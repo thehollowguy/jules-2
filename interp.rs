@@ -39,6 +39,8 @@ use crate::ast::{
     UnOpKind, VecSize,
 };
 use crate::lexer::Span;
+use crate::game_systems::{PhysicsWorld, RenderState, InputState};
+use crate::ml_engine::{ComputationGraph, Optimizer, OptimizerState};
 
 // =============================================================================
 // §1  RUNTIME VALUE
@@ -1111,6 +1113,16 @@ pub struct Interpreter {
     pub gpu:      Option<Box<dyn GpuBackend>>,
     /// Thread pool size for `spawn` / parallel loops.
     pub n_threads: usize,
+    /// Physics engine (game systems integration)
+    pub physics_world: Option<Arc<Mutex<PhysicsWorld>>>,
+    /// Rendering state (game systems integration)
+    pub render_state: Option<Arc<Mutex<RenderState>>>,
+    /// Input state (game systems integration)
+    pub input_state: Option<Arc<Mutex<InputState>>>,
+    /// Computation graph for autodiff (ML integration)
+    pub computation_graph: Option<Arc<Mutex<ComputationGraph>>>,
+    /// Active optimizers indexed by ID (ML integration)
+    pub optimizers: HashMap<String, (Optimizer, OptimizerState)>,
 }
 
 impl Interpreter {
@@ -1124,6 +1136,11 @@ impl Interpreter {
             world:        Arc::new(Mutex::new(EcsWorld::default())),
             gpu:          None,
             n_threads:    4,
+            physics_world: Some(Arc::new(Mutex::new(PhysicsWorld::new()))),
+            render_state: Some(Arc::new(Mutex::new(RenderState::new()))),
+            input_state: Some(Arc::new(Mutex::new(InputState::new()))),
+            computation_graph: Some(Arc::new(Mutex::new(ComputationGraph::new()))),
+            optimizers: HashMap::new(),
         }
     }
 

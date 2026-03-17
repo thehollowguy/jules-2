@@ -3,8 +3,8 @@
 // Provides Rapier physics simulation with ECS integration
 // =========================================================================
 
-use crate::interp::Value;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 // Physics component that can be attached to entities
 #[derive(Debug, Clone)]

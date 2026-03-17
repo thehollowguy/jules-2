@@ -32,6 +32,9 @@ mod parser;
 mod typeck;
 mod sema;
 mod interp;
+mod game_systems;
+mod ml_engine;
+mod optimizer;
 
 use std::fmt::Write as FmtWrite;
 use std::fs;
