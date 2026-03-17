@@ -1113,16 +1113,6 @@ impl Default for AdaDelta {
     fn default() -> Self { Self::new() }
 }
 
-    fn ensure_buffers(&mut self, params: &[ParamBuffer<'_>]) {
-        for buf in [&mut self.eg2, &mut self.edw2] {
-            if buf.len() < params.len() { buf.resize_with(params.len(), Vec::new); }
-            for (i, p) in params.iter().enumerate() {
-                if buf[i].len() != p.numel() { buf[i] = vec![0.0; p.numel()]; }
-            }
-        }
-    }
-}
-
 impl Optimizer for AdaDelta {
     fn name(&self) -> &str { "AdaDelta" }
 

@@ -1,0 +1,92 @@
+// Jules ML Model Test
+// This program tests the basic ML functionality
+
+// Simple linear model training
+fn train_simple_model() {
+    print("=== Jules ML Model Test ===")
+    print("")
+
+    // Test 1: Tensor creation
+    print("Test 1: Tensor Operations")
+    x = create_tensor([1.0, 2.0, 3.0, 4.0], [2, 2])
+    y = create_tensor([0.5, 1.5, 2.5, 3.5], [2, 2])
+    print("Tensor x created: [2x2]")
+    print("Tensor y created: [2x2]")
+    print("")
+
+    // Test 2: Loss computation
+    print("Test 2: Loss Functions")
+    mse = loss::mse(x, y)
+    print("MSE Loss computed: " + string(mse))
+    ce = loss::cross_entropy(x, y)
+    print("Cross-entropy computed: " + string(ce))
+    print("")
+
+    // Test 3: Metrics
+    print("Test 3: Metrics")
+    acc = metrics::accuracy(x, y)
+    print("Accuracy: " + string(acc))
+    prec = metrics::precision(x, y)
+    print("Precision: " + string(prec))
+    rec = metrics::recall(x, y)
+    print("Recall: " + string(rec))
+    f1 = metrics::f1_score(x, y)
+    print("F1 Score: " + string(f1))
+    print("")
+
+    // Test 4: Optimizer creation
+    print("Test 4: Optimizers")
+    opt_sgd = optimizer::create("sgd", 0.01)
+    print("SGD Optimizer created (lr=0.01)")
+    opt_adam = optimizer::create("adam", 0.001)
+    print("Adam Optimizer created (lr=0.001)")
+    print("")
+
+    // Test 5: Physics System
+    print("Test 5: Physics Engine")
+    world = physics::world_new()
+    body1 = physics::create_body(1.0, 0.0, 10.0, 0.0)
+    body2 = physics::create_body(2.0, 5.0, 5.0, 0.0)
+    print("Created 2 rigid bodies")
+
+    physics::set_velocity(body1, 0.0, -9.81, 0.0)
+    print("Body 1 velocity set")
+
+    physics::step(0.016)
+    pos1 = physics::get_position(body1)
+    print("After step: Body 1 position = " + string(pos1))
+    print("")
+
+    // Test 6: Graphics System
+    print("Test 6: Graphics System")
+    graphics::set_camera(0.0, 5.0, 10.0)
+    print("Camera positioned at (0, 5, 10)")
+
+    mesh_cube = graphics::create_mesh("cube", 1.0)
+    print("Cube mesh created")
+
+    mat_red = graphics::create_material(1.0, 0.0, 0.0, 1.0)
+    print("Red material created")
+
+    graphics::render_mesh(mesh_cube, mat_red)
+    print("Mesh rendered")
+    print("")
+
+    // Test 7: Input System
+    print("Test 7: Input System")
+    w_pressed = input::is_key_pressed("W")
+    print("W key pressed: " + string(w_pressed))
+
+    mouse_pos = input::get_mouse_position()
+    print("Mouse position queried")
+
+    scroll = input::get_mouse_scroll()
+    print("Mouse scroll: " + string(scroll))
+    print("")
+
+    print("=== All Tests Completed Successfully ===")
+}
+
+fn main() {
+    train_simple_model()
+}

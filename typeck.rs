@@ -2220,6 +2220,7 @@ fn broadcast_shapes(a: &[Dim], b: &[Dim]) -> Option<Vec<Dim>> {
         result.push(out);
     }
     Some(result)
+}
 
 // =============================================================================
 // CONVENIENCE: top-level entry point

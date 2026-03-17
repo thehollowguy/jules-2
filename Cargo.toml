@@ -8,7 +8,7 @@ license = "MIT"
 
 [lib]
 name = "jules"
-path = "interp.rs"
+path = "main.rs"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
