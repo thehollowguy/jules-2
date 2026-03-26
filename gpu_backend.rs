@@ -234,6 +234,81 @@ impl GpuBackendImpl for CpuBackend {
     }
 }
 
+fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
+}
+
+fn matmul_blocked_rows(
+    a_data: &[f32],
+    bt_data: &[f32],
+    row_start: usize,
+    row_end: usize,
+    k: usize,
+    n: usize,
+    out_chunk: &mut [f32],
+    out_row_base: usize,
+) {
+    const BK: usize = 64;
+    const BN: usize = 64;
+    for row in row_start..row_end {
+        let out_row_local = row - out_row_base;
+        let out_row = &mut out_chunk[out_row_local * n..(out_row_local + 1) * n];
+        let a_row = &a_data[row * k..(row + 1) * k];
+        for col_block in (0..n).step_by(BN) {
+            let col_end = (col_block + BN).min(n);
+            for col in col_block..col_end {
+                let b_row = &bt_data[col * k..(col + 1) * k];
+                let mut acc = 0.0f32;
+                for kk_block in (0..k).step_by(BK) {
+                    let kk_end = (kk_block + BK).min(k);
+                    acc += dot_unrolled_8(&a_row[kk_block..kk_end], &b_row[kk_block..kk_end]);
+                }
+                out_row[col] = acc;
+            }
+        }
+    }
+}
+
+fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
+    let len = lhs.len();
+    let chunks = len / 8;
+    let mut i = 0;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut s4 = 0.0f32;
+    let mut s5 = 0.0f32;
+    let mut s6 = 0.0f32;
+    let mut s7 = 0.0f32;
+
+    for _ in 0..chunks {
+        s0 += lhs[i] * rhs[i];
+        s1 += lhs[i + 1] * rhs[i + 1];
+        s2 += lhs[i + 2] * rhs[i + 2];
+        s3 += lhs[i + 3] * rhs[i + 3];
+        s4 += lhs[i + 4] * rhs[i + 4];
+        s5 += lhs[i + 5] * rhs[i + 5];
+        s6 += lhs[i + 6] * rhs[i + 6];
+        s7 += lhs[i + 7] * rhs[i + 7];
+        i += 8;
+    }
+
+    let mut tail = 0.0f32;
+    while i < len {
+        tail += lhs[i] * rhs[i];
+        i += 1;
+    }
+
+    s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + tail
+}
+
 // =============================================================================
 // WGPU Backend (WebGPU - cross-platform, Wasm-compatible)
 // =============================================================================
@@ -626,6 +701,17 @@ mod tests {
         let backend = GpuBackend::auto_select();
         assert!(backend.is_available());
         assert!(!backend.backend_name().is_empty());
+    }
+
+    #[test]
+    fn test_cpu_backend_matmul_correctness() {
+        let backend = CpuBackend::new();
+        let a = backend.upload(&[1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let b = backend.upload(&[5.0, 6.0, 7.0, 8.0], vec![2, 2]);
+        let out = backend.upload(&[0.0, 0.0, 0.0, 0.0], vec![2, 2]);
+        backend.matmul(&a, &b, &out).unwrap();
+        let got = backend.download(&out);
+        assert_eq!(got, vec![19.0, 22.0, 43.0, 50.0]);
     }
 
     #[test]

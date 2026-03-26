@@ -58,6 +58,25 @@ pub struct Tensor {
     pub data: Vec<f32>,
 }
 
+/// Experimental INT8 weight format for inference-only execution.
+/// Stores one signed byte per weight plus per-output scales.
+#[derive(Debug, Clone)]
+pub struct Int8LinearWeights {
+    pub in_dim: usize,
+    pub out_dim: usize,
+    pub qweights: Vec<i8>,
+    pub scales: Vec<f32>,
+}
+
+impl Int8LinearWeights {
+    /// Effective bytes-per-parameter including scale overhead.
+    pub fn effective_bytes_per_param(&self) -> f32 {
+        let weight_bytes = self.qweights.len() as f32;
+        let scale_bytes = (self.scales.len() * std::mem::size_of::<f32>()) as f32;
+        (weight_bytes + scale_bytes) / self.qweights.len().max(1) as f32
+    }
+}
+
 impl Tensor {
     const PARALLEL_MATMUL_MIN_OPS: usize = 2_000_000;
 
@@ -395,6 +414,159 @@ impl Tensor {
             data: self.data.iter().map(|x| (x - mean) / std).collect(),
         }
     }
+
+    /// Quantize a `[in_dim, out_dim]` weight tensor to signed int8.
+    /// This is for inference (running) only, not training.
+    pub fn quantize_linear_int8(&self) -> Result<Int8LinearWeights, String> {
+        if self.shape.len() != 2 {
+            return Err("quantize_linear_int8 expects a 2D weight tensor".into());
+        }
+        let in_dim = self.shape[0];
+        let out_dim = self.shape[1];
+        let mut qweights = vec![0i8; in_dim * out_dim];
+        let mut scales = vec![1.0f32; out_dim];
+
+        for o in 0..out_dim {
+            let mut max_abs = 0.0f32;
+            for i in 0..in_dim {
+                max_abs = max_abs.max(self.data[i * out_dim + o].abs());
+            }
+            let scale = if max_abs < 1e-8 { 1.0 } else { max_abs / 127.0 };
+            scales[o] = scale;
+            for i in 0..in_dim {
+                let w = self.data[i * out_dim + o] / scale;
+                qweights[i * out_dim + o] = w.round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+
+        Ok(Int8LinearWeights {
+            in_dim,
+            out_dim,
+            qweights,
+            scales,
+        })
+    }
+
+    /// Run a linear projection with INT8 weights:
+    /// input `[batch, in_dim]` x weights `[in_dim, out_dim]` -> `[batch, out_dim]`.
+    pub fn linear_int8(
+        &self,
+        weights: &Int8LinearWeights,
+        bias: Option<&Tensor>,
+    ) -> Result<Tensor, String> {
+        if self.shape.len() != 2 {
+            return Err("linear_int8 expects a 2D input tensor".into());
+        }
+        let batch = self.shape[0];
+        let in_dim = self.shape[1];
+        if in_dim != weights.in_dim {
+            return Err("linear_int8 input dimension mismatch".into());
+        }
+        if let Some(b) = bias {
+            if b.shape.len() != 1 || b.shape[0] != weights.out_dim {
+                return Err("linear_int8 bias must be shape [out_dim]".into());
+            }
+        }
+
+        let mut out = vec![0.0f32; batch * weights.out_dim];
+        for b in 0..batch {
+            for o in 0..weights.out_dim {
+                let mut acc = 0.0f32;
+                let scale = weights.scales[o];
+                for i in 0..in_dim {
+                    let x = self.data[b * in_dim + i];
+                    let qw = weights.qweights[i * weights.out_dim + o] as f32 * scale;
+                    acc += x * qw;
+                }
+                if let Some(bias_t) = bias {
+                    acc += bias_t.data[o];
+                }
+                out[b * weights.out_dim + o] = acc;
+            }
+        }
+
+        Ok(Tensor {
+            shape: vec![batch, weights.out_dim],
+            data: out,
+        })
+    }
+}
+
+fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
+}
+
+fn matmul_blocked_rows(
+    a_data: &[f32],
+    bt_data: &[f32],
+    row_start: usize,
+    row_end: usize,
+    k: usize,
+    n: usize,
+    out_chunk: &mut [f32],
+    out_row_base: usize,
+) {
+    const BK: usize = 64;
+    const BN: usize = 64;
+
+    for row in row_start..row_end {
+        let out_row_local = row - out_row_base;
+        let out_row = &mut out_chunk[out_row_local * n..(out_row_local + 1) * n];
+        let a_row = &a_data[row * k..(row + 1) * k];
+
+        for col_block in (0..n).step_by(BN) {
+            let col_end = (col_block + BN).min(n);
+            for col in col_block..col_end {
+                let b_row = &bt_data[col * k..(col + 1) * k];
+                let mut acc = 0.0f32;
+                for kk_block in (0..k).step_by(BK) {
+                    let kk_end = (kk_block + BK).min(k);
+                    acc += dot_unrolled_8(&a_row[kk_block..kk_end], &b_row[kk_block..kk_end]);
+                }
+                out_row[col] = acc;
+            }
+        }
+    }
+}
+
+fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
+    let len = lhs.len();
+    let chunks = len / 8;
+    let mut i = 0;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut s4 = 0.0f32;
+    let mut s5 = 0.0f32;
+    let mut s6 = 0.0f32;
+    let mut s7 = 0.0f32;
+
+    for _ in 0..chunks {
+        s0 += lhs[i] * rhs[i];
+        s1 += lhs[i + 1] * rhs[i + 1];
+        s2 += lhs[i + 2] * rhs[i + 2];
+        s3 += lhs[i + 3] * rhs[i + 3];
+        s4 += lhs[i + 4] * rhs[i + 4];
+        s5 += lhs[i + 5] * rhs[i + 5];
+        s6 += lhs[i + 6] * rhs[i + 6];
+        s7 += lhs[i + 7] * rhs[i + 7];
+        i += 8;
+    }
+
+    let mut tail = 0.0f32;
+    while i < len {
+        tail += lhs[i] * rhs[i];
+        i += 1;
+    }
+
+    s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + tail
 }
 
 fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
@@ -616,6 +788,40 @@ impl ComputationGraph {
         }
 
         order.push(node_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn int8_linear_is_close_to_fp32() {
+        let w = Tensor {
+            shape: vec![3, 2],
+            data: vec![0.5, -0.2, 1.2, 0.7, -0.4, 0.1],
+        };
+        let x = Tensor {
+            shape: vec![2, 3],
+            data: vec![1.0, 0.5, -1.0, 0.2, -0.1, 0.3],
+        };
+        let b = Tensor {
+            shape: vec![2],
+            data: vec![0.05, -0.03],
+        };
+
+        let q = w.quantize_linear_int8().expect("quantize");
+        let y_int8 = x.linear_int8(&q, Some(&b)).expect("int8 linear");
+        let y_fp32 = x.matmul(&w).add(&Tensor {
+            shape: vec![2, 2],
+            data: vec![0.05, -0.03, 0.05, -0.03],
+        });
+
+        for (a, b) in y_int8.data.iter().zip(y_fp32.data.iter()) {
+            assert!((a - b).abs() < 0.05, "int8 error too high: {a} vs {b}");
+        }
+
+        assert!(q.effective_bytes_per_param() <= 1.8);
     }
 }
 

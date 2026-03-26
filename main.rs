@@ -586,6 +586,7 @@ pub enum Command {
     Help,
     Run,
     Check,
+    Fix,
     Fmt,
     Repl,
     Train,
@@ -611,6 +612,7 @@ impl CliArgs {
         match cmd {
             Some("run")     => { out.command = Command::Run;     it.next(); }
             Some("check")   => { out.command = Command::Check;   it.next(); }
+            Some("fix")     => { out.command = Command::Fix;     it.next(); }
             Some("fmt")     => { out.command = Command::Fmt;     it.next(); }
             Some("repl")    => { out.command = Command::Repl;    it.next(); }
             Some("train")   => { out.command = Command::Train;   it.next(); }
@@ -694,6 +696,7 @@ fn cmd_help() {
     println!("COMMANDS:");
     println!("    run   <file.jules>    Execute a Jules source file");
     println!("    check <file.jules>    Type-check and lint without running");
+    println!("    fix   <file.jules>    Apply safe syntax autofixes from diagnostics");
     println!("    fmt   <file.jules>    Pretty-print the source (token pass)");
     println!("    train <file.jules>    Run all train {{ … }} blocks");
     println!("    repl               Interactive REPL / playground");
@@ -711,8 +714,107 @@ fn cmd_help() {
     println!("\nEXAMPLES:");
     println!("    jules run examples/physics.jules");
     println!("    jules check src/agent.jules -W");
+    println!("    jules fix broken.jules");
     println!("    jules train examples/warden.jules");
     println!("    jules repl");
+}
+
+fn insert_char_at_byte(source: &mut String, byte_idx: usize, ch: char) {
+    if byte_idx <= source.len() {
+        source.insert(byte_idx, ch);
+    }
+}
+
+fn apply_safe_syntax_fixes(source: &str, diags: &[Diag]) -> Option<String> {
+    let mut out = source.to_string();
+    let mut changed = false;
+
+    let fn_fixed = out.replace("fun ", "fn ").replace("func ", "fn ");
+    if fn_fixed != out {
+        out = fn_fixed;
+        changed = true;
+    }
+
+    let mut semicolon_lines = std::collections::BTreeSet::<u32>::new();
+    let mut insertions: Vec<(usize, char)> = Vec::new();
+
+    for d in diags {
+        let Some(span) = d.span else { continue };
+        let Some(hint) = d.hint.as_deref() else { continue };
+        if hint.contains("add `;` to end this statement") {
+            semicolon_lines.insert(span.line);
+        } else if hint.contains("close this expression with `)`") {
+            insertions.push((span.start, ')'));
+        } else if hint.contains("close this index/type with `]`") {
+            insertions.push((span.start, ']'));
+        } else if hint.contains("close this block with `}`") {
+            insertions.push((span.start, '}'));
+        }
+    }
+
+    insertions.sort_by(|a, b| b.0.cmp(&a.0));
+    for (idx, ch) in insertions {
+        insert_char_at_byte(&mut out, idx, ch);
+        changed = true;
+    }
+
+    if !semicolon_lines.is_empty() {
+        let mut lines: Vec<String> = out.split('\n').map(|s| s.to_owned()).collect();
+        for line_no in semicolon_lines {
+            let idx = line_no.saturating_sub(1) as usize;
+            if let Some(line) = lines.get_mut(idx) {
+                let trimmed = line.trim_end();
+                if !trimmed.is_empty()
+                    && !trimmed.ends_with(';')
+                    && !trimmed.ends_with('{')
+                    && !trimmed.ends_with('}')
+                {
+                    line.push(';');
+                    changed = true;
+                }
+            }
+        }
+        out = lines.join("\n");
+    }
+
+    changed.then_some(out)
+}
+
+fn cmd_fix(args: &CliArgs) -> i32 {
+    let path = match &args.file {
+        Some(p) => p,
+        None    => { eprintln!("jules fix: no file provided"); return 2; }
+    };
+    let source = match fs::read_to_string(path) {
+        Ok(s)  => s,
+        Err(e) => { eprintln!("jules: cannot read `{}`: {e}", path.display()); return 2; }
+    };
+
+    let filename = path.to_string_lossy();
+    let mut unit = CompileUnit::new(filename.as_ref(), &source);
+    let mut pipeline = Pipeline::new();
+    pipeline.quiet = true;
+    let _ = pipeline.run(&mut unit);
+
+    if unit.diags.is_empty() {
+        println!("jules fix: no diagnostics; file is already clean");
+        return 0;
+    }
+
+    match apply_safe_syntax_fixes(&source, &unit.diags) {
+        Some(fixed) if fixed != source => {
+            if let Err(e) = fs::write(path, fixed) {
+                eprintln!("jules fix: failed writing `{}`: {e}", path.display());
+                return 2;
+            }
+            println!("jules fix: applied safe fixes to {}", path.display());
+            0
+        }
+        _ => {
+            println!("jules fix: no safe automatic fix could be applied");
+            1
+        }
+    }
 }
 
 // ── jules check ────────────────────────────────────────────────────────────
@@ -1143,6 +1245,7 @@ pub fn main() {
         Command::Help    => { cmd_help();    0 }
         Command::Version => { cmd_version(); 0 }
         Command::Check   => cmd_check(&args),
+        Command::Fix     => cmd_fix(&args),
         Command::Run     => cmd_run(&args),
         Command::Train   => cmd_train(&args),
         Command::Fmt     => cmd_fmt(&args),
@@ -1187,6 +1290,13 @@ mod tests {
         let a = parse(&["check", "bar.jules"]).unwrap();
         assert_eq!(a.command, Command::Check);
         assert_eq!(a.file.as_deref(), Some(Path::new("bar.jules")));
+    }
+
+    #[test]
+    fn test_cli_fix_command() {
+        let a = parse(&["fix", "broken.jules"]).unwrap();
+        assert_eq!(a.command, Command::Fix);
+        assert_eq!(a.file.as_deref(), Some(Path::new("broken.jules")));
     }
 
     #[test]
@@ -1257,6 +1367,12 @@ mod tests {
     #[test]
     fn test_cli_tab_width_invalid() {
         assert!(parse(&["run", "x.jules", "--tab-width", "abc"]).is_err());
+    }
+
+    #[test]
+    fn test_apply_safe_syntax_fixes_keyword_typo() {
+        let fixed = apply_safe_syntax_fixes("fun main() {}", &[]).unwrap();
+        assert_eq!(fixed, "fn main() {}");
     }
 
     // ── Diagnostic construction ────────────────────────────────────────────────

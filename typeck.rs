@@ -2736,14 +2736,20 @@ impl TypeCk {
         }
     }
 
-    // ─── @AI Decorator Validation ──────────────────────────────────────────────
-    fn validate_ai_decorator(&mut self, a: &AgentDecl, attr: &crate::ast::Attribute) {
+    // ─── Network Decorator Validation ──────────────────────────────────────────
+    fn validate_network_decorator(
+        &mut self,
+        a: &AgentDecl,
+        attr: &crate::ast::Attribute,
+        decorator_name: &str,
+    ) {
         if let crate::ast::Attribute::Named { args, .. } = attr {
             // Extract architecture string from first argument
             if let Some(crate::ast::Expr::StrLit { value, span }) = args.first() {
                 // Validate architecture string format
                 if let Err(e) = self.validate_architecture_string(value) {
-                    self.diag.error(*span, format!("@AI: {}", e));
+                    self.diag
+                        .error(*span, format!("@{}: {}", decorator_name.to_uppercase(), e));
                     return;
                 }
 
@@ -2969,6 +2975,13 @@ pub fn jules_check(program: &Program) -> Diagnostics {
     let mut ck = TypeCk::new();
     ck.check_program(program);
     ck.diag
+}
+
+fn is_network_decorator(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "ai" | "ppo" | "dqn" | "a2c" | "sac" | "ddpg" | "td3" | "trpo" | "reinforce"
+    )
 }
 
 // =============================================================================

@@ -404,6 +404,38 @@ pub extern "C" fn jules_error_string(code: JulesError) -> *const c_char {
 }
 
 #[no_mangle]
+pub extern "C" fn jules_run_file_ffi(path: *const c_char) -> JulesError {
+    if path.is_null() {
+        return JulesError::InvalidArg;
+    }
+    let path_str = unsafe { CStr::from_ptr(path) };
+    let Ok(path) = path_str.to_str() else {
+        return JulesError::InvalidArg;
+    };
+    match crate::jules_run_file(path, "main") {
+        Ok(()) => JulesError::Success,
+        Err(_) => JulesError::RuntimeError,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn jules_check_code_ffi(source: *const c_char) -> JulesError {
+    if source.is_null() {
+        return JulesError::InvalidArg;
+    }
+    let source = unsafe { CStr::from_ptr(source) };
+    let Ok(source) = source.to_str() else {
+        return JulesError::InvalidArg;
+    };
+    let diags = crate::jules_check("<ffi>", source);
+    if diags.iter().any(|d| d.is_error()) {
+        JulesError::RuntimeError
+    } else {
+        JulesError::Success
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn julius_free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
