@@ -3,7 +3,11 @@
 // Enables full backpropagation through neural networks
 // =========================================================================
 
+use crate::gpu_backend::GpuMemoryManager;
+use matrixmultiply::sgemm;
 use std::collections::HashMap;
+use std::thread;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct ComputationGraph {
@@ -17,7 +21,7 @@ pub struct ComputationGraph {
 pub struct ComputeNode {
     pub id: u64,
     pub op: Operation,
-    pub inputs: Vec<u64>,  // IDs of input nodes
+    pub inputs: Vec<u64>, // IDs of input nodes
     pub value: Tensor,
     pub gradient: Option<Tensor>,
     pub requires_grad: bool,
@@ -25,21 +29,21 @@ pub struct ComputeNode {
 
 #[derive(Debug, Clone)]
 pub enum Operation {
-    Input,                                    // Input leaf node
-    Constant,                                 // Constant value
-    Add,                                      // Element-wise addition
-    Sub,                                      // Element-wise subtraction
-    Mul,                                      // Element-wise multiplication
-    Div,                                      // Element-wise division
-    MatMul,                                   // Matrix multiplication
-    ReLU,                                     // ReLU activation
-    Sigmoid,                                  // Sigmoid activation
-    Tanh,                                     // Tanh activation
-    Softmax,                                  // Softmax activation
-    Sum,                                      // Sum all elements
-    Mean,                                     // Mean of all elements
-    Reshape { new_shape: Vec<usize> },        // Reshape tensor
-    Transpose { axes: Vec<usize> },           // Transpose axes
+    Input,                             // Input leaf node
+    Constant,                          // Constant value
+    Add,                               // Element-wise addition
+    Sub,                               // Element-wise subtraction
+    Mul,                               // Element-wise multiplication
+    Div,                               // Element-wise division
+    MatMul,                            // Matrix multiplication
+    ReLU,                              // ReLU activation
+    Sigmoid,                           // Sigmoid activation
+    Tanh,                              // Tanh activation
+    Softmax,                           // Softmax activation
+    Sum,                               // Sum all elements
+    Mean,                              // Mean of all elements
+    Reshape { new_shape: Vec<usize> }, // Reshape tensor
+    Transpose { axes: Vec<usize> },    // Transpose axes
 }
 
 // Simple pseudo-random based on input for deterministic initialization
@@ -55,7 +59,39 @@ pub struct Tensor {
     pub data: Vec<f32>,
 }
 
+/// Experimental INT8 weight format for inference-only execution.
+/// Stores one signed byte per weight plus per-output scales.
+#[derive(Debug, Clone)]
+pub struct Int8LinearWeights {
+    pub in_dim: usize,
+    pub out_dim: usize,
+    pub qweights: Vec<i8>,
+    pub scales: Vec<f32>,
+}
+
+impl Int8LinearWeights {
+    /// Effective bytes-per-parameter including scale overhead.
+    pub fn effective_bytes_per_param(&self) -> f32 {
+        let weight_bytes = self.qweights.len() as f32;
+        let scale_bytes = (self.scales.len() * std::mem::size_of::<f32>()) as f32;
+        (weight_bytes + scale_bytes) / self.qweights.len().max(1) as f32
+    }
+
+    pub fn dequantize_f32(&self) -> Vec<f32> {
+        let mut w = vec![0.0f32; self.in_dim * self.out_dim];
+        for o in 0..self.out_dim {
+            let scale = self.scales[o];
+            for i in 0..self.in_dim {
+                w[i * self.out_dim + o] = self.qweights[i * self.out_dim + o] as f32 * scale;
+            }
+        }
+        w
+    }
+}
+
 impl Tensor {
+    const PARALLEL_MATMUL_MIN_OPS: usize = 2_000_000;
+
     pub fn zeros(shape: Vec<usize>) -> Self {
         let numel: usize = shape.iter().product();
         Tensor {
@@ -75,12 +111,18 @@ impl Tensor {
     /// Xavier (Glorot) initialization - good for sigmoid/tanh
     pub fn xavier(shape: Vec<usize>) -> Self {
         let numel: usize = shape.iter().product();
-        let limit = (6.0 / (shape.get(0).copied().unwrap_or(1) + shape.get(1).copied().unwrap_or(1)) as f32).sqrt();
+        let limit = (6.0
+            / (shape.get(0).copied().unwrap_or(1) + shape.get(1).copied().unwrap_or(1)) as f32)
+            .sqrt();
         let data = (0..numel)
             .map(|_| {
                 // Pseudo-random number between -limit and limit
                 let r = ((numel as f32 * (_as_pseudo_rand(numel) as f32)).sin() * limit.abs());
-                if (numel ^ _as_pseudo_rand(numel * 2)) & 1 == 0 { r } else { -r }
+                if (numel ^ _as_pseudo_rand(numel * 2)) & 1 == 0 {
+                    r
+                } else {
+                    -r
+                }
             })
             .collect();
         Tensor { shape, data }
@@ -106,10 +148,11 @@ impl Tensor {
 
     pub fn add(&self, other: &Tensor) -> Tensor {
         assert_eq!(self.shape, other.shape, "Shape mismatch in addition");
-        let data = self.data.iter()
-            .zip(&other.data)
-            .map(|(a, b)| a + b)
-            .collect();
+        let len = self.data.len();
+        let mut data = vec![0.0; len];
+        for i in 0..len {
+            data[i] = self.data[i] + other.data[i];
+        }
         Tensor {
             shape: self.shape.clone(),
             data,
@@ -118,10 +161,11 @@ impl Tensor {
 
     pub fn mul(&self, other: &Tensor) -> Tensor {
         assert_eq!(self.shape, other.shape, "Shape mismatch in multiplication");
-        let data = self.data.iter()
-            .zip(&other.data)
-            .map(|(a, b)| a * b)
-            .collect();
+        let len = self.data.len();
+        let mut data = vec![0.0; len];
+        for i in 0..len {
+            data[i] = self.data[i] * other.data[i];
+        }
         Tensor {
             shape: self.shape.clone(),
             data,
@@ -129,9 +173,10 @@ impl Tensor {
     }
 
     pub fn relu(&self) -> Tensor {
-        let data = self.data.iter()
-            .map(|x| x.max(0.0))
-            .collect();
+        let mut data = vec![0.0; self.data.len()];
+        for (i, x) in self.data.iter().enumerate() {
+            data[i] = x.max(0.0);
+        }
         Tensor {
             shape: self.shape.clone(),
             data,
@@ -139,9 +184,10 @@ impl Tensor {
     }
 
     pub fn sigmoid(&self) -> Tensor {
-        let data = self.data.iter()
-            .map(|x| 1.0 / (1.0 + (-x).exp()))
-            .collect();
+        let mut data = vec![0.0; self.data.len()];
+        for (i, x) in self.data.iter().enumerate() {
+            data[i] = 1.0 / (1.0 + (-x).exp());
+        }
         Tensor {
             shape: self.shape.clone(),
             data,
@@ -151,14 +197,10 @@ impl Tensor {
     pub fn softmax(&self) -> Tensor {
         // Numerically stable softmax
         let max = self.data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let exp_vals: Vec<f32> = self.data.iter()
-            .map(|x| (x - max).exp())
-            .collect();
+        let exp_vals: Vec<f32> = self.data.iter().map(|x| (x - max).exp()).collect();
         let sum: f32 = exp_vals.iter().sum();
 
-        let data = exp_vals.iter()
-            .map(|x| x / sum)
-            .collect();
+        let data = exp_vals.iter().map(|x| x / sum).collect();
 
         Tensor {
             shape: self.shape.clone(),
@@ -176,10 +218,15 @@ impl Tensor {
 
     /// Compute gradient for ReLU
     pub fn relu_grad(&self, upstream_grad: &Tensor) -> Tensor {
-        let data = upstream_grad.data.iter()
-            .zip(&self.data)
-            .map(|(g, x)| if *x > 0.0 { *g } else { 0.0 })
-            .collect();
+        let len = upstream_grad.data.len();
+        let mut data = vec![0.0; len];
+        for i in 0..len {
+            data[i] = if self.data[i] > 0.0 {
+                upstream_grad.data[i]
+            } else {
+                0.0
+            };
+        }
         Tensor {
             shape: upstream_grad.shape.clone(),
             data,
@@ -188,10 +235,12 @@ impl Tensor {
 
     /// Compute gradient for Sigmoid
     pub fn sigmoid_grad(&self, upstream_grad: &Tensor) -> Tensor {
-        let data = upstream_grad.data.iter()
-            .zip(&self.data)
-            .map(|(g, x)| g * x * (1.0 - x))
-            .collect();
+        let len = upstream_grad.data.len();
+        let mut data = vec![0.0; len];
+        for i in 0..len {
+            let x = self.data[i];
+            data[i] = upstream_grad.data[i] * x * (1.0 - x);
+        }
         Tensor {
             shape: upstream_grad.shape.clone(),
             data,
@@ -202,21 +251,80 @@ impl Tensor {
     pub fn matmul(&self, other: &Tensor) -> Tensor {
         assert_eq!(self.shape.len(), 2, "Left must be 2D");
         assert_eq!(other.shape.len(), 2, "Right must be 2D");
-        assert_eq!(self.shape[1], other.shape[0], "Incompatible shapes for matmul");
+        assert_eq!(
+            self.shape[1], other.shape[0],
+            "Incompatible shapes for matmul"
+        );
 
         let m = self.shape[0];
         let k = self.shape[1];
         let n = other.shape[1];
 
+        if m.saturating_mul(k).saturating_mul(n) >= 262_144 {
+            let mut result = vec![0.0f32; m * n];
+            gemm_matrixmultiply(&self.data, &other.data, m, k, n, &mut result);
+            return Tensor {
+                shape: vec![m, n],
+                data: result,
+            };
+        }
+
+        let other_t = transpose_2d(&other.data, k, n);
         let mut result = vec![0.0; m * n];
 
-        for i in 0..m {
-            for j in 0..n {
-                let mut sum = 0.0;
-                for p in 0..k {
-                    sum += self.data[i * k + p] * other.data[p * n + j];
+        let ops = m.saturating_mul(k).saturating_mul(n);
+        let threads = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        let use_blocked = m >= 64 && k >= 64 && n >= 64;
+
+        if threads > 1 && ops >= Self::PARALLEL_MATMUL_MIN_OPS {
+            let rows_per_chunk = m.div_ceil(threads);
+            thread::scope(|scope| {
+                for (chunk_idx, result_chunk) in result.chunks_mut(rows_per_chunk * n).enumerate() {
+                    let row_start = chunk_idx * rows_per_chunk;
+                    let row_end = (row_start + rows_per_chunk).min(m);
+                    let a_data = &self.data;
+                    let bt_data = &other_t;
+
+                    scope.spawn(move || {
+                        if use_blocked {
+                            matmul_blocked_rows(
+                                a_data,
+                                bt_data,
+                                row_start,
+                                row_end,
+                                k,
+                                n,
+                                result_chunk,
+                                row_start,
+                            );
+                        } else {
+                            for row in row_start..row_end {
+                                let local_row = row - row_start;
+                                let out_row = &mut result_chunk[local_row * n..(local_row + 1) * n];
+                                let a_row = &a_data[row * k..(row + 1) * k];
+                                for col in 0..n {
+                                    let b_row = &bt_data[col * k..(col + 1) * k];
+                                    out_row[col] = dot_unrolled_8(a_row, b_row);
+                                }
+                            }
+                        }
+                    });
                 }
-                result[i * n + j] = sum;
+            });
+        } else {
+            if use_blocked {
+                matmul_blocked_rows(&self.data, &other_t, 0, m, k, n, &mut result, 0);
+            } else {
+                for i in 0..m {
+                    let a_row = &self.data[i * k..(i + 1) * k];
+                    for j in 0..n {
+                        let b_row = &other_t[j * k..(j + 1) * k];
+                        result[i * n + j] = dot_unrolled_8(a_row, b_row);
+                    }
+                }
             }
         }
 
@@ -226,13 +334,59 @@ impl Tensor {
         }
     }
 
+    /// Stress helper for runtime tuning. Allocates large buffers and reports
+    /// total wall-clock time for repeated matrix multiplies.
+    pub fn benchmark_matmul_ms(dim: usize, iterations: usize) -> u128 {
+        let a = Tensor::he(vec![dim, dim]);
+        let b = Tensor::xavier(vec![dim, dim]);
+        let start = Instant::now();
+        let mut out = Tensor::zeros(vec![dim, dim]);
+        for _ in 0..iterations {
+            out = a.matmul(&b);
+        }
+        let _ = out.data.first().copied().unwrap_or_default();
+        start.elapsed().as_millis()
+    }
+
+    /// GPU matmul path with explicit memory budget control.
+    /// Callers can set base + max extra bytes on `GpuMemoryManager` before running.
+    pub fn matmul_gpu(&self, other: &Tensor, memory: &GpuMemoryManager) -> Result<Tensor, String> {
+        assert_eq!(self.shape.len(), 2, "Left must be 2D");
+        assert_eq!(other.shape.len(), 2, "Right must be 2D");
+        assert_eq!(
+            self.shape[1], other.shape[0],
+            "Incompatible shapes for matmul"
+        );
+
+        let m = self.shape[0];
+        let k = self.shape[1];
+        let n = other.shape[1];
+
+        let a = memory.allocate_from_data(self.shape.clone(), self.data.clone())?;
+        let b = memory.allocate_from_data(other.shape.clone(), other.data.clone())?;
+        let out = memory.allocate(vec![m, n], 0.0)?;
+
+        memory.matmul(&a, &b, &out)?;
+        let result = memory.download(&out);
+
+        memory.free(&a);
+        memory.free(&b);
+        memory.free(&out);
+
+        if result.len() != m * n {
+            return Err("GPU matmul returned incorrect output size".into());
+        }
+
+        Ok(Tensor {
+            shape: vec![m, n],
+            data: result,
+        })
+    }
+
     /// Compute gradient for matmul: dL/dA = dL/dC @ B^T
     pub fn matmul_grad_a(&self, upstream_grad: &Tensor, b: &Tensor) -> Tensor {
         let b_t_shape = vec![b.shape[1], b.shape[0]];
-        let b_t_data: Vec<f32> = (0..b.shape[1])
-            .flat_map(|j| (0..b.shape[0])
-                .map(move |i| b.data[i * b.shape[1] + j]))
-            .collect();
+        let b_t_data = transpose_2d(&b.data, b.shape[0], b.shape[1]);
 
         let b_t = Tensor {
             shape: b_t_shape,
@@ -245,10 +399,7 @@ impl Tensor {
     /// Compute gradient for matmul: dL/dB = A^T @ dL/dC
     pub fn matmul_grad_b(&self, a: &Tensor, upstream_grad: &Tensor) -> Tensor {
         let a_t_shape = vec![a.shape[1], a.shape[0]];
-        let a_t_data: Vec<f32> = (0..a.shape[1])
-            .flat_map(|j| (0..a.shape[0])
-                .map(move |i| a.data[i * a.shape[1] + j]))
-            .collect();
+        let a_t_data = transpose_2d(&a.data, a.shape[0], a.shape[1]);
 
         let a_t = Tensor {
             shape: a_t_shape,
@@ -268,11 +419,13 @@ impl Tensor {
 
     /// Clip gradients by value to prevent exploding gradients
     pub fn clip_by_value(&self, min: f32, max: f32) -> Tensor {
+        let mut data = vec![0.0; self.data.len()];
+        for (i, x) in self.data.iter().enumerate() {
+            data[i] = x.max(min).min(max);
+        }
         Tensor {
             shape: self.shape.clone(),
-            data: self.data.iter()
-                .map(|x| x.max(min).min(max))
-                .collect(),
+            data,
         }
     }
 
@@ -284,9 +437,7 @@ impl Tensor {
         } else {
             Tensor {
                 shape: self.shape.clone(),
-                data: self.data.iter()
-                    .map(|x| x * (max_norm / norm))
-                    .collect(),
+                data: self.data.iter().map(|x| x * (max_norm / norm)).collect(),
             }
         }
     }
@@ -294,18 +445,242 @@ impl Tensor {
     /// Normalize tensor to zero mean and unit variance
     pub fn normalize(&self) -> Tensor {
         let mean = self.mean();
-        let variance = self.data.iter()
-            .map(|x| (x - mean).powi(2))
-            .sum::<f32>() / self.numel().max(1) as f32;
+        let variance =
+            self.data.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / self.numel().max(1) as f32;
         let std = variance.sqrt() + 1e-8;
 
         Tensor {
             shape: self.shape.clone(),
-            data: self.data.iter()
-                .map(|x| (x - mean) / std)
-                .collect(),
+            data: self.data.iter().map(|x| (x - mean) / std).collect(),
         }
     }
+
+    /// Quantize a `[in_dim, out_dim]` weight tensor to signed int8.
+    /// This is for inference (running) only, not training.
+    pub fn quantize_linear_int8(&self) -> Result<Int8LinearWeights, String> {
+        if self.shape.len() != 2 {
+            return Err("quantize_linear_int8 expects a 2D weight tensor".into());
+        }
+        let in_dim = self.shape[0];
+        let out_dim = self.shape[1];
+        let mut qweights = vec![0i8; in_dim * out_dim];
+        let mut scales = vec![1.0f32; out_dim];
+
+        for o in 0..out_dim {
+            let mut max_abs = 0.0f32;
+            for i in 0..in_dim {
+                max_abs = max_abs.max(self.data[i * out_dim + o].abs());
+            }
+            let scale = if max_abs < 1e-8 { 1.0 } else { max_abs / 127.0 };
+            scales[o] = scale;
+            for i in 0..in_dim {
+                let w = self.data[i * out_dim + o] / scale;
+                qweights[i * out_dim + o] = w.round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+
+        Ok(Int8LinearWeights {
+            in_dim,
+            out_dim,
+            qweights,
+            scales,
+        })
+    }
+
+    /// Run a linear projection with INT8 weights:
+    /// input `[batch, in_dim]` x weights `[in_dim, out_dim]` -> `[batch, out_dim]`.
+    pub fn linear_int8(
+        &self,
+        weights: &Int8LinearWeights,
+        bias: Option<&Tensor>,
+    ) -> Result<Tensor, String> {
+        if self.shape.len() != 2 {
+            return Err("linear_int8 expects a 2D input tensor".into());
+        }
+        let batch = self.shape[0];
+        let in_dim = self.shape[1];
+        if in_dim != weights.in_dim {
+            return Err("linear_int8 input dimension mismatch".into());
+        }
+        if let Some(b) = bias {
+            if b.shape.len() != 1 || b.shape[0] != weights.out_dim {
+                return Err("linear_int8 bias must be shape [out_dim]".into());
+            }
+        }
+
+        let ops = batch.saturating_mul(in_dim).saturating_mul(weights.out_dim);
+        if ops >= 262_144 {
+            let w_f32 = weights.dequantize_f32();
+            let mut out = vec![0.0f32; batch * weights.out_dim];
+            gemm_matrixmultiply(&self.data, &w_f32, batch, in_dim, weights.out_dim, &mut out);
+            if let Some(bias_t) = bias {
+                for b in 0..batch {
+                    for o in 0..weights.out_dim {
+                        out[b * weights.out_dim + o] += bias_t.data[o];
+                    }
+                }
+            }
+            return Ok(Tensor {
+                shape: vec![batch, weights.out_dim],
+                data: out,
+            });
+        }
+
+        let mut out = vec![0.0f32; batch * weights.out_dim];
+        let threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        if threads > 1 && ops >= Self::PARALLEL_MATMUL_MIN_OPS {
+            let rows_per_chunk = batch.div_ceil(threads);
+            thread::scope(|scope| {
+                for (chunk_idx, out_chunk) in out.chunks_mut(rows_per_chunk * weights.out_dim).enumerate() {
+                    let row_start = chunk_idx * rows_per_chunk;
+                    let row_end = (row_start + rows_per_chunk).min(batch);
+                    let x_data = &self.data;
+                    let q_data = &weights.qweights;
+                    let scales = &weights.scales;
+                    let out_dim = weights.out_dim;
+                    let bias_ref = bias;
+                    scope.spawn(move || {
+                        for b in row_start..row_end {
+                            let local_row = b - row_start;
+                            let out_row = &mut out_chunk[local_row * out_dim..(local_row + 1) * out_dim];
+                            for o in 0..out_dim {
+                                let mut acc = 0.0f32;
+                                let scale = scales[o];
+                                for i in 0..in_dim {
+                                    let x = x_data[b * in_dim + i];
+                                    let qw = q_data[i * out_dim + o] as f32 * scale;
+                                    acc += x * qw;
+                                }
+                                if let Some(bias_t) = bias_ref {
+                                    acc += bias_t.data[o];
+                                }
+                                out_row[o] = acc;
+                            }
+                        }
+                    });
+                }
+            });
+        } else {
+            for b in 0..batch {
+                for o in 0..weights.out_dim {
+                    let mut acc = 0.0f32;
+                    let scale = weights.scales[o];
+                    for i in 0..in_dim {
+                        let x = self.data[b * in_dim + i];
+                        let qw = weights.qweights[i * weights.out_dim + o] as f32 * scale;
+                        acc += x * qw;
+                    }
+                    if let Some(bias_t) = bias {
+                        acc += bias_t.data[o];
+                    }
+                    out[b * weights.out_dim + o] = acc;
+                }
+            }
+        }
+
+        Ok(Tensor {
+            shape: vec![batch, weights.out_dim],
+            data: out,
+        })
+    }
+}
+
+fn gemm_matrixmultiply(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, out: &mut [f32]) {
+    unsafe {
+        sgemm(
+            m,
+            k,
+            n,
+            1.0,
+            a.as_ptr(),
+            k as isize,
+            1,
+            b.as_ptr(),
+            n as isize,
+            1,
+            0.0,
+            out.as_mut_ptr(),
+            n as isize,
+            1,
+        );
+    }
+}
+
+fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
+}
+
+fn matmul_blocked_rows(
+    a_data: &[f32],
+    bt_data: &[f32],
+    row_start: usize,
+    row_end: usize,
+    k: usize,
+    n: usize,
+    out_chunk: &mut [f32],
+    out_row_base: usize,
+) {
+    const BK: usize = 64;
+    const BN: usize = 64;
+
+    for row in row_start..row_end {
+        let out_row_local = row - out_row_base;
+        let out_row = &mut out_chunk[out_row_local * n..(out_row_local + 1) * n];
+        let a_row = &a_data[row * k..(row + 1) * k];
+
+        for col_block in (0..n).step_by(BN) {
+            let col_end = (col_block + BN).min(n);
+            for col in col_block..col_end {
+                let b_row = &bt_data[col * k..(col + 1) * k];
+                let mut acc = 0.0f32;
+                for kk_block in (0..k).step_by(BK) {
+                    let kk_end = (kk_block + BK).min(k);
+                    acc += dot_unrolled_8(&a_row[kk_block..kk_end], &b_row[kk_block..kk_end]);
+                }
+                out_row[col] = acc;
+            }
+        }
+    }
+}
+
+fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
+    let len = lhs.len();
+    let chunks = len / 8;
+    let mut i = 0;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut s4 = 0.0f32;
+    let mut s5 = 0.0f32;
+    let mut s6 = 0.0f32;
+    let mut s7 = 0.0f32;
+
+    for _ in 0..chunks {
+        s0 += lhs[i] * rhs[i];
+        s1 += lhs[i + 1] * rhs[i + 1];
+        s2 += lhs[i + 2] * rhs[i + 2];
+        s3 += lhs[i + 3] * rhs[i + 3];
+        s4 += lhs[i + 4] * rhs[i + 4];
+        s5 += lhs[i + 5] * rhs[i + 5];
+        s6 += lhs[i + 6] * rhs[i + 6];
+        s7 += lhs[i + 7] * rhs[i + 7];
+        i += 8;
+    }
+
+    let mut tail = 0.0f32;
+    while i < len {
+        tail += lhs[i] * rhs[i];
+        i += 1;
+    }
+
+    s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + tail
 }
 
 impl ComputationGraph {
@@ -333,21 +708,16 @@ impl ComputationGraph {
         id
     }
 
-    pub fn add_operation(
-        &mut self,
-        op: Operation,
-        inputs: Vec<u64>,
-        result: Tensor,
-    ) -> u64 {
+    pub fn add_operation(&mut self, op: Operation, inputs: Vec<u64>, result: Tensor) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
 
-        let requires_grad = inputs.iter()
-            .any(|&inp_id| {
-                self.nodes.get(&inp_id)
-                    .map(|n| n.requires_grad)
-                    .unwrap_or(false)
-            });
+        let requires_grad = inputs.iter().any(|&inp_id| {
+            self.nodes
+                .get(&inp_id)
+                .map(|n| n.requires_grad)
+                .unwrap_or(false)
+        });
 
         let node = ComputeNode {
             id,
@@ -377,97 +747,108 @@ impl ComputationGraph {
 
         // Backward pass through the graph
         for &node_id in &order {
-            if let Some(node) = self.nodes.get(&node_id) {
-                let Some(upstream_grad) = node.gradient.clone() else {
-                    continue;
-                };
+            let (op, inputs, upstream_grad) = match self.nodes.get(&node_id) {
+                Some(node) => {
+                    let Some(upstream_grad) = node.gradient.clone() else {
+                        continue;
+                    };
+                    (node.op.clone(), node.inputs.clone(), upstream_grad)
+                }
+                None => continue,
+            };
 
-                match node.op {
-                    Operation::Add => {
-                        // Gradient flows equally to both inputs
-                        if let Some(input_id) = node.inputs.get(0) {
-                            if let Some(input) = self.nodes.get_mut(input_id) {
-                                input.gradient = Some(match &input.gradient {
-                                    Some(g) => g.add(&upstream_grad),
-                                    None => upstream_grad.clone(),
-                                });
-                            }
-                        }
-                        if let Some(input_id) = node.inputs.get(1) {
-                            if let Some(input) = self.nodes.get_mut(input_id) {
-                                input.gradient = Some(match &input.gradient {
-                                    Some(g) => g.add(&upstream_grad),
-                                    None => upstream_grad.clone(),
-                                });
-                            }
+            match op {
+                Operation::Add => {
+                    // Gradient flows equally to both inputs
+                    if let Some(input_id) = inputs.get(0) {
+                        if let Some(input) = self.nodes.get_mut(input_id) {
+                            input.gradient = Some(match &input.gradient {
+                                Some(g) => g.add(&upstream_grad),
+                                None => upstream_grad.clone(),
+                            });
                         }
                     }
-                    Operation::Mul => {
-                        // Gradient: dL/dX = dL/dY * Y
-                        if let (Some(&a_id), Some(&b_id)) = (node.inputs.get(0), node.inputs.get(1)) {
-                            let a_val = &self.nodes.get(&a_id).unwrap().value.clone();
-                            let b_val = &self.nodes.get(&b_id).unwrap().value.clone();
-
-                            let grad_a = upstream_grad.mul(b_val);
-                            let grad_b = upstream_grad.mul(a_val);
-
-                            if let Some(a) = self.nodes.get_mut(&a_id) {
-                                a.gradient = Some(match &a.gradient {
-                                    Some(g) => g.add(&grad_a),
-                                    None => grad_a,
-                                });
-                            }
-                            if let Some(b) = self.nodes.get_mut(&b_id) {
-                                b.gradient = Some(match &b.gradient {
-                                    Some(g) => g.add(&grad_b),
-                                    None => grad_b,
-                                });
-                            }
+                    if let Some(input_id) = inputs.get(1) {
+                        if let Some(input) = self.nodes.get_mut(input_id) {
+                            input.gradient = Some(match &input.gradient {
+                                Some(g) => g.add(&upstream_grad),
+                                None => upstream_grad.clone(),
+                            });
                         }
                     }
-                    Operation::MatMul => {
-                        if let (Some(&a_id), Some(&b_id)) = (node.inputs.get(0), node.inputs.get(1)) {
-                            let a_val = &self.nodes.get(&a_id).unwrap().value.clone();
-                            let b_val = &self.nodes.get(&b_id).unwrap().value.clone();
+                }
+                Operation::Mul => {
+                    // Gradient: dL/dX = dL/dY * Y
+                    if let (Some(&a_id), Some(&b_id)) = (inputs.get(0), inputs.get(1)) {
+                        let a_val = &self.nodes.get(&a_id).unwrap().value.clone();
+                        let b_val = &self.nodes.get(&b_id).unwrap().value.clone();
 
-                            let grad_a = a_val.matmul_grad_a(&upstream_grad, b_val);
-                            let grad_b = a_val.matmul_grad_b(a_val, &upstream_grad);
+                        let grad_a = upstream_grad.mul(b_val);
+                        let grad_b = upstream_grad.mul(a_val);
 
-                            if let Some(a) = self.nodes.get_mut(&a_id) {
-                                a.gradient = Some(match &a.gradient {
-                                    Some(g) => g.add(&grad_a),
-                                    None => grad_a,
-                                });
-                            }
-                            if let Some(b) = self.nodes.get_mut(&b_id) {
-                                b.gradient = Some(match &b.gradient {
-                                    Some(g) => g.add(&grad_b),
-                                    None => grad_b,
-                                });
-                            }
+                        if let Some(a) = self.nodes.get_mut(&a_id) {
+                            a.gradient = Some(match &a.gradient {
+                                Some(g) => g.add(&grad_a),
+                                None => grad_a,
+                            });
+                        }
+                        if let Some(b) = self.nodes.get_mut(&b_id) {
+                            b.gradient = Some(match &b.gradient {
+                                Some(g) => g.add(&grad_b),
+                                None => grad_b,
+                            });
                         }
                     }
-                    Operation::ReLU => {
-                        if let Some(&input_id) = node.inputs.get(0) {
-                            let input_val = &self.nodes.get(&input_id).unwrap().value.clone();
-                            let grad_input = input_val.relu_grad(&upstream_grad);
+                }
+                Operation::MatMul => {
+                    if let (Some(&a_id), Some(&b_id)) = (inputs.get(0), inputs.get(1)) {
+                        let a_val = &self.nodes.get(&a_id).unwrap().value.clone();
+                        let b_val = &self.nodes.get(&b_id).unwrap().value.clone();
 
-                            if let Some(input) = self.nodes.get_mut(&input_id) {
-                                input.gradient = Some(match &input.gradient {
-                                    Some(g) => g.add(&grad_input),
-                                    None => grad_input,
-                                });
-                            }
+                        let grad_a = a_val.matmul_grad_a(&upstream_grad, b_val);
+                        let grad_b = a_val.matmul_grad_b(a_val, &upstream_grad);
+
+                        if let Some(a) = self.nodes.get_mut(&a_id) {
+                            a.gradient = Some(match &a.gradient {
+                                Some(g) => g.add(&grad_a),
+                                None => grad_a,
+                            });
+                        }
+                        if let Some(b) = self.nodes.get_mut(&b_id) {
+                            b.gradient = Some(match &b.gradient {
+                                Some(g) => g.add(&grad_b),
+                                None => grad_b,
+                            });
                         }
                     }
-                    _ => {} // Other operations handled similarly
-                };
-            }
+                }
+                Operation::ReLU => {
+                    if let Some(&input_id) = inputs.get(0) {
+                        let input_val = &self.nodes.get(&input_id).unwrap().value.clone();
+                        let grad_input = input_val.relu_grad(&upstream_grad);
+
+                        if let Some(input) = self.nodes.get_mut(&input_id) {
+                            input.gradient = Some(match &input.gradient {
+                                Some(g) => g.add(&grad_input),
+                                None => grad_input,
+                            });
+                        }
+                    }
+                }
+                _ => {} // Other operations handled similarly
+            };
         }
     }
 
-    fn topo_sort(&self, node_id: u64, visited: &mut std::collections::HashSet<u64>, order: &mut Vec<u64>) {
-        if visited.contains(&node_id) { return; }
+    fn topo_sort(
+        &self,
+        node_id: u64,
+        visited: &mut std::collections::HashSet<u64>,
+        order: &mut Vec<u64>,
+    ) {
+        if visited.contains(&node_id) {
+            return;
+        }
         visited.insert(node_id);
 
         if let Some(node) = self.nodes.get(&node_id) {
@@ -480,15 +861,49 @@ impl ComputationGraph {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn int8_linear_is_close_to_fp32() {
+        let w = Tensor {
+            shape: vec![3, 2],
+            data: vec![0.5, -0.2, 1.2, 0.7, -0.4, 0.1],
+        };
+        let x = Tensor {
+            shape: vec![2, 3],
+            data: vec![1.0, 0.5, -1.0, 0.2, -0.1, 0.3],
+        };
+        let b = Tensor {
+            shape: vec![2],
+            data: vec![0.05, -0.03],
+        };
+
+        let q = w.quantize_linear_int8().expect("quantize");
+        let y_int8 = x.linear_int8(&q, Some(&b)).expect("int8 linear");
+        let y_fp32 = x.matmul(&w).add(&Tensor {
+            shape: vec![2, 2],
+            data: vec![0.05, -0.03, 0.05, -0.03],
+        });
+
+        for (a, b) in y_int8.data.iter().zip(y_fp32.data.iter()) {
+            assert!((a - b).abs() < 0.05, "int8 error too high: {a} vs {b}");
+        }
+
+        assert!(q.effective_bytes_per_param() <= 1.8);
+    }
+}
+
 // =========================================================================
 // Advanced Optimizers with Learning Rate Scheduling
 // =========================================================================
 
 #[derive(Debug, Clone)]
 pub struct OptimizerState {
-    pub momentum: HashMap<u64, Vec<f32>>,     // For momentum-based optimizers
-    pub velocity_m: HashMap<u64, Vec<f32>>,   // First moment (Adam)
-    pub velocity_v: HashMap<u64, Vec<f32>>,   // Second moment (Adam)
+    pub momentum: HashMap<u64, Vec<f32>>, // For momentum-based optimizers
+    pub velocity_m: HashMap<u64, Vec<f32>>, // First moment (Adam)
+    pub velocity_v: HashMap<u64, Vec<f32>>, // Second moment (Adam)
     pub step_count: u64,
 }
 
@@ -504,7 +919,10 @@ impl OptimizerState {
 }
 
 pub enum Optimizer {
-    SGD { learning_rate: f32, momentum: f32 },
+    SGD {
+        learning_rate: f32,
+        momentum: f32,
+    },
     Adam {
         learning_rate: f32,
         beta1: f32,
@@ -533,7 +951,10 @@ impl Optimizer {
         state: &mut OptimizerState,
     ) {
         match self {
-            Optimizer::SGD { learning_rate, momentum } => {
+            Optimizer::SGD {
+                learning_rate,
+                momentum,
+            } => {
                 Self::sgd_step(weights, gradients, *learning_rate, *momentum, state);
             }
             Optimizer::Adam {
@@ -542,7 +963,15 @@ impl Optimizer {
                 beta2,
                 epsilon,
             } => {
-                Self::adam_step(weights, gradients, *learning_rate, *beta1, *beta2, *epsilon, state);
+                Self::adam_step(
+                    weights,
+                    gradients,
+                    *learning_rate,
+                    *beta1,
+                    *beta2,
+                    *epsilon,
+                    state,
+                );
             }
             Optimizer::AdamW {
                 learning_rate,
@@ -552,7 +981,14 @@ impl Optimizer {
                 weight_decay,
             } => {
                 Self::adamw_step(
-                    weights, gradients, *learning_rate, *beta1, *beta2, *epsilon, *weight_decay, state,
+                    weights,
+                    gradients,
+                    *learning_rate,
+                    *beta1,
+                    *beta2,
+                    *epsilon,
+                    *weight_decay,
+                    state,
                 );
             }
             Optimizer::RMSprop {
@@ -565,8 +1001,15 @@ impl Optimizer {
         }
     }
 
-    fn sgd_step(weights: &mut [f32], grads: &[f32], lr: f32, momentum: f32, state: &mut OptimizerState) {
-        let momentum_vec = state.momentum
+    fn sgd_step(
+        weights: &mut [f32],
+        grads: &[f32],
+        lr: f32,
+        momentum: f32,
+        state: &mut OptimizerState,
+    ) {
+        let momentum_vec = state
+            .momentum
             .entry(0)
             .or_insert_with(|| vec![0.0; weights.len()]);
 
@@ -596,10 +1039,12 @@ impl Optimizer {
         let bias_correction1 = 1.0 - beta1.powf(step);
         let bias_correction2 = 1.0 - beta2.powf(step);
 
-        let m = state.velocity_m
+        let m = state
+            .velocity_m
             .entry(0)
             .or_insert_with(|| vec![0.0; weights.len()]);
-        let v = state.velocity_v
+        let v = state
+            .velocity_v
             .entry(0)
             .or_insert_with(|| vec![0.0; weights.len()]);
 
@@ -643,7 +1088,8 @@ impl Optimizer {
         eps: f32,
         state: &mut OptimizerState,
     ) {
-        let v = state.velocity_v
+        let v = state
+            .velocity_v
             .entry(0)
             .or_insert_with(|| vec![0.0; weights.len()]);
 
@@ -683,7 +1129,10 @@ impl LearningRateScheduler {
     pub fn get_lr(&self) -> f32 {
         match &self.schedule {
             ScheduleType::Constant => self.initial_lr,
-            ScheduleType::Linear { final_lr, total_steps } => {
+            ScheduleType::Linear {
+                final_lr,
+                total_steps,
+            } => {
                 let progress = (self.step as f32) / (*total_steps as f32);
                 self.initial_lr + (final_lr - self.initial_lr) * progress
             }
@@ -720,46 +1169,56 @@ impl LossFunctions {
     /// Mean Squared Error loss with numerical stability
     pub fn mse(predictions: &Tensor, targets: &Tensor) -> f32 {
         assert_eq!(predictions.shape, targets.shape, "Shape mismatch in MSE");
-        predictions.data.iter()
+        predictions
+            .data
+            .iter()
             .zip(&targets.data)
             .map(|(p, t)| {
                 let diff = p - t;
                 diff * diff
             })
-            .sum::<f32>() / predictions.numel().max(1) as f32
+            .sum::<f32>()
+            / predictions.numel().max(1) as f32
     }
 
     /// Cross-Entropy loss with numerical stability (log-sum-exp trick)
     pub fn cross_entropy(logits: &Tensor, targets: &Tensor) -> f32 {
-        assert_eq!(logits.shape, targets.shape, "Shape mismatch in Cross-Entropy");
+        assert_eq!(
+            logits.shape, targets.shape,
+            "Shape mismatch in Cross-Entropy"
+        );
 
         // Numerically stable cross-entropy
         let max_logit = logits.data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let exp_logits: Vec<f32> = logits.data.iter()
-            .map(|x| (x - max_logit).exp())
-            .collect();
+        let exp_logits: Vec<f32> = logits.data.iter().map(|x| (x - max_logit).exp()).collect();
         let sum_exp: f32 = exp_logits.iter().sum();
 
-        logits.data.iter()
+        logits
+            .data
+            .iter()
             .zip(&targets.data)
             .enumerate()
             .map(|(i, (logit, target))| {
                 let prob = exp_logits[i] / sum_exp;
                 -target * (prob.max(1e-8).ln())
             })
-            .sum::<f32>() / logits.numel().max(1) as f32
+            .sum::<f32>()
+            / logits.numel().max(1) as f32
     }
 
     /// Binary Cross-Entropy with numerical stability
     pub fn binary_cross_entropy(predictions: &Tensor, targets: &Tensor) -> f32 {
         assert_eq!(predictions.shape, targets.shape, "Shape mismatch in BCE");
-        predictions.data.iter()
+        predictions
+            .data
+            .iter()
             .zip(&targets.data)
             .map(|(p, t)| {
                 let p = p.max(1e-8).min(1.0 - 1e-8);
                 -t * p.ln() - (1.0 - t) * (1.0 - p).ln()
             })
-            .sum::<f32>() / predictions.numel().max(1) as f32
+            .sum::<f32>()
+            / predictions.numel().max(1) as f32
     }
 
     /// Compute MSE gradient
@@ -767,7 +1226,9 @@ impl LossFunctions {
         assert_eq!(predictions.shape, targets.shape);
         Tensor {
             shape: predictions.shape.clone(),
-            data: predictions.data.iter()
+            data: predictions
+                .data
+                .iter()
                 .zip(&targets.data)
                 .map(|(p, t)| 2.0 * (p - t) / predictions.numel().max(1) as f32)
                 .collect(),
@@ -780,14 +1241,13 @@ impl LossFunctions {
 
         // Softmax probabilities with stability
         let max_logit = logits.data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let exp_logits: Vec<f32> = logits.data.iter()
-            .map(|x| (x - max_logit).exp())
-            .collect();
+        let exp_logits: Vec<f32> = logits.data.iter().map(|x| (x - max_logit).exp()).collect();
         let sum_exp: f32 = exp_logits.iter().sum();
 
         Tensor {
             shape: logits.shape.clone(),
-            data: exp_logits.iter()
+            data: exp_logits
+                .iter()
                 .zip(&targets.data)
                 .map(|(prob_unnorm, target)| {
                     let prob = prob_unnorm / sum_exp;
@@ -807,25 +1267,19 @@ pub struct Regularization;
 impl Regularization {
     /// L2 regularization penalty
     pub fn l2_penalty(weights: &Tensor, lambda: f32) -> f32 {
-        lambda * weights.data.iter()
-            .map(|w| w * w)
-            .sum::<f32>()
+        lambda * weights.data.iter().map(|w| w * w).sum::<f32>()
     }
 
     /// L1 regularization penalty
     pub fn l1_penalty(weights: &Tensor, lambda: f32) -> f32 {
-        lambda * weights.data.iter()
-            .map(|w| w.abs())
-            .sum::<f32>()
+        lambda * weights.data.iter().map(|w| w.abs()).sum::<f32>()
     }
 
     /// Compute L2 gradient
     pub fn l2_gradient(weights: &Tensor, lambda: f32) -> Tensor {
         Tensor {
             shape: weights.shape.clone(),
-            data: weights.data.iter()
-                .map(|w| 2.0 * lambda * w)
-                .collect(),
+            data: weights.data.iter().map(|w| 2.0 * lambda * w).collect(),
         }
     }
 
@@ -833,13 +1287,10 @@ impl Regularization {
     pub fn l1_gradient(weights: &Tensor, lambda: f32) -> Tensor {
         Tensor {
             shape: weights.shape.clone(),
-            data: weights.data.iter()
-                .map(|w| lambda * w.signum())
-                .collect(),
+            data: weights.data.iter().map(|w| lambda * w.signum()).collect(),
         }
     }
 }
 
 // Implemented optimizer suite without external dependencies
 // SGD, Adam, AdamW, RMSprop all use simple indexing patterns
-

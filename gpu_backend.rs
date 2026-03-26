@@ -1,9 +1,9 @@
-
-
 #![allow(dead_code)]
 
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use matrixmultiply::sgemm;
 
 // GPU buffer handle (opaque to users)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -147,17 +147,9 @@ impl GpuBackendImpl for CpuBackend {
         b: &GpuBufferHandle,
         out: &GpuBufferHandle,
     ) -> Result<(), String> {
-        let buffers = self.buffers.lock().unwrap();
-
-        let buf_a = buffers
-            .get(&a.id)
-            .ok_or("Buffer A not found")?;
-        let buf_b = buffers
-            .get(&b.id)
-            .ok_or("Buffer B not found")?;
-        let buf_out = buffers
-            .get(&out.id)
-            .ok_or("Output buffer not found")?;
+        let mut buffers = self.buffers.lock().unwrap();
+        let buf_a = buffers.get(&a.id).cloned().ok_or("Buffer A not found")?;
+        let buf_b = buffers.get(&b.id).cloned().ok_or("Buffer B not found")?;
 
         // Simple CPU matmul
         if buf_a.shape.len() < 2 || buf_b.shape.len() < 2 {
@@ -172,7 +164,70 @@ impl GpuBackendImpl for CpuBackend {
             return Err("Dimension mismatch in matmul".into());
         }
 
-        // CPU computation (simplified)
+        let mut out_data = vec![0.0f32; m * n];
+        if m.saturating_mul(k).saturating_mul(n) >= 262_144 {
+            gemm_matrixmultiply(&buf_a.data, &buf_b.data, m, k, n, &mut out_data);
+        } else {
+        let b_t = transpose_2d(&buf_b.data, k, n);
+
+        let ops = m.saturating_mul(k).saturating_mul(n);
+        let threads = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let use_blocked = m >= 64 && k >= 64 && n >= 64;
+
+        if threads > 1 && ops >= 1_000_000 {
+            let rows_per_chunk = m.div_ceil(threads);
+            thread::scope(|scope| {
+                for (chunk_idx, out_chunk) in out_data.chunks_mut(rows_per_chunk * n).enumerate() {
+                    let row_start = chunk_idx * rows_per_chunk;
+                    let row_end = (row_start + rows_per_chunk).min(m);
+                    let a_data = &buf_a.data;
+                    let bt_data = &b_t;
+
+                    scope.spawn(move || {
+                        if use_blocked {
+                            matmul_blocked_rows(
+                                a_data,
+                                bt_data,
+                                row_start,
+                                row_end,
+                                k,
+                                n,
+                                out_chunk,
+                                row_start,
+                            );
+                        } else {
+                            for row in row_start..row_end {
+                                let local_row = row - row_start;
+                                let out_row = &mut out_chunk[local_row * n..(local_row + 1) * n];
+                                let a_row = &a_data[row * k..(row + 1) * k];
+                                for col in 0..n {
+                                    let b_row = &bt_data[col * k..(col + 1) * k];
+                                    out_row[col] = dot_unrolled_8(a_row, b_row);
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        } else if use_blocked {
+            matmul_blocked_rows(&buf_a.data, &b_t, 0, m, k, n, &mut out_data, 0);
+        } else {
+            for i in 0..m {
+                let a_row = &buf_a.data[i * k..(i + 1) * k];
+                for j in 0..n {
+                    let b_row = &b_t[j * k..(j + 1) * k];
+                    out_data[i * n + j] = dot_unrolled_8(a_row, b_row);
+                }
+            }
+        }
+        }
+
+        let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
+        out_buf.data = out_data;
+        out_buf.shape = vec![m, n];
+
         Ok(())
     }
 
@@ -229,6 +284,102 @@ impl GpuBackendImpl for CpuBackend {
     fn is_available(&self) -> bool {
         true // CPU is always available
     }
+}
+
+fn gemm_matrixmultiply(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, out: &mut [f32]) {
+    unsafe {
+        sgemm(
+            m,
+            k,
+            n,
+            1.0,
+            a.as_ptr(),
+            k as isize,
+            1,
+            b.as_ptr(),
+            n as isize,
+            1,
+            0.0,
+            out.as_mut_ptr(),
+            n as isize,
+            1,
+        );
+    }
+}
+
+fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
+}
+
+fn matmul_blocked_rows(
+    a_data: &[f32],
+    bt_data: &[f32],
+    row_start: usize,
+    row_end: usize,
+    k: usize,
+    n: usize,
+    out_chunk: &mut [f32],
+    out_row_base: usize,
+) {
+    const BK: usize = 64;
+    const BN: usize = 64;
+    for row in row_start..row_end {
+        let out_row_local = row - out_row_base;
+        let out_row = &mut out_chunk[out_row_local * n..(out_row_local + 1) * n];
+        let a_row = &a_data[row * k..(row + 1) * k];
+        for col_block in (0..n).step_by(BN) {
+            let col_end = (col_block + BN).min(n);
+            for col in col_block..col_end {
+                let b_row = &bt_data[col * k..(col + 1) * k];
+                let mut acc = 0.0f32;
+                for kk_block in (0..k).step_by(BK) {
+                    let kk_end = (kk_block + BK).min(k);
+                    acc += dot_unrolled_8(&a_row[kk_block..kk_end], &b_row[kk_block..kk_end]);
+                }
+                out_row[col] = acc;
+            }
+        }
+    }
+}
+
+fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
+    let len = lhs.len();
+    let chunks = len / 8;
+    let mut i = 0;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut s4 = 0.0f32;
+    let mut s5 = 0.0f32;
+    let mut s6 = 0.0f32;
+    let mut s7 = 0.0f32;
+
+    for _ in 0..chunks {
+        s0 += lhs[i] * rhs[i];
+        s1 += lhs[i + 1] * rhs[i + 1];
+        s2 += lhs[i + 2] * rhs[i + 2];
+        s3 += lhs[i + 3] * rhs[i + 3];
+        s4 += lhs[i + 4] * rhs[i + 4];
+        s5 += lhs[i + 5] * rhs[i + 5];
+        s6 += lhs[i + 6] * rhs[i + 6];
+        s7 += lhs[i + 7] * rhs[i + 7];
+        i += 8;
+    }
+
+    let mut tail = 0.0f32;
+    while i < len {
+        tail += lhs[i] * rhs[i];
+        i += 1;
+    }
+
+    s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + tail
 }
 
 // =============================================================================
@@ -421,25 +572,110 @@ impl GpuBackend {
 pub struct GpuMemoryManager {
     backend: GpuBackend,
     allocated: Arc<Mutex<HashMap<u64, GpuBuffer>>>,
+    current_bytes: Arc<Mutex<usize>>,
+    config: Arc<Mutex<GpuMemoryConfig>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GpuMemoryConfig {
+    /// Memory reserved for runtime + model base footprint.
+    pub base_reserved_bytes: usize,
+    /// Additional bytes allowed above `base_reserved_bytes`.
+    pub max_extra_bytes: usize,
+}
+
+impl GpuMemoryConfig {
+    pub fn total_budget_bytes(self) -> usize {
+        self.base_reserved_bytes
+            .saturating_add(self.max_extra_bytes)
+    }
 }
 
 impl GpuMemoryManager {
     pub fn new(backend: GpuBackend) -> Self {
+        Self::new_with_config(
+            backend,
+            GpuMemoryConfig {
+                base_reserved_bytes: 0,
+                max_extra_bytes: usize::MAX / 2,
+            },
+        )
+    }
+
+    pub fn new_with_config(backend: GpuBackend, config: GpuMemoryConfig) -> Self {
         GpuMemoryManager {
             backend,
             allocated: Arc::new(Mutex::new(HashMap::new())),
+            current_bytes: Arc::new(Mutex::new(0)),
+            config: Arc::new(Mutex::new(config)),
         }
     }
 
-    pub fn allocate(&self, shape: Vec<usize>, init_val: f32) -> GpuBufferHandle {
+    pub fn set_base_reserved_bytes(&self, bytes: usize) {
+        let mut cfg = self.config.lock().unwrap();
+        cfg.base_reserved_bytes = bytes;
+    }
+
+    pub fn set_max_extra_bytes(&self, bytes: usize) {
+        let mut cfg = self.config.lock().unwrap();
+        cfg.max_extra_bytes = bytes;
+    }
+
+    pub fn memory_budget_bytes(&self) -> usize {
+        self.config.lock().unwrap().total_budget_bytes()
+    }
+
+    pub fn used_bytes(&self) -> usize {
+        *self.current_bytes.lock().unwrap()
+    }
+
+    pub fn allocate(&self, shape: Vec<usize>, init_val: f32) -> Result<GpuBufferHandle, String> {
         let numel: usize = shape.iter().product();
         let data = vec![init_val; numel];
-        self.backend.upload(&data, shape)
+        self.allocate_from_data(shape, data)
+    }
+
+    pub fn allocate_from_data(
+        &self,
+        shape: Vec<usize>,
+        data: Vec<f32>,
+    ) -> Result<GpuBufferHandle, String> {
+        let numel: usize = shape.iter().product();
+        if data.len() != numel {
+            return Err("Data length does not match shape".into());
+        }
+        let requested_bytes = numel.saturating_mul(std::mem::size_of::<f32>());
+        let budget_bytes = self.memory_budget_bytes();
+        let mut used = self.current_bytes.lock().unwrap();
+        if used.saturating_add(requested_bytes) > budget_bytes {
+            return Err(format!(
+                "GPU memory budget exceeded: requested={} used={} budget={}",
+                requested_bytes, *used, budget_bytes
+            ));
+        }
+
+        let shape_clone = shape.clone();
+        let handle = self.backend.upload(&data, shape);
+        self.allocated.lock().unwrap().insert(
+            handle.id,
+            GpuBuffer {
+                id: handle.id,
+                data,
+                shape: shape_clone,
+                device: self.backend.backend_name().to_string(),
+            },
+        );
+        *used += requested_bytes;
+        Ok(handle)
     }
 
     pub fn free(&self, handle: &GpuBufferHandle) {
-        let mut allocated = self.allocated.lock().unwrap();
-        allocated.remove(&handle.id);
+        let removed = self.allocated.lock().unwrap().remove(&handle.id);
+        if let Some(buffer) = removed {
+            let mut used = self.current_bytes.lock().unwrap();
+            let bytes = buffer.data.len().saturating_mul(std::mem::size_of::<f32>());
+            *used = used.saturating_sub(bytes);
+        }
     }
 
     pub fn get_stats(&self) -> (usize, usize) {
@@ -447,6 +683,23 @@ impl GpuMemoryManager {
         let count = allocated.len();
         let total_elements: usize = allocated.values().map(|b| b.data.len()).sum();
         (count, total_elements)
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        self.backend.backend_name()
+    }
+
+    pub fn matmul(
+        &self,
+        a: &GpuBufferHandle,
+        b: &GpuBufferHandle,
+        out: &GpuBufferHandle,
+    ) -> Result<(), String> {
+        self.backend.matmul(a, b, out)
+    }
+
+    pub fn download(&self, handle: &GpuBufferHandle) -> Vec<f32> {
+        self.backend.download(handle)
     }
 }
 
@@ -524,13 +777,39 @@ mod tests {
     }
 
     #[test]
+    fn test_cpu_backend_matmul_correctness() {
+        let backend = CpuBackend::new();
+        let a = backend.upload(&[1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let b = backend.upload(&[5.0, 6.0, 7.0, 8.0], vec![2, 2]);
+        let out = backend.upload(&[0.0, 0.0, 0.0, 0.0], vec![2, 2]);
+        backend.matmul(&a, &b, &out).unwrap();
+        let got = backend.download(&out);
+        assert_eq!(got, vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    #[test]
     fn test_memory_manager() {
         let backend = GpuBackend::cpu();
         let manager = GpuMemoryManager::new(backend);
-        let handle = manager.allocate(vec![10, 10], 0.0);
+        let handle = manager.allocate(vec![10, 10], 0.0).unwrap();
         let (count, total) = manager.get_stats();
         assert!(count > 0);
         assert_eq!(total, 100);
+        assert!(manager.used_bytes() >= 400);
         manager.free(&handle);
+    }
+
+    #[test]
+    fn test_memory_budget_limit() {
+        let backend = GpuBackend::cpu();
+        let manager = GpuMemoryManager::new_with_config(
+            backend,
+            GpuMemoryConfig {
+                base_reserved_bytes: 128,
+                max_extra_bytes: 128,
+            },
+        );
+        let too_large = manager.allocate(vec![100], 0.0);
+        assert!(too_large.is_err());
     }
 }

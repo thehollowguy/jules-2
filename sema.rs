@@ -76,11 +76,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    AccessMode, AgentDecl, AssignOpKind, Attribute, BehaviorRule, Block,
-    ComponentAccess, ComponentDecl, EpisodeSpec, EntityQuery, Expr,
-    FnDecl, GoalDecl, Item, LearningKind, MatchArm, ModelDecl, ModelLayer,
-    Param, ParallelFor, Pattern, PerceptionKind, Program, SignalSpec,
-    Stmt, SystemDecl, TrainDecl,
+    AccessMode, AgentDecl, AssignOpKind, Attribute, BehaviorRule, Block, ComponentAccess,
+    ComponentDecl, EntityQuery, EpisodeSpec, Expr, FnDecl, GoalDecl, Item, LearningKind, MatchArm,
+    ModelDecl, ModelLayer, ParallelFor, Param, Pattern, PerceptionKind, Program, SignalSpec, Stmt,
+    SystemDecl, TrainDecl,
 };
 use crate::lexer::Span;
 
@@ -100,28 +99,45 @@ pub enum Severity {
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub severity: Severity,
-    pub span:     Span,
-    pub message:  String,
+    pub span: Span,
+    pub message: String,
     /// Secondary labels pointing at related source locations.
-    pub labels:   Vec<(Span, String)>,
+    pub labels: Vec<(Span, String)>,
 }
 
 impl Diagnostic {
     pub fn error(span: Span, msg: impl Into<String>) -> Self {
-        Diagnostic { severity: Severity::Error, span, message: msg.into(), labels: vec![] }
+        Diagnostic {
+            severity: Severity::Error,
+            span,
+            message: msg.into(),
+            labels: vec![],
+        }
     }
     pub fn warning(span: Span, msg: impl Into<String>) -> Self {
-        Diagnostic { severity: Severity::Warning, span, message: msg.into(), labels: vec![] }
+        Diagnostic {
+            severity: Severity::Warning,
+            span,
+            message: msg.into(),
+            labels: vec![],
+        }
     }
     pub fn note(span: Span, msg: impl Into<String>) -> Self {
-        Diagnostic { severity: Severity::Note, span, message: msg.into(), labels: vec![] }
+        Diagnostic {
+            severity: Severity::Note,
+            span,
+            message: msg.into(),
+            labels: vec![],
+        }
     }
     /// Attach a secondary label to a different source location.
     pub fn with_label(mut self, span: Span, msg: impl Into<String>) -> Self {
         self.labels.push((span, msg.into()));
         self
     }
-    pub fn is_fatal(&self) -> bool { self.severity == Severity::Error }
+    pub fn is_fatal(&self) -> bool {
+        self.severity == Severity::Error
+    }
 }
 
 /// Collects all diagnostics emitted during the semantic pass.
@@ -131,14 +147,29 @@ pub struct Diagnostics {
 }
 
 impl Diagnostics {
-    pub fn push(&mut self, d: Diagnostic) { self.items.push(d); }
-    pub fn error  (&mut self, span: Span, msg: impl Into<String>) { self.push(Diagnostic::error(span, msg)); }
-    pub fn warning(&mut self, span: Span, msg: impl Into<String>) { self.push(Diagnostic::warning(span, msg)); }
-    pub fn note   (&mut self, span: Span, msg: impl Into<String>) { self.push(Diagnostic::note(span, msg)); }
-    pub fn has_errors(&self) -> bool { self.items.iter().any(|d| d.is_fatal()) }
-    pub fn error_count(&self) -> usize { self.items.iter().filter(|d| d.is_fatal()).count() }
+    pub fn push(&mut self, d: Diagnostic) {
+        self.items.push(d);
+    }
+    pub fn error(&mut self, span: Span, msg: impl Into<String>) {
+        self.push(Diagnostic::error(span, msg));
+    }
+    pub fn warning(&mut self, span: Span, msg: impl Into<String>) {
+        self.push(Diagnostic::warning(span, msg));
+    }
+    pub fn note(&mut self, span: Span, msg: impl Into<String>) {
+        self.push(Diagnostic::note(span, msg));
+    }
+    pub fn has_errors(&self) -> bool {
+        self.items.iter().any(|d| d.is_fatal())
+    }
+    pub fn error_count(&self) -> usize {
+        self.items.iter().filter(|d| d.is_fatal()).count()
+    }
     pub fn warning_count(&self) -> usize {
-        self.items.iter().filter(|d| d.severity == Severity::Warning).count()
+        self.items
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count()
     }
 }
 
@@ -149,8 +180,8 @@ impl Diagnostics {
 /// Tracks one declared variable in the current scope.
 #[derive(Debug, Clone)]
 struct Binding {
-    span:     Span,
-    mutable:  bool,
+    span: Span,
+    mutable: bool,
     /// Number of times this binding has been *read* since its declaration.
     use_count: u32,
     /// True if this binding was declared with `_` (intentionally unused).
@@ -159,7 +190,12 @@ struct Binding {
 
 impl Binding {
     fn new(span: Span, mutable: bool, is_wildcard: bool) -> Self {
-        Binding { span, mutable, use_count: 0, is_wildcard }
+        Binding {
+            span,
+            mutable,
+            use_count: 0,
+            is_wildcard,
+        }
     }
 }
 
@@ -222,8 +258,13 @@ impl ScopeStack {
     /// used to detect shadowing.
     fn is_outer_name(&self, name: &str) -> bool {
         let len = self.scopes.len();
-        if len < 2 { return false; }
-        self.scopes[..len - 1].iter().rev().any(|s| s.contains_key(name))
+        if len < 2 {
+            return false;
+        }
+        self.scopes[..len - 1]
+            .iter()
+            .rev()
+            .any(|s| s.contains_key(name))
     }
 }
 
@@ -254,30 +295,38 @@ struct CfStack {
 }
 
 impl CfStack {
-    fn push(&mut self, f: CfFrame) { self.frames.push(f); }
-    fn pop(&mut self) { self.frames.pop(); }
+    fn push(&mut self, f: CfFrame) {
+        self.frames.push(f);
+    }
+    fn pop(&mut self) {
+        self.frames.pop();
+    }
 
     fn in_loop(&self) -> bool {
-        self.frames.iter().rev().any(|f| matches!(f,
-            CfFrame::Loop { .. } | CfFrame::ParallelLoop { .. }
-        ))
+        self.frames
+            .iter()
+            .rev()
+            .any(|f| matches!(f, CfFrame::Loop { .. } | CfFrame::ParallelLoop { .. }))
     }
 
     fn in_async_fn(&self) -> bool {
-        self.frames.iter().rev().any(|f| matches!(f,
-            CfFrame::Function { is_async: true, .. }
-        ))
+        self.frames
+            .iter()
+            .rev()
+            .any(|f| matches!(f, CfFrame::Function { is_async: true, .. }))
     }
 
     fn in_function(&self) -> bool {
-        self.frames.iter().any(|f| matches!(f, CfFrame::Function { .. }))
+        self.frames
+            .iter()
+            .any(|f| matches!(f, CfFrame::Function { .. }))
     }
 
     /// Returns `true` if a loop with `label` is reachable from current position.
     fn has_label(&self, label: &str) -> bool {
         self.frames.iter().rev().any(|f| match f {
-            CfFrame::Loop        { label: Some(l), .. } => l == label,
-            CfFrame::ParallelLoop{ label: Some(l), .. } => l == label,
+            CfFrame::Loop { label: Some(l), .. } => l == label,
+            CfFrame::ParallelLoop { label: Some(l), .. } => l == label,
             _ => false,
         })
     }
@@ -296,9 +345,9 @@ impl CfStack {
 
 #[derive(Debug, Clone)]
 struct DeclRecord {
-    span:       Span,
-    use_count:  u32,
-    kind:       DeclKind,
+    span: Span,
+    use_count: u32,
+    kind: DeclKind,
     deprecated: bool,
 }
 
@@ -326,11 +375,27 @@ struct DeclRegistry {
 
 impl DeclRegistry {
     fn register(&mut self, name: impl Into<String>, span: Span, kind: DeclKind) {
-        self.records.insert(name.into(), DeclRecord { span, use_count: 0, kind, deprecated: false });
+        self.records.insert(
+            name.into(),
+            DeclRecord {
+                span,
+                use_count: 0,
+                kind,
+                deprecated: false,
+            },
+        );
     }
 
     fn register_deprecated(&mut self, name: impl Into<String>, span: Span, kind: DeclKind) {
-        self.records.insert(name.into(), DeclRecord { span, use_count: 0, kind, deprecated: true });
+        self.records.insert(
+            name.into(),
+            DeclRecord {
+                span,
+                use_count: 0,
+                kind,
+                deprecated: true,
+            },
+        );
     }
 
     fn is_deprecated(&self, name: &str) -> bool {
@@ -338,11 +403,14 @@ impl DeclRegistry {
     }
 
     fn mark_used(&mut self, name: &str) {
-        if let Some(r) = self.records.get_mut(name) { r.use_count += 1; }
+        if let Some(r) = self.records.get_mut(name) {
+            r.use_count += 1;
+        }
     }
 
     fn unused(&self) -> impl Iterator<Item = (&str, &DeclRecord)> {
-        self.records.iter()
+        self.records
+            .iter()
             .filter(|(name, r)| r.use_count == 0 && !name.starts_with('_'))
             .map(|(n, r)| (n.as_str(), r))
     }
@@ -355,15 +423,19 @@ impl DeclRegistry {
 /// The read / write set for one entity-loop or system.
 #[derive(Debug, Default, Clone)]
 struct ComponentSet {
-    reads:  HashSet<String>,
+    reads: HashSet<String>,
     writes: HashSet<String>,
 }
 
 impl ComponentSet {
     fn add(&mut self, component: &str, mode: AccessMode) {
         match mode {
-            AccessMode::Read  => { self.reads.insert(component.to_owned()); }
-            AccessMode::Write => { self.writes.insert(component.to_owned()); }
+            AccessMode::Read => {
+                self.reads.insert(component.to_owned());
+            }
+            AccessMode::Write => {
+                self.writes.insert(component.to_owned());
+            }
             AccessMode::ReadWrite => {
                 self.reads.insert(component.to_owned());
                 self.writes.insert(component.to_owned());
@@ -395,44 +467,54 @@ impl ComponentSet {
 
 /// The top-level semantic analysis context.
 pub struct SemaCtx {
-    pub diag:      Diagnostics,
-    scopes:        ScopeStack,
-    cf:            CfStack,
-    decls:         DeclRegistry,
+    pub diag: Diagnostics,
+    scopes: ScopeStack,
+    cf: CfStack,
+    decls: DeclRegistry,
     /// All component names declared in the program.
-    components:    HashSet<String>,
+    components: HashSet<String>,
     /// Per-system component access sets (for aliasing analysis).
-    system_sets:   Vec<(String, Span, ComponentSet)>,
+    system_sets: Vec<(String, Span, ComponentSet)>,
     /// All agent names that appear in `train` blocks (to warn on unused learning).
     trained_agents: HashSet<String>,
     /// Whether to emit shadowing warnings (controlled by a lint flag).
-    warn_shadow:   bool,
+    warn_shadow: bool,
 }
 
 impl SemaCtx {
     pub fn new() -> Self {
         SemaCtx {
-            diag:           Diagnostics::default(),
-            scopes:         ScopeStack::default(),
-            cf:             CfStack::default(),
-            decls:          DeclRegistry::default(),
-            components:     HashSet::new(),
-            system_sets:    Vec::new(),
+            diag: Diagnostics::default(),
+            scopes: ScopeStack::default(),
+            cf: CfStack::default(),
+            decls: DeclRegistry::default(),
+            components: HashSet::new(),
+            system_sets: Vec::new(),
             trained_agents: HashSet::new(),
-            warn_shadow:    true,
+            warn_shadow: true,
         }
     }
 
     /// Disable shadowing warnings (e.g., for REPL / interactive mode).
-    pub fn silence_shadow_warnings(&mut self) { self.warn_shadow = false; }
+    pub fn silence_shadow_warnings(&mut self) {
+        self.warn_shadow = false;
+    }
 
     // ── Convenience wrappers ────────────────────────────────────────────────
 
-    fn err (&mut self, span: Span, msg: impl Into<String>) { self.diag.error(span, msg); }
-    fn warn(&mut self, span: Span, msg: impl Into<String>) { self.diag.warning(span, msg); }
-    fn note(&mut self, span: Span, msg: impl Into<String>) { self.diag.note(span, msg); }
+    fn err(&mut self, span: Span, msg: impl Into<String>) {
+        self.diag.error(span, msg);
+    }
+    fn warn(&mut self, span: Span, msg: impl Into<String>) {
+        self.diag.warning(span, msg);
+    }
+    fn note(&mut self, span: Span, msg: impl Into<String>) {
+        self.diag.note(span, msg);
+    }
 
-    fn push_scope(&mut self) { self.scopes.push(); }
+    fn push_scope(&mut self) {
+        self.scopes.push();
+    }
 
     fn pop_scope(&mut self) {
         for (name, binding) in self.scopes.pop() {
@@ -443,18 +525,16 @@ impl SemaCtx {
         }
     }
 
-    fn declare_var(
-        &mut self,
-        name: &str,
-        span: Span,
-        mutable: bool,
-    ) {
+    fn declare_var(&mut self, name: &str, span: Span, mutable: bool) {
         if self.warn_shadow && self.scopes.is_outer_name(name) {
-            self.warn(span,
-                format!("binding `{}` shadows an outer variable", name));
+            self.warn(
+                span,
+                format!("binding `{}` shadows an outer variable", name),
+            );
         }
         let wildcard = name == "_" || name.starts_with('_');
-        self.scopes.declare(name, Binding::new(span, mutable, wildcard));
+        self.scopes
+            .declare(name, Binding::new(span, mutable, wildcard));
     }
 
     fn use_var(&mut self, name: &str, span: Span) {
@@ -498,20 +578,24 @@ impl SemaCtx {
     fn collect_decls(&mut self, program: &Program) {
         for item in &program.items {
             match item {
-                Item::Fn(f)        => self.decls.register(&f.name, f.span, DeclKind::Function),
-                Item::System(s)    => self.decls.register(&s.name, s.span, DeclKind::System),
+                Item::Fn(f) => self.decls.register(&f.name, f.span, DeclKind::Function),
+                Item::System(s) => self.decls.register(&s.name, s.span, DeclKind::System),
                 Item::Component(c) => {
                     self.decls.register(&c.name, c.span, DeclKind::Component);
                     self.components.insert(c.name.clone());
                 }
-                Item::Struct(s)    => self.decls.register(&s.name, s.span, DeclKind::Struct),
-                Item::Enum(e)      => self.decls.register(&e.name, e.span, DeclKind::Enum),
-                Item::Agent(a)     => self.decls.register(&a.name, a.span, DeclKind::Agent),
-                Item::Model(m)     => self.decls.register(&m.name, m.span, DeclKind::Model),
-                Item::Const(c)     => self.decls.register(&c.name, c.span, DeclKind::Const),
-                Item::Mod { items: Some(inner), .. } => {
+                Item::Struct(s) => self.decls.register(&s.name, s.span, DeclKind::Struct),
+                Item::Enum(e) => self.decls.register(&e.name, e.span, DeclKind::Enum),
+                Item::Agent(a) => self.decls.register(&a.name, a.span, DeclKind::Agent),
+                Item::Model(m) => self.decls.register(&m.name, m.span, DeclKind::Model),
+                Item::Const(c) => self.decls.register(&c.name, c.span, DeclKind::Const),
+                Item::Mod {
+                    items: Some(inner), ..
+                } => {
                     // Recurse into inline modules.
-                    for i in inner { self.collect_item_decl(i); }
+                    for i in inner {
+                        self.collect_item_decl(i);
+                    }
                 }
                 _ => {}
             }
@@ -520,17 +604,17 @@ impl SemaCtx {
 
     fn collect_item_decl(&mut self, item: &Item) {
         match item {
-            Item::Fn(f)        => self.decls.register(&f.name, f.span, DeclKind::Function),
-            Item::System(s)    => self.decls.register(&s.name, s.span, DeclKind::System),
+            Item::Fn(f) => self.decls.register(&f.name, f.span, DeclKind::Function),
+            Item::System(s) => self.decls.register(&s.name, s.span, DeclKind::System),
             Item::Component(c) => {
                 self.decls.register(&c.name, c.span, DeclKind::Component);
                 self.components.insert(c.name.clone());
             }
-            Item::Struct(s)    => self.decls.register(&s.name, s.span, DeclKind::Struct),
-            Item::Enum(e)      => self.decls.register(&e.name, e.span, DeclKind::Enum),
-            Item::Agent(a)     => self.decls.register(&a.name, a.span, DeclKind::Agent),
-            Item::Model(m)     => self.decls.register(&m.name, m.span, DeclKind::Model),
-            Item::Const(c)     => self.decls.register(&c.name, c.span, DeclKind::Const),
+            Item::Struct(s) => self.decls.register(&s.name, s.span, DeclKind::Struct),
+            Item::Enum(e) => self.decls.register(&e.name, e.span, DeclKind::Enum),
+            Item::Agent(a) => self.decls.register(&a.name, a.span, DeclKind::Agent),
+            Item::Model(m) => self.decls.register(&m.name, m.span, DeclKind::Model),
+            Item::Const(c) => self.decls.register(&c.name, c.span, DeclKind::Const),
             _ => {}
         }
     }
@@ -543,23 +627,31 @@ impl SemaCtx {
 impl SemaCtx {
     fn analyse_item(&mut self, item: &Item) {
         match item {
-            Item::Fn(f)        => self.analyse_fn(f),
-            Item::System(s)    => self.analyse_system(s),
+            Item::Fn(f) => self.analyse_fn(f),
+            Item::System(s) => self.analyse_system(s),
             Item::Component(c) => self.analyse_component(c),
-            Item::Agent(a)     => self.analyse_agent(a),
-            Item::Model(m)     => self.analyse_model(m),
-            Item::Train(t)     => self.analyse_train(t),
-            Item::Const(c)     => {
-                self.cf.push(CfFrame::Function { is_async: false, name: "<const>".into() });
+            Item::Agent(a) => self.analyse_agent(a),
+            Item::Model(m) => self.analyse_model(m),
+            Item::Train(t) => self.analyse_train(t),
+            Item::Const(c) => {
+                self.cf.push(CfFrame::Function {
+                    is_async: false,
+                    name: "<const>".into(),
+                });
                 self.push_scope();
                 self.analyse_expr(&c.value);
                 self.pop_scope();
                 self.cf.pop();
             }
-            Item::Mod { items: Some(inner), .. } => {
-                for i in inner { self.analyse_item(i); }
+            Item::Mod {
+                items: Some(inner), ..
+            } => {
+                for i in inner {
+                    self.analyse_item(i);
+                }
             }
             Item::Struct(_) | Item::Enum(_) | Item::Use(_) | Item::Mod { .. } => {}
+            _ => {}
         }
     }
 
@@ -568,7 +660,10 @@ impl SemaCtx {
     // =========================================================================
 
     fn analyse_fn(&mut self, f: &FnDecl) {
-        self.cf.push(CfFrame::Function { is_async: f.is_async, name: f.name.clone() });
+        self.cf.push(CfFrame::Function {
+            is_async: f.is_async,
+            name: f.name.clone(),
+        });
         self.push_scope();
 
         for param in &f.params {
@@ -594,18 +689,22 @@ impl SemaCtx {
         }
 
         // ── Check the `@simd` / `@parallel` + empty query rule. ───────────────
-        let has_parallel_attr = s.attrs.iter().any(|a| matches!(
-            a, Attribute::Simd | Attribute::Parallel | Attribute::Gpu
-        ));
+        let has_parallel_attr = s
+            .attrs
+            .iter()
+            .any(|a| matches!(a, Attribute::Simd | Attribute::Parallel | Attribute::Gpu));
         if has_parallel_attr {
             if let Some(q) = &s.explicit_query {
                 if q.with.is_empty() {
-                    self.warn(s.span, format!(
-                        "system `{}` is annotated for parallel execution but has \
+                    self.warn(
+                        s.span,
+                        format!(
+                            "system `{}` is annotated for parallel execution but has \
                          an unconstrained query (`with` is empty); \
                          this may process more entities than intended",
-                        s.name
-                    ));
+                            s.name
+                        ),
+                    );
                 }
             }
         }
@@ -618,14 +717,18 @@ impl SemaCtx {
         self.system_sets.push((s.name.clone(), s.span, comp_set));
 
         // ── Analyse the body. ─────────────────────────────────────────────────
-        self.cf.push(CfFrame::Function { is_async: false, name: s.name.clone() });
+        self.cf.push(CfFrame::Function {
+            is_async: false,
+            name: s.name.clone(),
+        });
         self.push_scope();
 
         // Inject system parameters and the world handle.
         for param in &s.params {
             self.declare_var(&param.name, param.span, param.mutable);
         }
-        self.scopes.declare("world", Binding::new(s.span, false, false));
+        self.scopes
+            .declare("world", Binding::new(s.span, false, false));
 
         self.analyse_block(&s.body);
 
@@ -637,44 +740,56 @@ impl SemaCtx {
         // All component names must be declared.
         for comp in q.with.iter().chain(q.without.iter()) {
             if !self.components.contains(comp.as_str()) {
-                self.err(q.span, format!(
-                    "query references component `{}` which has not been declared \
+                self.err(
+                    q.span,
+                    format!(
+                        "query references component `{}` which has not been declared \
                      with the `component` keyword",
-                    comp
-                ));
+                        comp
+                    ),
+                );
             }
             // Mark it used so the unused-decl check doesn't fire.
             self.decls.mark_used(comp);
         }
 
         // Duplicate component names within a query are always a mistake.
-        let mut seen_with:    HashSet<&str> = HashSet::new();
+        let mut seen_with: HashSet<&str> = HashSet::new();
         let mut seen_without: HashSet<&str> = HashSet::new();
 
         for comp in &q.with {
             if !seen_with.insert(comp.as_str()) {
-                self.err(q.span, format!(
-                    "component `{}` appears more than once in `with(…)` clause",
-                    comp
-                ));
+                self.err(
+                    q.span,
+                    format!(
+                        "component `{}` appears more than once in `with(…)` clause",
+                        comp
+                    ),
+                );
             }
         }
         for comp in &q.without {
             if !seen_without.insert(comp.as_str()) {
-                self.err(q.span, format!(
-                    "component `{}` appears more than once in `without(…)` clause",
-                    comp
-                ));
+                self.err(
+                    q.span,
+                    format!(
+                        "component `{}` appears more than once in `without(…)` clause",
+                        comp
+                    ),
+                );
             }
         }
 
         // A component cannot be in both `with` and `without`.
         for comp in &q.with {
             if q.without.contains(comp) {
-                self.err(q.span, format!(
-                    "component `{}` appears in both `with(…)` and `without(…)`",
-                    comp
-                ));
+                self.err(
+                    q.span,
+                    format!(
+                        "component `{}` appears in both `with(…)` and `without(…)`",
+                        comp
+                    ),
+                );
             }
         }
 
@@ -690,12 +805,19 @@ impl SemaCtx {
                 let (name_b, span_b, set_b) = &sets[j];
                 if let Some(comp) = set_a.conflicts_with(set_b) {
                     self.diag.push(
-                        Diagnostic::warning(*span_a, format!(
-                            "read/write aliasing on component `{}` between \
+                        Diagnostic::warning(
+                            *span_a,
+                            format!(
+                                "read/write aliasing on component `{}` between \
                              system `{}` and system `{}`; \
                              concurrent execution may produce non-deterministic results",
-                            comp, name_a, name_b
-                        )).with_label(*span_b, format!("system `{}` also accesses `{}`", name_b, comp))
+                                comp, name_a, name_b
+                            ),
+                        )
+                        .with_label(
+                            *span_b,
+                            format!("system `{}` also accesses `{}`", name_b, comp),
+                        ),
                     );
                 }
             }
@@ -711,10 +833,13 @@ impl SemaCtx {
         let mut seen: HashSet<&str> = HashSet::new();
         for field in &c.fields {
             if !seen.insert(field.name.as_str()) {
-                self.err(field.span, format!(
-                    "field `{}` is declared more than once in component `{}`",
-                    field.name, c.name
-                ));
+                self.err(
+                    field.span,
+                    format!(
+                        "field `{}` is declared more than once in component `{}`",
+                        field.name, c.name
+                    ),
+                );
             }
         }
     }
@@ -729,10 +854,13 @@ impl SemaCtx {
 
         // §4a  At least one behaviour.
         if a.behaviors.is_empty() {
-            self.warn(a.span, format!(
-                "agent `{}` declares no behaviours; it will never act",
-                a.name
-            ));
+            self.warn(
+                a.span,
+                format!(
+                    "agent `{}` declares no behaviours; it will never act",
+                    a.name
+                ),
+            );
         }
 
         // §4b  Behaviour priorities must be unique.
@@ -741,11 +869,14 @@ impl SemaCtx {
             for rule in &a.behaviors {
                 let prio = rule.priority.0;
                 if let Some(prev) = seen_prio.insert(prio, rule.name.as_str()) {
-                    self.err(rule.span, format!(
-                        "behaviour `{}` and `{}` share the same priority {} \
+                    self.err(
+                        rule.span,
+                        format!(
+                            "behaviour `{}` and `{}` share the same priority {} \
                          in agent `{}`; priorities must be unique",
-                        rule.name, prev, prio, a.name
-                    ));
+                            rule.name, prev, prio, a.name
+                        ),
+                    );
                 }
             }
         }
@@ -756,10 +887,13 @@ impl SemaCtx {
             for perc in &a.perceptions {
                 let duplicate = seen_kinds.iter().any(|k| perception_kind_eq(k, &perc.kind));
                 if duplicate {
-                    self.err(perc.span, format!(
-                        "agent `{}` declares the same perception kind more than once",
-                        a.name
-                    ));
+                    self.err(
+                        perc.span,
+                        format!(
+                            "agent `{}` declares the same perception kind more than once",
+                            a.name
+                        ),
+                    );
                 } else {
                     seen_kinds.push(&perc.kind);
                 }
@@ -771,12 +905,10 @@ impl SemaCtx {
             use crate::ast::MemoryCapacity;
             match &mem.capacity {
                 Some(MemoryCapacity::Slots(0)) => {
-                    self.err(mem.span,
-                        "memory `slots` capacity must be greater than 0");
+                    self.err(mem.span, "memory `slots` capacity must be greater than 0");
                 }
                 Some(MemoryCapacity::Duration { seconds }) if *seconds <= 0.0 => {
-                    self.err(mem.span,
-                        "memory retention duration must be > 0 seconds");
+                    self.err(mem.span, "memory retention duration must be > 0 seconds");
                 }
                 _ => {}
             }
@@ -786,17 +918,18 @@ impl SemaCtx {
         if let Some(ls) = &a.learning {
             if let Some(lr) = ls.learning_rate {
                 if lr <= 0.0 || lr.is_nan() {
-                    self.err(ls.span, format!(
-                        "learning_rate must be a positive finite number; got {}",
-                        lr
-                    ));
+                    self.err(
+                        ls.span,
+                        format!("learning_rate must be a positive finite number; got {}", lr),
+                    );
                 }
             }
             if let Some(g) = ls.gamma {
                 if !(0.0..=1.0).contains(&g) {
-                    self.err(ls.span, format!(
-                        "discount factor γ must be in [0, 1]; got {}", g
-                    ));
+                    self.err(
+                        ls.span,
+                        format!("discount factor γ must be in [0, 1]; got {}", g),
+                    );
                 }
             }
         }
@@ -820,7 +953,8 @@ impl SemaCtx {
         self.push_scope();
 
         // Inject `self` and parameters.
-        self.scopes.declare("self", Binding::new(rule.span, false, false));
+        self.scopes
+            .declare("self", Binding::new(rule.span, false, false));
         for param in &rule.params {
             self.declare_var(&param.name, param.span, param.mutable);
         }
@@ -835,16 +969,20 @@ impl SemaCtx {
         // Goal utility expressions must not produce side effects.
         // We approximate this by checking for assignments and calls.
         if expr_has_side_effects(&goal.utility) {
-            self.warn(goal.utility.span(), format!(
-                "goal `{}` utility expression in agent `{}` appears to have \
+            self.warn(
+                goal.utility.span(),
+                format!(
+                    "goal `{}` utility expression in agent `{}` appears to have \
                  side effects (contains assignment or call); \
                  utility expressions should be pure",
-                goal.name, agent.name
-            ));
+                    goal.name, agent.name
+                ),
+            );
         }
 
         self.push_scope();
-        self.scopes.declare("self", Binding::new(goal.utility.span(), false, false));
+        self.scopes
+            .declare("self", Binding::new(goal.utility.span(), false, false));
         self.analyse_expr(&goal.utility);
         self.pop_scope();
     }
@@ -855,48 +993,72 @@ impl SemaCtx {
 
     fn analyse_model(&mut self, m: &ModelDecl) {
         // §5a  Exactly one `input` and one `output` layer.
-        let input_count  = m.layers.iter().filter(|l| matches!(l, ModelLayer::Input { .. })).count();
-        let output_count = m.layers.iter().filter(|l| matches!(l, ModelLayer::Output { .. })).count();
+        let input_count = m
+            .layers
+            .iter()
+            .filter(|l| matches!(l, ModelLayer::Input { .. }))
+            .count();
+        let output_count = m
+            .layers
+            .iter()
+            .filter(|l| matches!(l, ModelLayer::Output { .. }))
+            .count();
 
         if input_count == 0 {
-            self.err(m.span, format!(
-                "model `{}` has no `input` layer; every model must declare an input shape",
-                m.name
-            ));
+            self.err(
+                m.span,
+                format!(
+                    "model `{}` has no `input` layer; every model must declare an input shape",
+                    m.name
+                ),
+            );
         } else if input_count > 1 {
-            self.err(m.span, format!(
-                "model `{}` declares {} `input` layers; only one is allowed",
-                m.name, input_count
-            ));
+            self.err(
+                m.span,
+                format!(
+                    "model `{}` declares {} `input` layers; only one is allowed",
+                    m.name, input_count
+                ),
+            );
         }
 
         if output_count == 0 {
-            self.err(m.span, format!(
-                "model `{}` has no `output` layer; every model must declare an output shape",
-                m.name
-            ));
+            self.err(
+                m.span,
+                format!(
+                    "model `{}` has no `output` layer; every model must declare an output shape",
+                    m.name
+                ),
+            );
         } else if output_count > 1 {
-            self.err(m.span, format!(
-                "model `{}` declares {} `output` layers; only one is allowed",
-                m.name, output_count
-            ));
+            self.err(
+                m.span,
+                format!(
+                    "model `{}` declares {} `output` layers; only one is allowed",
+                    m.name, output_count
+                ),
+            );
         }
 
         // §5b  `input` must be the first layer, `output` the last.
         if let Some(first) = m.layers.first() {
             if !matches!(first, ModelLayer::Input { .. }) {
-                self.err(first.span(), format!(
-                    "first layer of model `{}` should be `input`", m.name
-                ));
+                self.err(
+                    first.span(),
+                    format!("first layer of model `{}` should be `input`", m.name),
+                );
             }
         }
         if let Some(last) = m.layers.last() {
             if !matches!(last, ModelLayer::Output { .. }) {
-                self.warn(last.span(), format!(
-                    "last layer of model `{}` is not an `output` layer; \
+                self.warn(
+                    last.span(),
+                    format!(
+                        "last layer of model `{}` is not an `output` layer; \
                      the model output shape will be implicit",
-                    m.name
-                ));
+                        m.name
+                    ),
+                );
             }
         }
 
@@ -904,14 +1066,17 @@ impl SemaCtx {
         let mut prev_kind: Option<&str> = None;
         for layer in &m.layers {
             let kind = model_layer_kind_name(layer);
-            if Some(kind) == prev_kind && !matches!(layer,
-                ModelLayer::Dense { .. } | ModelLayer::Conv2d { .. }
-            ) {
-                self.warn(layer.span(), format!(
-                    "model `{}` has adjacent duplicate `{}` layers; \
+            if Some(kind) == prev_kind
+                && !matches!(layer, ModelLayer::Dense { .. } | ModelLayer::Conv2d { .. })
+            {
+                self.warn(
+                    layer.span(),
+                    format!(
+                        "model `{}` has adjacent duplicate `{}` layers; \
                      is this intentional?",
-                    m.name, kind
-                ));
+                        m.name, kind
+                    ),
+                );
             }
             prev_kind = Some(kind);
         }
@@ -933,7 +1098,9 @@ impl SemaCtx {
     fn analyse_train(&mut self, t: &TrainDecl) {
         // §5e  References must resolve.
         self.decls.mark_used(&t.agent);
-        if let Some(m) = &t.model { self.decls.mark_used(m); }
+        if let Some(m) = &t.model {
+            self.decls.mark_used(m);
+        }
 
         // Track that this agent is being trained.
         self.trained_agents.insert(t.agent.clone());
@@ -943,10 +1110,13 @@ impl SemaCtx {
             let mut seen: HashSet<&str> = HashSet::new();
             for sig in &t.signals {
                 if !seen.insert(sig.name.as_str()) {
-                    self.err(sig.span, format!(
-                        "signal name `{}` appears more than once in `train` block",
-                        sig.name
-                    ));
+                    self.err(
+                        sig.span,
+                        format!(
+                            "signal name `{}` appears more than once in `train` block",
+                            sig.name
+                        ),
+                    );
                 }
             }
         }
@@ -954,24 +1124,26 @@ impl SemaCtx {
         // §5g  Signal weights must be non-negative.
         for sig in &t.signals {
             if sig.weight < 0.0 {
-                self.err(sig.span, format!(
-                    "{} signal `{}` has negative weight {}; \
+                self.err(
+                    sig.span,
+                    format!(
+                        "{} signal `{}` has negative weight {}; \
                      use a `penalty` with positive weight for negative reinforcement",
-                    if sig.is_reward { "reward" } else { "penalty" },
-                    sig.name, sig.weight
-                ));
+                        if sig.is_reward { "reward" } else { "penalty" },
+                        sig.name,
+                        sig.weight
+                    ),
+                );
             }
         }
 
         // §5h  Episode constraints.
         if let Some(ep) = &t.episode {
             if matches!(ep.max_steps, Some(0)) {
-                self.err(ep.span,
-                    "episode `max_steps` must be ≥ 1");
+                self.err(ep.span, "episode `max_steps` must be ≥ 1");
             }
             if matches!(ep.num_envs, Some(0)) {
-                self.err(ep.span,
-                    "episode `num_envs` must be ≥ 1");
+                self.err(ep.span, "episode `num_envs` must be ≥ 1");
             }
         }
 
@@ -980,10 +1152,10 @@ impl SemaCtx {
             let mut seen: HashSet<&str> = HashSet::new();
             for (key, expr) in &t.hyper {
                 if !seen.insert(key.as_str()) {
-                    self.err(expr.span(), format!(
-                        "hyper-parameter `{}` is specified more than once",
-                        key
-                    ));
+                    self.err(
+                        expr.span(),
+                        format!("hyper-parameter `{}` is specified more than once", key),
+                    );
                 }
             }
         }
@@ -1018,11 +1190,14 @@ impl SemaCtx {
     fn check_untrained_learnable_agents(&mut self, program: &Program) {
         for agent in program.agents() {
             if agent.is_learnable() && !self.trained_agents.contains(&agent.name) {
-                self.warn(agent.span, format!(
-                    "agent `{}` has a `learning` configuration but is never referenced \
+                self.warn(
+                    agent.span,
+                    format!(
+                        "agent `{}` has a `learning` configuration but is never referenced \
                      in a `train` block; the agent will not improve at runtime",
-                    agent.name
-                ));
+                        agent.name
+                    ),
+                );
             }
         }
     }
@@ -1068,7 +1243,13 @@ impl SemaCtx {
     fn analyse_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             // ── let binding ───────────────────────────────────────────────────
-            Stmt::Let { span, pattern, init, mutable, .. } => {
+            Stmt::Let {
+                span,
+                pattern,
+                init,
+                mutable,
+                ..
+            } => {
                 // Analyse RHS first (it cannot reference the new binding).
                 if let Some(e) = init {
                     self.analyse_expr(e);
@@ -1081,12 +1262,18 @@ impl SemaCtx {
             }
 
             // ── expression statement ──────────────────────────────────────────
-            Stmt::Expr { expr, has_semi, span } => {
+            Stmt::Expr {
+                expr,
+                has_semi,
+                span,
+            } => {
                 self.analyse_expr(expr);
                 // Warn when a value-producing expression is silently discarded.
                 if *has_semi && expr_produces_value(expr) && !is_call_or_assign(expr) {
-                    self.note(*span,
-                        "expression value discarded; use `let _ = …` if intentional");
+                    self.note(
+                        *span,
+                        "expression value discarded; use `let _ = …` if intentional",
+                    );
                 }
             }
 
@@ -1095,7 +1282,9 @@ impl SemaCtx {
                 if !self.cf.in_function() {
                     self.err(*span, "`return` outside of a function");
                 }
-                if let Some(e) = value { self.analyse_expr(e); }
+                if let Some(e) = value {
+                    self.analyse_expr(e);
+                }
             }
 
             // ── break / continue ──────────────────────────────────────────────
@@ -1104,12 +1293,15 @@ impl SemaCtx {
                     self.err(*span, "`break` outside of a loop");
                 } else if let Some(lbl) = label {
                     if !self.cf.has_label(lbl) {
-                        self.err(*span, format!(
-                            "`break '{lbl}` does not correspond to any enclosing loop"
-                        ));
+                        self.err(
+                            *span,
+                            format!("`break '{lbl}` does not correspond to any enclosing loop"),
+                        );
                     }
                 }
-                if let Some(e) = value { self.analyse_expr(e); }
+                if let Some(e) = value {
+                    self.analyse_expr(e);
+                }
             }
 
             Stmt::Continue { span, label } => {
@@ -1117,17 +1309,26 @@ impl SemaCtx {
                     self.err(*span, "`continue` outside of a loop");
                 } else if let Some(lbl) = label {
                     if !self.cf.has_label(lbl) {
-                        self.err(*span, format!(
-                            "`continue '{lbl}` does not correspond to any enclosing loop"
-                        ));
+                        self.err(
+                            *span,
+                            format!("`continue '{lbl}` does not correspond to any enclosing loop"),
+                        );
                     }
                 }
             }
 
             // ── for … in … ────────────────────────────────────────────────────
-            Stmt::ForIn { span, pattern, iter, body, label } => {
+            Stmt::ForIn {
+                span,
+                pattern,
+                iter,
+                body,
+                label,
+            } => {
                 self.analyse_expr(iter);
-                self.cf.push(CfFrame::Loop { label: label.clone() });
+                self.cf.push(CfFrame::Loop {
+                    label: label.clone(),
+                });
                 self.push_scope();
                 self.bind_pattern(pattern, *span, false);
                 self.analyse_block(body);
@@ -1136,51 +1337,70 @@ impl SemaCtx {
             }
 
             // ── entity for (ECS) ──────────────────────────────────────────────
-            Stmt::EntityFor { span, var, query, body, label, accesses, parallelism } => {
+            Stmt::EntityFor {
+                span,
+                var,
+                query,
+                body,
+                label,
+                accesses,
+                parallelism,
+            } => {
                 // Validate the query.
                 self.validate_entity_query(query, *span);
 
                 // §3 Determinism check: if the loop is parallel/SIMD, warn on writes.
-                let is_parallel = matches!(parallelism,
+                let is_parallel = matches!(
+                    parallelism,
                     crate::ast::ParallelismHint::Parallel
-                    | crate::ast::ParallelismHint::Simd
-                    | crate::ast::ParallelismHint::Gpu
-                    | crate::ast::ParallelismHint::SimdOrGpu { .. }
+                        | crate::ast::ParallelismHint::Simd
+                        | crate::ast::ParallelismHint::Gpu
+                        | crate::ast::ParallelismHint::SimdOrGpu { .. }
                 );
                 for acc in accesses {
                     if acc.mode.is_write() && is_parallel {
                         // Only flag if there's a component that is *also* read by
                         // another iteration (i.e., it's in the `reads` set too).
                         // As a conservative approximation, flag any write.
-                        self.warn(*span, format!(
-                            "entity loop writes component `{}` under parallel \
+                        self.warn(
+                            *span,
+                            format!(
+                                "entity loop writes component `{}` under parallel \
                              execution; if iterations are order-dependent this \
                              produces non-deterministic results — \
                              add `@seq` to force determinism",
-                            acc.component
-                        ));
+                                acc.component
+                            ),
+                        );
                     }
                 }
 
                 // Build a set for the aliasing check.
                 let mut comp_set = ComponentSet::default();
-                for acc in accesses { comp_set.add(&acc.component, acc.mode); }
+                for acc in accesses {
+                    comp_set.add(&acc.component, acc.mode);
+                }
 
                 // Check for self-aliasing: a component that is both read and
                 // written within the *same* loop is only safe if iterations are
                 // independent.
                 for comp in &comp_set.reads {
                     if comp_set.writes.contains(comp) && is_parallel {
-                        self.err(*span, format!(
-                            "component `{}` is both read and written inside a \
+                        self.err(
+                            *span,
+                            format!(
+                                "component `{}` is both read and written inside a \
                              parallel entity loop; this is a data race — \
                              split into separate systems or use `@seq`",
-                            comp
-                        ));
+                                comp
+                            ),
+                        );
                     }
                 }
 
-                self.cf.push(CfFrame::Loop { label: label.clone() });
+                self.cf.push(CfFrame::Loop {
+                    label: label.clone(),
+                });
                 self.push_scope();
                 self.declare_var(var, *span, false);
                 self.analyse_block(body);
@@ -1189,13 +1409,17 @@ impl SemaCtx {
             }
 
             // ── while / loop ──────────────────────────────────────────────────
-            Stmt::While { cond, body, label, .. } => {
+            Stmt::While {
+                cond, body, label, ..
+            } => {
                 self.analyse_expr(cond);
                 // Constant `false` condition → unreachable body.
                 if let Expr::BoolLit { value: false, span } = cond {
                     self.warn(*span, "`while false { … }` loop body is unreachable");
                 }
-                self.cf.push(CfFrame::Loop { label: label.clone() });
+                self.cf.push(CfFrame::Loop {
+                    label: label.clone(),
+                });
                 self.push_scope();
                 self.analyse_block(body);
                 // Check for infinite loop: `while true` with no reachable break.
@@ -1209,26 +1433,40 @@ impl SemaCtx {
             }
 
             Stmt::Loop { body, label, .. } => {
-                self.cf.push(CfFrame::Loop { label: label.clone() });
+                self.cf.push(CfFrame::Loop {
+                    label: label.clone(),
+                });
                 self.push_scope();
                 self.analyse_block(body);
                 if !block_has_break(body) {
-                    self.warn(body.span, "`loop { }` has no reachable `break`; \
-                               this is an infinite loop");
+                    self.warn(
+                        body.span,
+                        "`loop { }` has no reachable `break`; \
+                               this is an infinite loop",
+                    );
                 }
                 self.pop_scope();
                 self.cf.pop();
             }
 
             // ── if / match ────────────────────────────────────────────────────
-            Stmt::If { span, cond, then, else_ } => {
+            Stmt::If {
+                span,
+                cond,
+                then,
+                else_,
+            } => {
                 self.analyse_expr(cond);
                 // Constant-condition dead-branch detection.
                 match cond {
-                    Expr::BoolLit { value: true,  span: cs } =>
-                        self.warn(*cs, "`if true { … }` — else branch (if any) is unreachable"),
-                    Expr::BoolLit { value: false, span: cs } =>
-                        self.warn(*cs, "`if false { … }` — then branch is unreachable"),
+                    Expr::BoolLit {
+                        value: true,
+                        span: cs,
+                    } => self.warn(*cs, "`if true { … }` — else branch (if any) is unreachable"),
+                    Expr::BoolLit {
+                        value: false,
+                        span: cs,
+                    } => self.warn(*cs, "`if false { … }` — then branch is unreachable"),
                     _ => {}
                 }
                 self.push_scope();
@@ -1236,7 +1474,7 @@ impl SemaCtx {
                 self.pop_scope();
                 if let Some(e) = else_ {
                     match e.as_ref() {
-                        crate::ast::IfOrBlock::If(s)    => self.analyse_stmt(s),
+                        crate::ast::IfOrBlock::If(s) => self.analyse_stmt(s),
                         crate::ast::IfOrBlock::Block(b) => {
                             self.push_scope();
                             self.analyse_block(b);
@@ -1249,15 +1487,21 @@ impl SemaCtx {
 
             Stmt::Match { expr, arms, span } => {
                 self.analyse_expr(expr);
-                for arm in arms { self.analyse_match_arm(arm); }
+                for arm in arms {
+                    self.analyse_match_arm(arm);
+                }
                 let _ = span;
             }
 
             // ── nested item ───────────────────────────────────────────────────
-            Stmt::Item(i) => { self.analyse_item(i); }
+            Stmt::Item(i) => {
+                self.analyse_item(i);
+            }
 
             // ── parallel constructs (Feature 4) ──────────────────────────────
-            Stmt::ParallelFor(pf) => { self.analyse_parallel_for(pf); }
+            Stmt::ParallelFor(pf) => {
+                self.analyse_parallel_for(pf);
+            }
 
             Stmt::Spawn(sb) => {
                 // Captures should be used inside the block; check for
@@ -1294,14 +1538,18 @@ impl SemaCtx {
     fn analyse_match_arm(&mut self, arm: &MatchArm) {
         self.push_scope();
         self.bind_pattern(&arm.pat, arm.span, false);
-        if let Some(g) = &arm.guard { self.analyse_expr(g); }
+        if let Some(g) = &arm.guard {
+            self.analyse_expr(g);
+        }
         self.analyse_expr(&arm.body);
         self.pop_scope();
     }
 
     fn analyse_parallel_for(&mut self, pf: &ParallelFor) {
         self.analyse_expr(&pf.iter);
-        self.cf.push(CfFrame::ParallelLoop { label: pf.label.clone() });
+        self.cf.push(CfFrame::ParallelLoop {
+            label: pf.label.clone(),
+        });
         self.push_scope();
         self.bind_pattern(&pf.var, pf.span, false);
         self.analyse_block(&pf.body);
@@ -1317,8 +1565,10 @@ impl SemaCtx {
     fn analyse_expr(&mut self, expr: &Expr) {
         match expr {
             // Literals produce no variable references.
-            Expr::IntLit { .. } | Expr::FloatLit { .. }
-            | Expr::BoolLit { .. } | Expr::StrLit { .. } => {}
+            Expr::IntLit { .. }
+            | Expr::FloatLit { .. }
+            | Expr::BoolLit { .. }
+            | Expr::StrLit { .. } => {}
 
             Expr::Ident { span, name } => {
                 self.use_var(name, *span);
@@ -1334,13 +1584,16 @@ impl SemaCtx {
                 }
             }
 
-            Expr::VecCtor  { elems, .. }
-            | Expr::ArrayLit { elems, .. } => {
-                for e in elems { self.analyse_expr(e); }
+            Expr::VecCtor { elems, .. } | Expr::ArrayLit { elems, .. } => {
+                for e in elems {
+                    self.analyse_expr(e);
+                }
             }
 
             Expr::Tuple { elems, .. } => {
-                for e in elems { self.analyse_expr(e); }
+                for e in elems {
+                    self.analyse_expr(e);
+                }
             }
 
             Expr::BinOp { lhs, rhs, .. } => {
@@ -1363,31 +1616,47 @@ impl SemaCtx {
                 self.analyse_expr(object);
             }
 
-            Expr::Index { object, indices, .. } => {
+            Expr::Index {
+                object, indices, ..
+            } => {
                 self.analyse_expr(object);
-                for i in indices { self.analyse_expr(i); }
+                for i in indices {
+                    self.analyse_expr(i);
+                }
             }
 
-            Expr::Call { func, args, named, .. } => {
+            Expr::Call {
+                func, args, named, ..
+            } => {
                 self.analyse_expr(func);
                 // Mark callee as used in the decl registry.
                 if let Expr::Ident { name, .. } = func.as_ref() {
                     self.decls.mark_used(name);
                 }
-                for a in args { self.analyse_expr(a); }
-                for (_, a) in named { self.analyse_expr(a); }
+                for a in args {
+                    self.analyse_expr(a);
+                }
+                for (_, a) in named {
+                    self.analyse_expr(a);
+                }
             }
 
             Expr::MethodCall { receiver, args, .. } => {
                 self.analyse_expr(receiver);
-                for a in args { self.analyse_expr(a); }
+                for a in args {
+                    self.analyse_expr(a);
+                }
             }
 
             Expr::MatMul { lhs, rhs, .. }
             | Expr::HadamardMul { lhs, rhs, .. }
             | Expr::HadamardDiv { lhs, rhs, .. }
             | Expr::TensorConcat { lhs, rhs, .. }
-            | Expr::Pow { base: lhs, exp: rhs, .. } => {
+            | Expr::Pow {
+                base: lhs,
+                exp: rhs,
+                ..
+            } => {
                 self.analyse_expr(lhs);
                 self.analyse_expr(rhs);
             }
@@ -1397,22 +1666,30 @@ impl SemaCtx {
             }
 
             Expr::Range { lo, hi, .. } => {
-                if let Some(e) = lo { self.analyse_expr(e); }
-                if let Some(e) = hi { self.analyse_expr(e); }
+                if let Some(e) = lo {
+                    self.analyse_expr(e);
+                }
+                if let Some(e) = hi {
+                    self.analyse_expr(e);
+                }
             }
 
             Expr::Cast { expr, .. } => {
                 self.analyse_expr(expr);
             }
 
-            Expr::IfExpr { cond, then, else_, .. } => {
+            Expr::IfExpr {
+                cond, then, else_, ..
+            } => {
                 self.analyse_expr(cond);
                 // Constant condition warning.
                 match cond.as_ref() {
-                    Expr::BoolLit { value: true,  span } =>
-                        self.warn(*span, "`if true` — else branch is unreachable"),
-                    Expr::BoolLit { value: false, span } =>
-                        self.warn(*span, "`if false` — then branch is unreachable"),
+                    Expr::BoolLit { value: true, span } => {
+                        self.warn(*span, "`if true` — else branch is unreachable")
+                    }
+                    Expr::BoolLit { value: false, span } => {
+                        self.warn(*span, "`if false` — then branch is unreachable")
+                    }
                     _ => {}
                 }
                 self.push_scope();
@@ -1440,7 +1717,13 @@ impl SemaCtx {
 
             Expr::StructLit { name, fields, .. } => {
                 self.decls.mark_used(name);
-                for (_, e) in fields { self.analyse_expr(e); }
+                for (_, e) in fields {
+                    self.analyse_expr(e);
+                }
+            }
+            Expr::KronProd { lhs, rhs, .. } | Expr::OuterProd { lhs, rhs, .. } => {
+                self.analyse_expr(lhs);
+                self.analyse_expr(rhs);
             }
         }
     }
@@ -1452,11 +1735,14 @@ impl SemaCtx {
             Expr::Ident { span, name } => {
                 if let Some(b) = self.scopes.lookup(name) {
                     if !b.mutable {
-                        self.err(*span, format!(
-                            "cannot assign to immutable variable `{}`; \
+                        self.err(
+                            *span,
+                            format!(
+                                "cannot assign to immutable variable `{}`; \
                              declare it with `let mut {}`",
-                            name, name
-                        ));
+                                name, name
+                            ),
+                        );
                     }
                 }
                 // If not found in scope, typeck already flagged it.
@@ -1467,7 +1753,11 @@ impl SemaCtx {
             Expr::Index { object, .. } => {
                 self.check_lvalue_mutability(object);
             }
-            Expr::UnOp { op: crate::ast::UnOpKind::Deref, expr, .. } => {
+            Expr::UnOp {
+                op: crate::ast::UnOpKind::Deref,
+                expr,
+                ..
+            } => {
                 // Deref of `&mut T` — trust the type checker.
                 self.analyse_expr(expr);
             }
@@ -1481,12 +1771,19 @@ impl SemaCtx {
 
     fn bind_pattern(&mut self, pat: &Pattern, span: Span, mutable: bool) {
         match pat {
-            Pattern::Ident { name, span: ps, mutable: pm, .. } => {
+            Pattern::Ident {
+                name,
+                span: ps,
+                mutable: pm,
+                ..
+            } => {
                 self.declare_var(name, *ps, mutable || *pm);
             }
             Pattern::Wildcard(_) => {}
             Pattern::Tuple { elems, .. } => {
-                for p in elems { self.bind_pattern(p, span, mutable); }
+                for p in elems {
+                    self.bind_pattern(p, span, mutable);
+                }
             }
             Pattern::Struct { fields, .. } => {
                 for (_, maybe_pat) in fields {
@@ -1496,10 +1793,14 @@ impl SemaCtx {
                 }
             }
             Pattern::Or { arms, .. } => {
-                for p in arms { self.bind_pattern(p, span, mutable); }
+                for p in arms {
+                    self.bind_pattern(p, span, mutable);
+                }
             }
             Pattern::Enum { inner, .. } => {
-                for p in inner { self.bind_pattern(p, span, mutable); }
+                for p in inner {
+                    self.bind_pattern(p, span, mutable);
+                }
             }
             Pattern::Lit(..) | Pattern::Range { .. } => {}
         }
@@ -1510,7 +1811,9 @@ impl SemaCtx {
     // =========================================================================
 
     fn check_unused_decls(&mut self) {
-        let unused: Vec<(String, Span, DeclKind)> = self.decls.unused()
+        let unused: Vec<(String, Span, DeclKind)> = self
+            .decls
+            .unused()
             .map(|(name, r)| (name.to_owned(), r.span, r.kind))
             .collect();
 
@@ -1521,10 +1824,14 @@ impl SemaCtx {
                 DeclKind::System | DeclKind::Component => {}
                 // Everything else gets a warning.
                 _ => {
-                    self.warn(span, format!(
-                        "unused {} `{}`; prefix with `_` to suppress or remove",
-                        decl_kind_name(kind), name
-                    ));
+                    self.warn(
+                        span,
+                        format!(
+                            "unused {} `{}`; prefix with `_` to suppress or remove",
+                            decl_kind_name(kind),
+                            name
+                        ),
+                    );
                 }
             }
         }
@@ -1541,9 +1848,15 @@ fn stmt_terminates(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => true,
         Stmt::Loop { body, .. } => !block_has_break(body),
-        Stmt::While { cond: Expr::BoolLit { value: true, .. }, body, .. } =>
-            !block_has_break(body),
-        Stmt::If { cond: Expr::BoolLit { value: false, .. }, .. } => false,
+        Stmt::While {
+            cond: Expr::BoolLit { value: true, .. },
+            body,
+            ..
+        } => !block_has_break(body),
+        Stmt::If {
+            cond: Expr::BoolLit { value: false, .. },
+            ..
+        } => false,
         _ => false,
     }
 }
@@ -1557,22 +1870,22 @@ fn is_dead_item(stmt: &Stmt) -> bool {
 /// Returns the primary span of a statement.
 fn stmt_span(stmt: &Stmt) -> Span {
     match stmt {
-        Stmt::Let      { span, .. } => *span,
-        Stmt::Expr     { span, .. } => *span,
-        Stmt::Return   { span, .. } => *span,
-        Stmt::Break    { span, .. } => *span,
+        Stmt::Let { span, .. } => *span,
+        Stmt::Expr { span, .. } => *span,
+        Stmt::Return { span, .. } => *span,
+        Stmt::Break { span, .. } => *span,
         Stmt::Continue { span, .. } => *span,
-        Stmt::ForIn    { span, .. } => *span,
-        Stmt::EntityFor{ span, .. } => *span,
-        Stmt::While    { span: _, cond, .. } => cond.span(),
-        Stmt::Loop     { body, .. } => body.span,
-        Stmt::If       { span, .. } => *span,
-        Stmt::Match    { span, .. } => *span,
-        Stmt::Item(i)               => i.span(),
-        Stmt::ParallelFor(pf)       => pf.span,
-        Stmt::Spawn(sb)             => sb.span,
-        Stmt::Sync(sb)              => sb.span,
-        Stmt::Atomic(ab)            => ab.span,
+        Stmt::ForIn { span, .. } => *span,
+        Stmt::EntityFor { span, .. } => *span,
+        Stmt::While { span: _, cond, .. } => cond.span(),
+        Stmt::Loop { body, .. } => body.span,
+        Stmt::If { span, .. } => *span,
+        Stmt::Match { span, .. } => *span,
+        Stmt::Item(i) => i.span(),
+        Stmt::ParallelFor(pf) => pf.span,
+        Stmt::Spawn(sb) => sb.span,
+        Stmt::Sync(sb) => sb.span,
+        Stmt::Atomic(ab) => ab.span,
     }
 }
 
@@ -1586,15 +1899,19 @@ fn stmt_has_direct_break(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Break { .. } => true,
         Stmt::If { then, else_, .. } => {
-            block_has_break(then) || else_.as_ref().map_or(false, |e| match e.as_ref() {
-                crate::ast::IfOrBlock::Block(b) => block_has_break(b),
-                crate::ast::IfOrBlock::If(s)    => stmt_has_direct_break(s),
-            })
+            block_has_break(then)
+                || else_.as_ref().map_or(false, |e| match e.as_ref() {
+                    crate::ast::IfOrBlock::Block(b) => block_has_break(b),
+                    crate::ast::IfOrBlock::If(s) => stmt_has_direct_break(s),
+                })
         }
         Stmt::Match { arms, .. } => arms.iter().any(|arm| expr_is_break(&arm.body)),
         // Don't descend into nested loops — their breaks belong to them.
-        Stmt::Loop { .. } | Stmt::While { .. } | Stmt::ForIn { .. }
-        | Stmt::EntityFor { .. } | Stmt::ParallelFor(_) => false,
+        Stmt::Loop { .. }
+        | Stmt::While { .. }
+        | Stmt::ForIn { .. }
+        | Stmt::EntityFor { .. }
+        | Stmt::ParallelFor(_) => false,
         _ => false,
     }
 }
@@ -1609,20 +1926,23 @@ fn expr_produces_value(expr: &Expr) -> bool {
     matches!(
         expr,
         Expr::IfExpr { .. }
-        | Expr::Block(_)
-        | Expr::MatMul { .. }
-        | Expr::HadamardMul { .. }
-        | Expr::TensorConcat { .. }
-        | Expr::BinOp { .. }
-        | Expr::Tuple { .. }
-        | Expr::Closure { .. }
+            | Expr::Block(_)
+            | Expr::MatMul { .. }
+            | Expr::HadamardMul { .. }
+            | Expr::TensorConcat { .. }
+            | Expr::BinOp { .. }
+            | Expr::Tuple { .. }
+            | Expr::Closure { .. }
     )
 }
 
 /// True for call expressions and assignments — these are expected to appear
 /// as statements without triggering the "value discarded" note.
 fn is_call_or_assign(expr: &Expr) -> bool {
-    matches!(expr, Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Assign { .. })
+    matches!(
+        expr,
+        Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Assign { .. }
+    )
 }
 
 /// Coarse check: does the expression contain an assignment or a call?
@@ -1631,17 +1951,20 @@ fn expr_has_side_effects(expr: &Expr) -> bool {
     match expr {
         Expr::Assign { .. } => true,
         Expr::Call { .. } | Expr::MethodCall { .. } => true,
-        Expr::BinOp { lhs, rhs, .. } =>
-            expr_has_side_effects(lhs) || expr_has_side_effects(rhs),
+        Expr::BinOp { lhs, rhs, .. } => expr_has_side_effects(lhs) || expr_has_side_effects(rhs),
         Expr::UnOp { expr, .. } => expr_has_side_effects(expr),
         Expr::Field { object, .. } => expr_has_side_effects(object),
-        Expr::Index { object, indices, .. } =>
-            expr_has_side_effects(object) || indices.iter().any(expr_has_side_effects),
-        Expr::IfExpr { cond, then, else_, .. } =>
+        Expr::Index {
+            object, indices, ..
+        } => expr_has_side_effects(object) || indices.iter().any(expr_has_side_effects),
+        Expr::IfExpr {
+            cond, then, else_, ..
+        } => {
             expr_has_side_effects(cond)
-            || block_has_side_effects(then)
-            || else_.as_ref().map_or(false, |b| block_has_side_effects(b)),
-        Expr::Block(b)  => block_has_side_effects(b),
+                || block_has_side_effects(then)
+                || else_.as_ref().map_or(false, |b| block_has_side_effects(b))
+        }
+        Expr::Block(b) => block_has_side_effects(b),
         Expr::Closure { .. } => false, // closure creation is pure
         _ => false,
     }
@@ -1649,7 +1972,10 @@ fn expr_has_side_effects(expr: &Expr) -> bool {
 
 fn block_has_side_effects(block: &Block) -> bool {
     block.stmts.iter().any(stmt_has_side_effects)
-        || block.tail.as_ref().map_or(false, |e| expr_has_side_effects(e))
+        || block
+            .tail
+            .as_ref()
+            .map_or(false, |e| expr_has_side_effects(e))
 }
 
 fn stmt_has_side_effects(stmt: &Stmt) -> bool {
@@ -1665,40 +1991,42 @@ fn stmt_has_side_effects(stmt: &Stmt) -> bool {
 /// equality comparison (avoids `PartialEq` on the enum which doesn't exist).
 fn perception_kind_eq(a: &PerceptionKind, b: &PerceptionKind) -> bool {
     match (a, b) {
-        (PerceptionKind::Vision,     PerceptionKind::Vision)     => true,
-        (PerceptionKind::Hearing,    PerceptionKind::Hearing)    => true,
+        (PerceptionKind::Vision, PerceptionKind::Vision) => true,
+        (PerceptionKind::Hearing, PerceptionKind::Hearing) => true,
         (PerceptionKind::Omniscient, PerceptionKind::Omniscient) => true,
-        (PerceptionKind::Custom(x),  PerceptionKind::Custom(y))  => x == y,
+        (PerceptionKind::Custom(x), PerceptionKind::Custom(y)) => x == y,
         _ => false,
     }
 }
 
 fn model_layer_kind_name(layer: &ModelLayer) -> &'static str {
     match layer {
-        ModelLayer::Input     { .. } => "input",
-        ModelLayer::Dense     { .. } => "dense",
-        ModelLayer::Conv2d    { .. } => "conv",
-        ModelLayer::Pool      { .. } => "pool",
+        ModelLayer::Input { .. } => "input",
+        ModelLayer::Dense { .. } => "dense",
+        ModelLayer::Conv2d { .. } => "conv",
+        ModelLayer::Pool { .. } => "pool",
         ModelLayer::Recurrent { .. } => "recurrent",
         ModelLayer::Attention { .. } => "attention",
-        ModelLayer::Embed     { .. } => "embed",
-        ModelLayer::Dropout   { .. } => "dropout",
-        ModelLayer::Norm      { .. } => "norm",
-        ModelLayer::Output    { .. } => "output",
-        ModelLayer::SubModel  { .. } => "submodel",
+        ModelLayer::Embed { .. } => "embed",
+        ModelLayer::Dropout { .. } => "dropout",
+        ModelLayer::Norm { .. } => "norm",
+        ModelLayer::Output { .. } => "output",
+        ModelLayer::SubModel { .. } => "submodel",
+        _ => "other",
     }
 }
 
 fn decl_kind_name(kind: DeclKind) -> &'static str {
     match kind {
-        DeclKind::Function  => "function",
-        DeclKind::System    => "system",
+        DeclKind::Function => "function",
+        DeclKind::System => "system",
         DeclKind::Component => "component",
-        DeclKind::Struct    => "struct",
-        DeclKind::Enum      => "enum",
-        DeclKind::Agent     => "agent",
-        DeclKind::Model     => "model",
-        DeclKind::Const     => "constant",
+        DeclKind::Struct => "struct",
+        DeclKind::Enum => "enum",
+        DeclKind::Agent => "agent",
+        DeclKind::Model => "model",
+        DeclKind::Const => "constant",
+        _ => "other",
     }
 }
 
@@ -1732,53 +2060,79 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    fn sp() -> Span { Span::dummy() }
+    fn sp() -> Span {
+        Span::dummy()
+    }
 
     fn mk_fn(name: &str, body: Block) -> FnDecl {
         FnDecl {
-            span:     sp(),
-            attrs:    vec![],
-            name:     name.into(),
+            span: sp(),
+            attrs: vec![],
+            name: name.into(),
             generics: vec![],
-            params:   vec![],
-            ret_ty:   None,
-            body:     Some(body),
+            params: vec![],
+            ret_ty: None,
+            body: Some(body),
             is_async: false,
         }
     }
 
     fn mk_block(stmts: Vec<Stmt>) -> Block {
-        Block { span: sp(), stmts, tail: None }
+        Block {
+            span: sp(),
+            stmts,
+            tail: None,
+        }
     }
 
     fn ident(name: &str) -> Expr {
-        Expr::Ident { span: sp(), name: name.into() }
+        Expr::Ident {
+            span: sp(),
+            name: name.into(),
+        }
     }
 
     fn bool_lit(v: bool) -> Expr {
-        Expr::BoolLit { span: sp(), value: v }
+        Expr::BoolLit {
+            span: sp(),
+            value: v,
+        }
     }
 
     fn int_lit(v: u128) -> Expr {
-        Expr::IntLit { span: sp(), value: v }
+        Expr::IntLit {
+            span: sp(),
+            value: v,
+        }
     }
 
     fn ret(e: Option<Expr>) -> Stmt {
-        Stmt::Return { span: sp(), value: e }
+        Stmt::Return {
+            span: sp(),
+            value: e,
+        }
     }
 
     fn let_stmt(name: &str, mutable: bool, init: Option<Expr>) -> Stmt {
         Stmt::Let {
-            span:    sp(),
-            pattern: Pattern::Ident { span: sp(), name: name.into(), mutable },
-            ty:      None,
+            span: sp(),
+            pattern: Pattern::Ident {
+                span: sp(),
+                name: name.into(),
+                mutable,
+            },
+            ty: None,
             init,
             mutable,
         }
     }
 
     fn expr_stmt(e: Expr) -> Stmt {
-        Stmt::Expr { span: sp(), expr: e, has_semi: true }
+        Stmt::Expr {
+            span: sp(),
+            expr: e,
+            has_semi: true,
+        }
     }
 
     fn run(program: &Program) -> SemaCtx {
@@ -1794,13 +2148,14 @@ mod tests {
     #[test]
     fn test_unused_variable_warning() {
         // `let x = 1;` with no subsequent use of x.
-        let body = mk_block(vec![
-            let_stmt("x", false, Some(int_lit(42))),
-        ]);
+        let body = mk_block(vec![let_stmt("x", false, Some(int_lit(42)))]);
         let mut prog = Program::new();
         prog.items.push(Item::Fn(mk_fn("foo", body)));
         let ctx = run(&prog);
-        assert!(ctx.diag.warning_count() >= 1, "expected unused-variable warning");
+        assert!(
+            ctx.diag.warning_count() >= 1,
+            "expected unused-variable warning"
+        );
         assert!(!ctx.diag.has_errors());
     }
 
@@ -1815,22 +2170,30 @@ mod tests {
         prog.items.push(Item::Fn(mk_fn("foo", body)));
         let ctx = run(&prog);
         // Should have no unused-variable warning (there may be other notes).
-        let unused_warns: Vec<_> = ctx.diag.items.iter()
+        let unused_warns: Vec<_> = ctx
+            .diag
+            .items
+            .iter()
             .filter(|d| d.severity == Severity::Warning && d.message.contains("unused variable"))
             .collect();
-        assert!(unused_warns.is_empty(), "unexpected unused-var warning: {:?}", unused_warns);
+        assert!(
+            unused_warns.is_empty(),
+            "unexpected unused-var warning: {:?}",
+            unused_warns
+        );
     }
 
     #[test]
     fn test_wildcard_variable_no_warning() {
         // `let _x = 1;` — intentionally unused.
-        let body = mk_block(vec![
-            let_stmt("_x", false, Some(int_lit(1))),
-        ]);
+        let body = mk_block(vec![let_stmt("_x", false, Some(int_lit(1)))]);
         let mut prog = Program::new();
         prog.items.push(Item::Fn(mk_fn("foo", body)));
         let ctx = run(&prog);
-        let unused: Vec<_> = ctx.diag.items.iter()
+        let unused: Vec<_> = ctx
+            .diag
+            .items
+            .iter()
             .filter(|d| d.message.contains("unused variable"))
             .collect();
         assert!(unused.is_empty());
@@ -1842,10 +2205,10 @@ mod tests {
         let body = mk_block(vec![
             let_stmt("x", false, Some(int_lit(1))),
             expr_stmt(Expr::Assign {
-                span:   sp(),
-                op:     AssignOpKind::Assign,
+                span: sp(),
+                op: AssignOpKind::Assign,
                 target: Box::new(ident("x")),
-                value:  Box::new(int_lit(2)),
+                value: Box::new(int_lit(2)),
             }),
         ]);
         let mut prog = Program::new();
@@ -1860,10 +2223,10 @@ mod tests {
         let body = mk_block(vec![
             let_stmt("x", true, Some(int_lit(1))),
             expr_stmt(Expr::Assign {
-                span:   sp(),
-                op:     AssignOpKind::Assign,
+                span: sp(),
+                op: AssignOpKind::Assign,
                 target: Box::new(ident("x")),
-                value:  Box::new(int_lit(2)),
+                value: Box::new(int_lit(2)),
             }),
         ]);
         let mut prog = Program::new();
@@ -1875,17 +2238,22 @@ mod tests {
     #[test]
     fn test_shadowing_warning() {
         // let x = 1; { let x = 2; }
-        let inner = mk_block(vec![
-            let_stmt("x", false, Some(int_lit(2))),
-        ]);
+        let inner = mk_block(vec![let_stmt("x", false, Some(int_lit(2)))]);
         let body = mk_block(vec![
             let_stmt("x", false, Some(int_lit(1))),
-            Stmt::Expr { span: sp(), expr: Expr::Block(Box::new(inner)), has_semi: false },
+            Stmt::Expr {
+                span: sp(),
+                expr: Expr::Block(Box::new(inner)),
+                has_semi: false,
+            },
         ]);
         let mut prog = Program::new();
         prog.items.push(Item::Fn(mk_fn("foo", body)));
         let ctx = run(&prog);
-        let shadow: Vec<_> = ctx.diag.items.iter()
+        let shadow: Vec<_> = ctx
+            .diag
+            .items
+            .iter()
             .filter(|d| d.message.contains("shadows"))
             .collect();
         assert!(!shadow.is_empty(), "expected shadowing warning");
@@ -1905,7 +2273,10 @@ mod tests {
         let mut prog = Program::new();
         prog.items.push(Item::Fn(mk_fn("foo", body)));
         let ctx = run(&prog);
-        let unreach: Vec<_> = ctx.diag.items.iter()
+        let unreach: Vec<_> = ctx
+            .diag
+            .items
+            .iter()
             .filter(|d| d.message.contains("unreachable"))
             .collect();
         assert!(!unreach.is_empty(), "expected unreachable-code warning");
@@ -1916,20 +2287,23 @@ mod tests {
         // if true { 1 } else { 2 }  ← else is dead
         let then_block = mk_block(vec![]);
         let else_block = mk_block(vec![]);
-        let body = mk_block(vec![
-            Stmt::If {
-                span:  sp(),
-                cond:  bool_lit(true),
-                then:  then_block,
-                else_: Some(Box::new(IfOrBlock::Block(else_block))),
-            },
-        ]);
+        let body = mk_block(vec![Stmt::If {
+            span: sp(),
+            cond: bool_lit(true),
+            then: then_block,
+            else_: Some(Box::new(IfOrBlock::Block(else_block))),
+        }]);
         let mut prog = Program::new();
         prog.items.push(Item::Fn(mk_fn("foo", body)));
         let ctx = run(&prog);
-        let warns: Vec<_> = ctx.diag.items.iter()
-            .filter(|d| d.severity == Severity::Warning
-                && (d.message.contains("unreachable") || d.message.contains("if true")))
+        let warns: Vec<_> = ctx
+            .diag
+            .items
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Warning
+                    && (d.message.contains("unreachable") || d.message.contains("if true"))
+            })
             .collect();
         assert!(!warns.is_empty(), "expected dead-else warning");
     }
@@ -1937,17 +2311,18 @@ mod tests {
     #[test]
     fn test_infinite_loop_warning() {
         // loop { /* no break */ }
-        let body = mk_block(vec![
-            Stmt::Loop {
-                span:  sp(),
-                body:  mk_block(vec![]),
-                label: None,
-            },
-        ]);
+        let body = mk_block(vec![Stmt::Loop {
+            span: sp(),
+            body: mk_block(vec![]),
+            label: None,
+        }]);
         let mut prog = Program::new();
         prog.items.push(Item::Fn(mk_fn("foo", body)));
         let ctx = run(&prog);
-        let inf: Vec<_> = ctx.diag.items.iter()
+        let inf: Vec<_> = ctx
+            .diag
+            .items
+            .iter()
             .filter(|d| d.message.contains("infinite loop"))
             .collect();
         assert!(!inf.is_empty(), "expected infinite-loop warning");
@@ -1955,17 +2330,22 @@ mod tests {
 
     #[test]
     fn test_loop_with_break_no_warning() {
-        let body = mk_block(vec![
-            Stmt::Loop {
-                span:  sp(),
-                body:  mk_block(vec![Stmt::Break { span: sp(), value: None, label: None }]),
+        let body = mk_block(vec![Stmt::Loop {
+            span: sp(),
+            body: mk_block(vec![Stmt::Break {
+                span: sp(),
+                value: None,
                 label: None,
-            },
-        ]);
+            }]),
+            label: None,
+        }]);
         let mut prog = Program::new();
         prog.items.push(Item::Fn(mk_fn("foo", body)));
         let ctx = run(&prog);
-        let inf: Vec<_> = ctx.diag.items.iter()
+        let inf: Vec<_> = ctx
+            .diag
+            .items
+            .iter()
             .filter(|d| d.message.contains("infinite loop"))
             .collect();
         assert!(inf.is_empty(), "unexpected infinite-loop warning");
@@ -1977,38 +2357,54 @@ mod tests {
 
     #[test]
     fn test_break_outside_loop_error() {
-        let body = mk_block(vec![
-            Stmt::Break { span: sp(), value: None, label: None },
-        ]);
+        let body = mk_block(vec![Stmt::Break {
+            span: sp(),
+            value: None,
+            label: None,
+        }]);
         let mut prog = Program::new();
         prog.items.push(Item::Fn(mk_fn("foo", body)));
         let ctx = run(&prog);
-        assert!(ctx.diag.has_errors(), "expected error for break outside loop");
+        assert!(
+            ctx.diag.has_errors(),
+            "expected error for break outside loop"
+        );
     }
 
     #[test]
     fn test_continue_outside_loop_error() {
-        let body = mk_block(vec![
-            Stmt::Continue { span: sp(), label: None },
-        ]);
+        let body = mk_block(vec![Stmt::Continue {
+            span: sp(),
+            label: None,
+        }]);
         let mut prog = Program::new();
         prog.items.push(Item::Fn(mk_fn("foo", body)));
         let ctx = run(&prog);
-        assert!(ctx.diag.has_errors(), "expected error for continue outside loop");
+        assert!(
+            ctx.diag.has_errors(),
+            "expected error for continue outside loop"
+        );
     }
 
     #[test]
     fn test_break_inside_loop_ok() {
-        let inner = mk_block(vec![
-            Stmt::Break { span: sp(), value: None, label: None },
-        ]);
-        let body = mk_block(vec![
-            Stmt::Loop { span: sp(), body: inner, label: None },
-        ]);
+        let inner = mk_block(vec![Stmt::Break {
+            span: sp(),
+            value: None,
+            label: None,
+        }]);
+        let body = mk_block(vec![Stmt::Loop {
+            span: sp(),
+            body: inner,
+            label: None,
+        }]);
         let mut prog = Program::new();
         prog.items.push(Item::Fn(mk_fn("foo", body)));
         let ctx = run(&prog);
-        let errs: Vec<_> = ctx.diag.items.iter()
+        let errs: Vec<_> = ctx
+            .diag
+            .items
+            .iter()
             .filter(|d| d.is_fatal() && d.message.contains("break"))
             .collect();
         assert!(errs.is_empty(), "unexpected break error: {:?}", errs);
@@ -2020,7 +2416,10 @@ mod tests {
         // (simulated by calling analyse_stmt directly).
         let mut ctx = SemaCtx::new();
         // No function frame pushed.
-        ctx.analyse_stmt(&Stmt::Return { span: sp(), value: None });
+        ctx.analyse_stmt(&Stmt::Return {
+            span: sp(),
+            value: None,
+        });
         assert!(ctx.diag.has_errors());
     }
 
@@ -2031,52 +2430,61 @@ mod tests {
     #[test]
     fn test_duplicate_component_in_with_error() {
         let q = EntityQuery {
-            span:    sp(),
-            with:    vec!["Position".into(), "Position".into()],
+            span: sp(),
+            with: vec!["Position".into(), "Position".into()],
             without: vec![],
-            filter:  None,
+            filter: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.components.insert("Position".into());
         ctx.validate_entity_query(&q, sp());
-        assert!(ctx.diag.has_errors(), "expected error for duplicate in with(…)");
+        assert!(
+            ctx.diag.has_errors(),
+            "expected error for duplicate in with(…)"
+        );
     }
 
     #[test]
     fn test_component_in_both_with_and_without_error() {
         let q = EntityQuery {
-            span:    sp(),
-            with:    vec!["Velocity".into()],
+            span: sp(),
+            with: vec!["Velocity".into()],
             without: vec!["Velocity".into()],
-            filter:  None,
+            filter: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.components.insert("Velocity".into());
         ctx.validate_entity_query(&q, sp());
-        assert!(ctx.diag.has_errors(), "expected error for component in both clauses");
+        assert!(
+            ctx.diag.has_errors(),
+            "expected error for component in both clauses"
+        );
     }
 
     #[test]
     fn test_undeclared_component_in_query_error() {
         let q = EntityQuery {
-            span:    sp(),
-            with:    vec!["Ghost".into()], // not declared
+            span: sp(),
+            with: vec!["Ghost".into()], // not declared
             without: vec![],
-            filter:  None,
+            filter: None,
         };
         let mut ctx = SemaCtx::new();
         // "Ghost" is NOT in ctx.components
         ctx.validate_entity_query(&q, sp());
-        assert!(ctx.diag.has_errors(), "expected error for undeclared component");
+        assert!(
+            ctx.diag.has_errors(),
+            "expected error for undeclared component"
+        );
     }
 
     #[test]
     fn test_valid_entity_query_no_errors() {
         let q = EntityQuery {
-            span:    sp(),
-            with:    vec!["Position".into(), "Velocity".into()],
+            span: sp(),
+            with: vec!["Position".into(), "Velocity".into()],
             without: vec!["Dead".into()],
-            filter:  None,
+            filter: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.components.insert("Position".into());
@@ -2099,7 +2507,10 @@ mod tests {
         ctx.system_sets.push(("RenderPos".into(), sp(), set_b));
         ctx.check_system_aliasing();
 
-        let warns: Vec<_> = ctx.diag.items.iter()
+        let warns: Vec<_> = ctx
+            .diag
+            .items
+            .iter()
             .filter(|d| d.severity == Severity::Warning && d.message.contains("aliasing"))
             .collect();
         assert!(!warns.is_empty(), "expected aliasing warning");
@@ -2113,12 +2524,15 @@ mod tests {
         set_b.add("Health", AccessMode::Read);
 
         let mut ctx = SemaCtx::new();
-        ctx.system_sets.push(("MoveSystem".into(),  sp(), set_a));
+        ctx.system_sets.push(("MoveSystem".into(), sp(), set_a));
         ctx.system_sets.push(("HealthSystem".into(), sp(), set_b));
         ctx.check_system_aliasing();
 
         assert!(!ctx.diag.has_errors());
-        let warns: Vec<_> = ctx.diag.items.iter()
+        let warns: Vec<_> = ctx
+            .diag
+            .items
+            .iter()
             .filter(|d| d.message.contains("aliasing"))
             .collect();
         assert!(warns.is_empty(), "unexpected aliasing warning");
@@ -2131,20 +2545,23 @@ mod tests {
     #[test]
     fn test_agent_no_behaviours_warning() {
         let a = AgentDecl {
-            span:         sp(),
-            attrs:        vec![],
-            name:         "EmptyAgent".into(),
+            span: sp(),
+            attrs: vec![],
+            name: "EmptyAgent".into(),
             architecture: AgentArchitecture::Utility,
-            perceptions:  vec![],
-            memory:       None,
-            learning:     None,
-            behaviors:    vec![],  // ← empty
-            goals:        vec![],
-            fields:       vec![],
+            perceptions: vec![],
+            memory: None,
+            learning: None,
+            behaviors: vec![], // ← empty
+            goals: vec![],
+            fields: vec![],
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_agent(&a);
-        let warns: Vec<_> = ctx.diag.items.iter()
+        let warns: Vec<_> = ctx
+            .diag
+            .items
+            .iter()
             .filter(|d| d.severity == Severity::Warning && d.message.contains("no behaviours"))
             .collect();
         assert!(!warns.is_empty(), "expected no-behaviours warning");
@@ -2153,23 +2570,23 @@ mod tests {
     #[test]
     fn test_agent_duplicate_priority_error() {
         let rule = |name: &str, prio: u32| BehaviorRule {
-            span:     sp(),
-            name:     name.into(),
+            span: sp(),
+            name: name.into(),
             priority: BehaviorPriority(prio),
-            params:   vec![],
-            body:     mk_block(vec![]),
+            params: vec![],
+            body: mk_block(vec![]),
         };
         let a = AgentDecl {
-            span:         sp(),
-            attrs:        vec![],
-            name:         "Clash".into(),
+            span: sp(),
+            attrs: vec![],
+            name: "Clash".into(),
             architecture: AgentArchitecture::Utility,
-            perceptions:  vec![],
-            memory:       None,
-            learning:     None,
-            behaviors:    vec![rule("Flee", 100), rule("Attack", 100)], // same prio
-            goals:        vec![],
-            fields:       vec![],
+            perceptions: vec![],
+            memory: None,
+            learning: None,
+            behaviors: vec![rule("Flee", 100), rule("Attack", 100)], // same prio
+            goals: vec![],
+            fields: vec![],
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_agent(&a);
@@ -2179,23 +2596,23 @@ mod tests {
     #[test]
     fn test_agent_unique_priorities_ok() {
         let rule = |name: &str, prio: u32| BehaviorRule {
-            span:     sp(),
-            name:     name.into(),
+            span: sp(),
+            name: name.into(),
             priority: BehaviorPriority(prio),
-            params:   vec![],
-            body:     mk_block(vec![]),
+            params: vec![],
+            body: mk_block(vec![]),
         };
         let a = AgentDecl {
-            span:         sp(),
-            attrs:        vec![],
-            name:         "Ordered".into(),
+            span: sp(),
+            attrs: vec![],
+            name: "Ordered".into(),
             architecture: AgentArchitecture::Utility,
-            perceptions:  vec![],
-            memory:       None,
-            learning:     None,
-            behaviors:    vec![rule("Flee", 100), rule("Patrol", 10)],
-            goals:        vec![],
-            fields:       vec![],
+            perceptions: vec![],
+            memory: None,
+            learning: None,
+            behaviors: vec![rule("Flee", 100), rule("Patrol", 10)],
+            goals: vec![],
+            fields: vec![],
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_agent(&a);
@@ -2205,26 +2622,28 @@ mod tests {
     #[test]
     fn test_agent_duplicate_perception_error() {
         let vision = |range| PerceptionSpec {
-            span:  sp(),
-            kind:  PerceptionKind::Vision,
+            span: sp(),
+            kind: PerceptionKind::Vision,
             range: Some(range),
-            fov:   None,
-            tag:   None,
+            fov: None,
+            tag: None,
         };
         let a = AgentDecl {
-            span:         sp(),
-            attrs:        vec![],
-            name:         "DualVision".into(),
+            span: sp(),
+            attrs: vec![],
+            name: "DualVision".into(),
             architecture: AgentArchitecture::Utility,
-            perceptions:  vec![vision(40.0), vision(20.0)], // duplicate Vision
-            memory:       None,
-            learning:     None,
-            behaviors:    vec![BehaviorRule {
-                span: sp(), name: "act".into(),
+            perceptions: vec![vision(40.0), vision(20.0)], // duplicate Vision
+            memory: None,
+            learning: None,
+            behaviors: vec![BehaviorRule {
+                span: sp(),
+                name: "act".into(),
                 priority: BehaviorPriority(1),
-                params: vec![], body: mk_block(vec![]),
+                params: vec![],
+                body: mk_block(vec![]),
             }],
-            goals:  vec![],
+            goals: vec![],
             fields: vec![],
         };
         let mut ctx = SemaCtx::new();
@@ -2239,11 +2658,15 @@ mod tests {
     #[test]
     fn test_model_missing_input_error() {
         let m = ModelDecl {
-            span:      sp(),
-            attrs:     vec![],
-            name:      "NoInput".into(),
-            layers:    vec![ModelLayer::Output { span: sp(), units: 10, activation: Activation::Softmax }],
-            device:    ModelDevice::Auto,
+            span: sp(),
+            attrs: vec![],
+            name: "NoInput".into(),
+            layers: vec![ModelLayer::Output {
+                span: sp(),
+                units: 10,
+                activation: Activation::Softmax,
+            }],
+            device: ModelDevice::Auto,
             optimizer: None,
         };
         let mut ctx = SemaCtx::new();
@@ -2254,11 +2677,14 @@ mod tests {
     #[test]
     fn test_model_missing_output_error() {
         let m = ModelDecl {
-            span:      sp(),
-            attrs:     vec![],
-            name:      "NoOutput".into(),
-            layers:    vec![ModelLayer::Input { span: sp(), size: 128 }],
-            device:    ModelDevice::Auto,
+            span: sp(),
+            attrs: vec![],
+            name: "NoOutput".into(),
+            layers: vec![ModelLayer::Input {
+                span: sp(),
+                size: 128,
+            }],
+            device: ModelDevice::Auto,
             optimizer: None,
         };
         let mut ctx = SemaCtx::new();
@@ -2269,15 +2695,25 @@ mod tests {
     #[test]
     fn test_model_duplicate_input_error() {
         let m = ModelDecl {
-            span:      sp(),
-            attrs:     vec![],
-            name:      "TwoInputs".into(),
-            layers:    vec![
-                ModelLayer::Input  { span: sp(), size: 64 },
-                ModelLayer::Input  { span: sp(), size: 128 },
-                ModelLayer::Output { span: sp(), units: 10, activation: Activation::Softmax },
+            span: sp(),
+            attrs: vec![],
+            name: "TwoInputs".into(),
+            layers: vec![
+                ModelLayer::Input {
+                    span: sp(),
+                    size: 64,
+                },
+                ModelLayer::Input {
+                    span: sp(),
+                    size: 128,
+                },
+                ModelLayer::Output {
+                    span: sp(),
+                    units: 10,
+                    activation: Activation::Softmax,
+                },
             ],
-            device:    ModelDevice::Auto,
+            device: ModelDevice::Auto,
             optimizer: None,
         };
         let mut ctx = SemaCtx::new();
@@ -2288,15 +2724,27 @@ mod tests {
     #[test]
     fn test_model_well_formed_ok() {
         let m = ModelDecl {
-            span:      sp(),
-            attrs:     vec![],
-            name:      "Good".into(),
-            layers:    vec![
-                ModelLayer::Input  { span: sp(), size: 128 },
-                ModelLayer::Dense  { span: sp(), units: 256, activation: Activation::Relu, bias: true },
-                ModelLayer::Output { span: sp(), units: 10,  activation: Activation::Softmax },
+            span: sp(),
+            attrs: vec![],
+            name: "Good".into(),
+            layers: vec![
+                ModelLayer::Input {
+                    span: sp(),
+                    size: 128,
+                },
+                ModelLayer::Dense {
+                    span: sp(),
+                    units: 256,
+                    activation: Activation::Relu,
+                    bias: true,
+                },
+                ModelLayer::Output {
+                    span: sp(),
+                    units: 10,
+                    activation: Activation::Softmax,
+                },
             ],
-            device:    ModelDevice::Auto,
+            device: ModelDevice::Auto,
             optimizer: None,
         };
         let mut ctx = SemaCtx::new();
@@ -2311,18 +2759,24 @@ mod tests {
     #[test]
     fn test_train_duplicate_signal_name_error() {
         let sig = |name: &str| SignalSpec {
-            span: sp(), is_reward: true, name: name.into(), weight: 1.0, expr: None,
+            span: sp(),
+            is_reward: true,
+            name: name.into(),
+            weight: 1.0,
+            expr: None,
         };
         let t = TrainDecl {
-            span:      sp(),
-            attrs:     vec![],
-            agent:     "Bot".into(),
-            world:     "Arena".into(),
-            signals:   vec![sig("survive"), sig("survive")], // duplicate
-            episode:   None,
-            model:     None,
+            span: sp(),
+            attrs: vec![],
+            agent: "Bot".into(),
+            world: "Arena".into(),
+            signals: vec![sig("survive"), sig("survive")], // duplicate
+            episode: None,
+            model: None,
             optimizer: None,
-            hyper:     vec![],
+            hyper: vec![],
+            algorithm: None,
+            value_model: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_train(&t);
@@ -2332,18 +2786,24 @@ mod tests {
     #[test]
     fn test_train_negative_signal_weight_error() {
         let sig = SignalSpec {
-            span: sp(), is_reward: true, name: "bonus".into(), weight: -0.5, expr: None,
+            span: sp(),
+            is_reward: true,
+            name: "bonus".into(),
+            weight: -0.5,
+            expr: None,
         };
         let t = TrainDecl {
-            span:      sp(),
-            attrs:     vec![],
-            agent:     "Bot".into(),
-            world:     "Arena".into(),
-            signals:   vec![sig],
-            episode:   None,
-            model:     None,
+            span: sp(),
+            attrs: vec![],
+            agent: "Bot".into(),
+            world: "Arena".into(),
+            signals: vec![sig],
+            episode: None,
+            model: None,
             optimizer: None,
-            hyper:     vec![],
+            hyper: vec![],
+            algorithm: None,
+            value_model: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_train(&t);
@@ -2353,18 +2813,32 @@ mod tests {
     #[test]
     fn test_train_duplicate_hyper_key_error() {
         let t = TrainDecl {
-            span:      sp(),
-            attrs:     vec![],
-            agent:     "Bot".into(),
-            world:     "Arena".into(),
-            signals:   vec![],
-            episode:   None,
-            model:     None,
+            span: sp(),
+            attrs: vec![],
+            agent: "Bot".into(),
+            world: "Arena".into(),
+            signals: vec![],
+            episode: None,
+            model: None,
             optimizer: None,
-            hyper:     vec![
-                ("gamma".into(), Expr::FloatLit { span: sp(), value: 0.99 }),
-                ("gamma".into(), Expr::FloatLit { span: sp(), value: 0.95 }),
+            hyper: vec![
+                (
+                    "gamma".into(),
+                    Expr::FloatLit {
+                        span: sp(),
+                        value: 0.99,
+                    },
+                ),
+                (
+                    "gamma".into(),
+                    Expr::FloatLit {
+                        span: sp(),
+                        value: 0.95,
+                    },
+                ),
             ],
+            algorithm: None,
+            value_model: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_train(&t);
@@ -2374,22 +2848,24 @@ mod tests {
     #[test]
     fn test_train_zero_max_steps_error() {
         let ep = EpisodeSpec {
-            span:           sp(),
-            max_steps:      Some(0),
-            max_seconds:    None,
+            span: sp(),
+            max_steps: Some(0),
+            max_seconds: None,
             done_condition: None,
-            num_envs:       Some(8),
+            num_envs: Some(8),
         };
         let t = TrainDecl {
-            span:      sp(),
-            attrs:     vec![],
-            agent:     "Bot".into(),
-            world:     "Arena".into(),
-            signals:   vec![],
-            episode:   Some(ep),
-            model:     None,
+            span: sp(),
+            attrs: vec![],
+            agent: "Bot".into(),
+            world: "Arena".into(),
+            signals: vec![],
+            episode: Some(ep),
+            model: None,
             optimizer: None,
-            hyper:     vec![],
+            hyper: vec![],
+            algorithm: None,
+            value_model: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_train(&t);
@@ -2399,22 +2875,24 @@ mod tests {
     #[test]
     fn test_train_zero_num_envs_error() {
         let ep = EpisodeSpec {
-            span:           sp(),
-            max_steps:      Some(1000),
-            max_seconds:    None,
+            span: sp(),
+            max_steps: Some(1000),
+            max_seconds: None,
             done_condition: None,
-            num_envs:       Some(0),  // invalid
+            num_envs: Some(0), // invalid
         };
         let t = TrainDecl {
-            span:      sp(),
-            attrs:     vec![],
-            agent:     "Bot".into(),
-            world:     "Arena".into(),
-            signals:   vec![],
-            episode:   Some(ep),
-            model:     None,
+            span: sp(),
+            attrs: vec![],
+            agent: "Bot".into(),
+            world: "Arena".into(),
+            signals: vec![],
+            episode: Some(ep),
+            model: None,
             optimizer: None,
-            hyper:     vec![],
+            hyper: vec![],
+            algorithm: None,
+            value_model: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_train(&t);
@@ -2427,8 +2905,7 @@ mod tests {
 
     #[test]
     fn test_diagnostic_with_label() {
-        let d = Diagnostic::error(sp(), "boom")
-            .with_label(sp(), "defined here");
+        let d = Diagnostic::error(sp(), "boom").with_label(sp(), "defined here");
         assert_eq!(d.labels.len(), 1);
         assert!(d.is_fatal());
     }
@@ -2500,7 +2977,9 @@ mod tests {
     #[test]
     fn test_cf_stack_labelled_loop() {
         let mut cf = CfStack::default();
-        cf.push(CfFrame::Loop { label: Some("outer".into()) });
+        cf.push(CfFrame::Loop {
+            label: Some("outer".into()),
+        });
         assert!(cf.has_label("outer"));
         assert!(!cf.has_label("inner"));
         cf.pop();
@@ -2509,7 +2988,10 @@ mod tests {
     #[test]
     fn test_cf_stack_async_fn() {
         let mut cf = CfStack::default();
-        cf.push(CfFrame::Function { is_async: true, name: "fetch".into() });
+        cf.push(CfFrame::Function {
+            is_async: true,
+            name: "fetch".into(),
+        });
         assert!(cf.in_async_fn());
         assert!(cf.in_function());
         cf.pop();

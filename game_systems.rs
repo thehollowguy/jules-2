@@ -15,7 +15,7 @@ pub struct PhysicsBody {
     pub velocity: [f32; 3],
     pub angular_velocity: [f32; 3],
     pub position: [f32; 3],
-    pub rotation: [f32; 4],  // Quaternion
+    pub rotation: [f32; 4], // Quaternion
 }
 
 #[derive(Debug, Clone)]
@@ -55,12 +55,7 @@ impl PhysicsWorld {
         }
     }
 
-    pub fn create_rigid_body(
-        &mut self,
-        mass: f32,
-        shape: PhysicsShape,
-        position: [f32; 3],
-    ) -> u32 {
+    pub fn create_rigid_body(&mut self, mass: f32, shape: PhysicsShape, position: [f32; 3]) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -71,7 +66,7 @@ impl PhysicsWorld {
             velocity: [0.0, 0.0, 0.0],
             angular_velocity: [0.0, 0.0, 0.0],
             position,
-            rotation: [0.0, 0.0, 0.0, 1.0],  // Identity quaternion
+            rotation: [0.0, 0.0, 0.0, 1.0], // Identity quaternion
         };
 
         self.bodies.insert(id, body);
@@ -133,9 +128,7 @@ impl PhysicsWorld {
                 let id1 = bodies[i];
                 let id2 = bodies[j];
 
-                if let (Some(body1), Some(body2)) =
-                    (self.bodies.get(&id1), self.bodies.get(&id2))
-                {
+                if let (Some(body1), Some(body2)) = (self.bodies.get(&id1), self.bodies.get(&id2)) {
                     if self.bodies_colliding(body1, body2) {
                         self.resolve_collision(id1, id2);
                     }
@@ -178,7 +171,9 @@ impl PhysicsWorld {
         let dz = pos2[2] - pos1[2];
         let dist = (dx * dx + dy * dy + dz * dz).sqrt();
 
-        if dist < 0.001 { return; }
+        if dist < 0.001 {
+            return;
+        }
 
         let nx = dx / dist;
         let ny = dy / dist;
@@ -190,7 +185,9 @@ impl PhysicsWorld {
 
         let dvn = dvx * nx + dvy * ny + dvz * nz;
 
-        if dvn >= 0.0 { return; }  // Already separating
+        if dvn >= 0.0 {
+            return;
+        } // Already separating
 
         let inv_mass_sum = 1.0 / (mass1 + mass2);
         let impulse = -dvn / inv_mass_sum;
@@ -260,10 +257,58 @@ impl Camera {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Sprite {
+    pub name: String,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct Model {
+    pub name: String,
+    pub mesh_id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub enum SceneObjectKind {
+    Sprite(u32),
+    Model(u32),
+}
+
+#[derive(Debug, Clone)]
+pub struct SceneObject {
+    pub id: u32,
+    pub kind: SceneObjectKind,
+    pub material_id: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GridMap {
+    pub id: u32,
+    pub width: usize,
+    pub height: usize,
+    pub cells: Vec<u32>, // object-id per tile; 0 = empty
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkedGridMap {
+    pub id: u32,
+    pub width: usize,
+    pub height: usize,
+    pub chunk_size: usize,
+    pub chunks: HashMap<(i32, i32), Vec<u32>>,
+}
+
 pub struct RenderState {
     pub camera: Camera,
     pub meshes: HashMap<u32, Mesh>,
     pub materials: HashMap<u32, Material>,
+    pub sprites: HashMap<u32, Sprite>,
+    pub models: HashMap<u32, Model>,
+    pub objects: HashMap<u32, SceneObject>,
+    pub maps: HashMap<u32, GridMap>,
+    pub chunked_maps: HashMap<u32, ChunkedGridMap>,
     pub next_id: u32,
     // 8K rendering support
     pub width: u32,
@@ -276,7 +321,14 @@ impl RenderState {
             camera: Camera::default(),
             meshes: HashMap::new(),
             materials: HashMap::new(),
+            sprites: HashMap::new(),
+            models: HashMap::new(),
+            objects: HashMap::new(),
+            maps: HashMap::new(),
+            chunked_maps: HashMap::new(),
             next_id: 1,
+            width: 1920,
+            height: 1080,
         }
     }
 
@@ -314,6 +366,174 @@ impl RenderState {
     pub fn update_camera_position(&mut self, x: f32, y: f32, z: f32) {
         self.camera.position = [x, y, z];
     }
+
+    pub fn create_sprite(&mut self, name: String, width: f32, height: f32) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.sprites.insert(
+            id,
+            Sprite {
+                name,
+                width,
+                height,
+            },
+        );
+        id
+    }
+
+    pub fn create_model(&mut self, name: String, mesh_id: u32) -> Result<u32, String> {
+        if !self.meshes.contains_key(&mesh_id) {
+            return Err(format!("unknown mesh_id {}", mesh_id));
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.models.insert(id, Model { name, mesh_id });
+        Ok(id)
+    }
+
+    pub fn create_object(
+        &mut self,
+        kind: SceneObjectKind,
+        material_id: Option<u32>,
+    ) -> Result<u32, String> {
+        if let Some(mid) = material_id {
+            if !self.materials.contains_key(&mid) {
+                return Err(format!("unknown material_id {}", mid));
+            }
+        }
+        match kind {
+            SceneObjectKind::Sprite(id) if !self.sprites.contains_key(&id) => {
+                return Err(format!("unknown sprite_id {}", id));
+            }
+            SceneObjectKind::Model(id) if !self.models.contains_key(&id) => {
+                return Err(format!("unknown model_id {}", id));
+            }
+            _ => {}
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+        self.objects.insert(
+            id,
+            SceneObject {
+                id,
+                kind,
+                material_id,
+            },
+        );
+        Ok(id)
+    }
+
+    pub fn create_grid_map(&mut self, width: usize, height: usize) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.maps.insert(
+            id,
+            GridMap {
+                id,
+                width,
+                height,
+                cells: vec![0; width.saturating_mul(height)],
+            },
+        );
+        id
+    }
+
+    pub fn set_grid_cell(&mut self, map_id: u32, x: usize, y: usize, object_id: u32) -> Result<(), String> {
+        if object_id != 0 && !self.objects.contains_key(&object_id) {
+            return Err(format!("unknown object_id {}", object_id));
+        }
+        let map = self.maps.get_mut(&map_id).ok_or_else(|| format!("unknown map_id {}", map_id))?;
+        if x >= map.width || y >= map.height {
+            return Err(format!("grid index out of bounds ({}, {}) for {}x{}", x, y, map.width, map.height));
+        }
+        map.cells[y * map.width + x] = object_id;
+        Ok(())
+    }
+
+    pub fn get_grid_cell(&self, map_id: u32, x: usize, y: usize) -> Option<u32> {
+        let map = self.maps.get(&map_id)?;
+        if x >= map.width || y >= map.height {
+            return None;
+        }
+        Some(map.cells[y * map.width + x])
+    }
+
+    pub fn render_grid_map(&self, map_id: u32) -> Result<usize, String> {
+        let map = self.maps.get(&map_id).ok_or_else(|| format!("unknown map_id {}", map_id))?;
+        let mut drawn = 0usize;
+        for object_id in &map.cells {
+            if *object_id == 0 {
+                continue;
+            }
+            if self.objects.contains_key(object_id) {
+                drawn += 1;
+            }
+        }
+        Ok(drawn)
+    }
+
+    pub fn create_chunked_grid_map(&mut self, width: usize, height: usize, chunk_size: usize) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.chunked_maps.insert(
+            id,
+            ChunkedGridMap {
+                id,
+                width,
+                height,
+                chunk_size: chunk_size.max(1),
+                chunks: HashMap::new(),
+            },
+        );
+        id
+    }
+
+    pub fn set_chunked_grid_cell(
+        &mut self,
+        map_id: u32,
+        x: usize,
+        y: usize,
+        object_id: u32,
+    ) -> Result<(), String> {
+        if object_id != 0 && !self.objects.contains_key(&object_id) {
+            return Err(format!("unknown object_id {}", object_id));
+        }
+        let map = self
+            .chunked_maps
+            .get_mut(&map_id)
+            .ok_or_else(|| format!("unknown chunked map_id {}", map_id))?;
+        if x >= map.width || y >= map.height {
+            return Err(format!(
+                "chunked grid index out of bounds ({}, {}) for {}x{}",
+                x, y, map.width, map.height
+            ));
+        }
+
+        let csize = map.chunk_size;
+        let cx = (x / csize) as i32;
+        let cy = (y / csize) as i32;
+        let lx = x % csize;
+        let ly = y % csize;
+        let chunk = map
+            .chunks
+            .entry((cx, cy))
+            .or_insert_with(|| vec![0; csize.saturating_mul(csize)]);
+        chunk[ly * csize + lx] = object_id;
+        Ok(())
+    }
+
+    pub fn render_chunked_grid_map(&self, map_id: u32) -> Result<usize, String> {
+        let map = self
+            .chunked_maps
+            .get(&map_id)
+            .ok_or_else(|| format!("unknown chunked map_id {}", map_id))?;
+        let mut drawn = 0usize;
+        for chunk in map.chunks.values() {
+            drawn += chunk.iter().filter(|&&id| id != 0 && self.objects.contains_key(&id)).count();
+        }
+        Ok(drawn)
+    }
 }
 
 // Primitive mesh generators
@@ -321,31 +541,44 @@ pub fn create_cube_mesh(size: f32) -> Mesh {
     let s = size / 2.0;
     let vertices = vec![
         // Front
-        [-s, -s,  s], [ s, -s,  s], [ s,  s,  s], [-s,  s,  s],
+        [-s, -s, s],
+        [s, -s, s],
+        [s, s, s],
+        [-s, s, s],
         // Back
-        [-s, -s, -s], [ s, -s, -s], [ s,  s, -s], [-s,  s, -s],
+        [-s, -s, -s],
+        [s, -s, -s],
+        [s, s, -s],
+        [-s, s, -s],
         // Right
-        [ s, -s,  s], [ s, -s, -s], [ s,  s, -s], [ s,  s,  s],
+        [s, -s, s],
+        [s, -s, -s],
+        [s, s, -s],
+        [s, s, s],
         // Left
-        [-s, -s,  s], [-s, -s, -s], [-s,  s, -s], [-s,  s,  s],
+        [-s, -s, s],
+        [-s, -s, -s],
+        [-s, s, -s],
+        [-s, s, s],
         // Top
-        [-s,  s,  s], [ s,  s,  s], [ s,  s, -s], [-s,  s, -s],
+        [-s, s, s],
+        [s, s, s],
+        [s, s, -s],
+        [-s, s, -s],
         // Bottom
-        [-s, -s,  s], [ s, -s,  s], [ s, -s, -s], [-s, -s, -s],
+        [-s, -s, s],
+        [s, -s, s],
+        [s, -s, -s],
+        [-s, -s, -s],
     ];
 
     let indices = vec![
         // Front
-        0, 1, 2, 2, 3, 0,
-        // Back
-        6, 5, 4, 4, 7, 6,
-        // Right
-        8, 9, 10, 10, 11, 8,
-        // Left
-        14, 13, 12, 12, 15, 14,
-        // Top
-        16, 17, 18, 18, 19, 16,
-        // Bottom
+        0, 1, 2, 2, 3, 0, // Back
+        6, 5, 4, 4, 7, 6, // Right
+        8, 9, 10, 10, 11, 8, // Left
+        14, 13, 12, 12, 15, 14, // Top
+        16, 17, 18, 18, 19, 16, // Bottom
         22, 21, 20, 20, 23, 22,
     ];
 
@@ -383,11 +616,7 @@ pub fn create_sphere_mesh(radius: f32, segments: u32) -> Mesh {
             vertices.push([x, y, z]);
 
             // Normal for sphere is simply the normalized position (points outward)
-            let normal = [
-                (sin_lat * cos_lon),
-                (cos_lat),
-                (sin_lat * sin_lon),
-            ];
+            let normal = [(sin_lat * cos_lon), (cos_lat), (sin_lat * sin_lon)];
             normals.push(normal);
         }
     }
@@ -420,9 +649,17 @@ pub fn create_sphere_mesh(radius: f32, segments: u32) -> Mesh {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum KeyCode {
-    W, A, S, D,
-    Left, Right, Up, Down,
-    Space, Enter, Escape,
+    W,
+    A,
+    S,
+    D,
+    Left,
+    Right,
+    Up,
+    Down,
+    Space,
+    Enter,
+    Escape,
 }
 
 #[derive(Debug, Clone)]
@@ -431,7 +668,7 @@ pub struct InputState {
     pub mouse_x: f32,
     pub mouse_y: f32,
     pub mouse_scroll: f32,
-    pub gamepad_axes: [f32; 6],  // [LX, LY, RX, RY, LT, RT]
+    pub gamepad_axes: [f32; 6], // [LX, LY, RX, RY, LT, RT]
     pub gamepad_buttons: std::collections::HashSet<u8>,
 }
 
@@ -468,16 +705,28 @@ impl InputState {
         match axis {
             "horizontal" => {
                 let mut val = 0.0;
-                if self.is_key_pressed(KeyCode::D) { val += 1.0; }
-                if self.is_key_pressed(KeyCode::A) { val -= 1.0; }
-                if self.gamepad_axes[0].abs() > 0.1 { val = self.gamepad_axes[0]; }
+                if self.is_key_pressed(KeyCode::D) {
+                    val += 1.0;
+                }
+                if self.is_key_pressed(KeyCode::A) {
+                    val -= 1.0;
+                }
+                if self.gamepad_axes[0].abs() > 0.1 {
+                    val = self.gamepad_axes[0];
+                }
                 val.clamp(-1.0, 1.0)
             }
             "vertical" => {
                 let mut val = 0.0;
-                if self.is_key_pressed(KeyCode::W) { val += 1.0; }
-                if self.is_key_pressed(KeyCode::S) { val -= 1.0; }
-                if self.gamepad_axes[1].abs() > 0.1 { val = self.gamepad_axes[1]; }
+                if self.is_key_pressed(KeyCode::W) {
+                    val += 1.0;
+                }
+                if self.is_key_pressed(KeyCode::S) {
+                    val -= 1.0;
+                }
+                if self.gamepad_axes[1].abs() > 0.1 {
+                    val = self.gamepad_axes[1];
+                }
                 val.clamp(-1.0, 1.0)
             }
             _ => 0.0,
@@ -491,6 +740,61 @@ impl InputState {
 
 pub fn physics_world_new() -> PhysicsWorld {
     PhysicsWorld::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_grid_map_with_sprite_and_model_objects() {
+        let mut render = RenderState::new();
+        let mesh = render.create_mesh(vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], vec![0, 1, 2]);
+        let mat = render.create_material([1.0, 1.0, 1.0, 1.0]);
+        let sprite = render.create_sprite("grass".into(), 1.0, 1.0);
+        let model = render.create_model("tree".into(), mesh).unwrap();
+        let sprite_obj = render
+            .create_object(SceneObjectKind::Sprite(sprite), Some(mat))
+            .unwrap();
+        let model_obj = render
+            .create_object(SceneObjectKind::Model(model), Some(mat))
+            .unwrap();
+
+        let map = render.create_grid_map(4, 4);
+        render.set_grid_cell(map, 0, 0, sprite_obj).unwrap();
+        render.set_grid_cell(map, 1, 0, model_obj).unwrap();
+
+        assert_eq!(render.get_grid_cell(map, 0, 0), Some(sprite_obj));
+        assert_eq!(render.get_grid_cell(map, 1, 0), Some(model_obj));
+        assert_eq!(render.render_grid_map(map).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_chunked_grid_map_for_sparse_large_worlds() {
+        let mut render = RenderState::new();
+        let mat = render.create_material([1.0, 1.0, 1.0, 1.0]);
+        let sprite = render.create_sprite("rock".into(), 1.0, 1.0);
+        let sprite_obj = render
+            .create_object(SceneObjectKind::Sprite(sprite), Some(mat))
+            .unwrap();
+
+        let map = render.create_chunked_grid_map(100_000, 100_000, 64);
+        render.set_chunked_grid_cell(map, 0, 0, sprite_obj).unwrap();
+        render
+            .set_chunked_grid_cell(map, 99_999, 99_999, sprite_obj)
+            .unwrap();
+
+        assert_eq!(render.render_chunked_grid_map(map).unwrap(), 2);
+        assert_eq!(
+            render
+                .chunked_maps
+                .get(&map)
+                .expect("chunked map exists")
+                .chunks
+                .len(),
+            2
+        );
+    }
 }
 
 pub fn render_state_new() -> RenderState {

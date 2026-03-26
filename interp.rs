@@ -28,18 +28,17 @@
 #![allow(clippy::match_single_binding, clippy::large_enum_variant)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
 use std::fmt;
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::ast::{
-    Activation, AgentDecl, AssignOpKind, Attribute, BinOpKind, Block, EntityQuery,
-    ElemType, Expr, FnDecl, Item, LearningKind, MatchArm, ModelDecl, ModelLayer,
-    NormKind, OptimizerKind, Padding, ParallelismHint, Pattern, PoolOp,
-    Program, RecurrentCell, ScheduleKind, Stmt, SystemDecl, TrainDecl,
-    UnOpKind, VecSize,
+    Activation, AgentDecl, AssignOpKind, Attribute, BinOpKind, Block, ElemType, EntityQuery, Expr,
+    FnDecl, Item, LearningKind, MatchArm, ModelDecl, ModelLayer, NormKind, OptimizerKind, Padding,
+    ParallelismHint, Pattern, PoolOp, Program, RecurrentCell, ScheduleKind, Stmt, SystemDecl,
+    TrainDecl, UnOpKind, VecSize,
 };
+use crate::game_systems::{create_cube_mesh, InputState, PhysicsShape, PhysicsWorld, RenderState, SceneObjectKind};
 use crate::lexer::Span;
-use crate::game_systems::{PhysicsWorld, RenderState, InputState};
 use crate::ml_engine::{ComputationGraph, Optimizer, OptimizerState};
 
 // =============================================================================
@@ -53,9 +52,16 @@ use crate::ml_engine::{ComputationGraph, Optimizer, OptimizerState};
 #[derive(Debug, Clone)]
 pub enum Value {
     // ── Scalars ───────────────────────────────────────────────────────────────
-    I8(i8),   I16(i16), I32(i32), I64(i64),
-    U8(u8),   U16(u16), U32(u32), U64(u64),
-    F32(f32), F64(f64),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    F32(f32),
+    F64(f64),
     Bool(bool),
     Str(String),
     Unit,
@@ -70,7 +76,7 @@ pub enum Value {
     Mat2([[f32; 2]; 2]),
     Mat3([[f32; 3]; 3]),
     Mat4([[f32; 4]; 4]),
-    Quat([f32; 4]),  // [x, y, z, w]
+    Quat([f32; 4]), // [x, y, z, w]
 
     // ── Tensors (Feature 1) ───────────────────────────────────────────────────
     Tensor(Arc<RwLock<Tensor>>),
@@ -78,7 +84,10 @@ pub enum Value {
     // ── Compound ─────────────────────────────────────────────────────────────
     Tuple(Vec<Value>),
     Array(Arc<Mutex<Vec<Value>>>),
-    Struct { name: String, fields: HashMap<String, Value> },
+    Struct {
+        name: String,
+        fields: HashMap<String, Value>,
+    },
     /// HashMap: key -> value pairs (keys currently strings)
     HashMap(Arc<Mutex<HashMap<String, Value>>>),
 
@@ -111,33 +120,42 @@ pub enum Value {
 impl Value {
     pub fn type_name(&self) -> &str {
         match self {
-            Value::I8(_)  => "i8",  Value::I16(_) => "i16",
-            Value::I32(_) => "i32", Value::I64(_) => "i64",
-            Value::U8(_)  => "u8",  Value::U16(_) => "u16",
-            Value::U32(_) => "u32", Value::U64(_) => "u64",
-            Value::F32(_) => "f32", Value::F64(_) => "f64",
-            Value::Bool(_)   => "bool",
-            Value::Str(_)    => "str",
-            Value::Unit      => "()",
-            Value::Vec2(_)   => "vec2",  Value::Vec3(_) => "vec3",
-            Value::Vec4(_)   => "vec4",
-            Value::IVec2(_)  => "ivec2", Value::IVec3(_) => "ivec3",
-            Value::IVec4(_)  => "ivec4",
-            Value::Mat2(_)   => "mat2",  Value::Mat3(_) => "mat3",
-            Value::Mat4(_)   => "mat4",  Value::Quat(_) => "quat",
+            Value::I8(_) => "i8",
+            Value::I16(_) => "i16",
+            Value::I32(_) => "i32",
+            Value::I64(_) => "i64",
+            Value::U8(_) => "u8",
+            Value::U16(_) => "u16",
+            Value::U32(_) => "u32",
+            Value::U64(_) => "u64",
+            Value::F32(_) => "f32",
+            Value::F64(_) => "f64",
+            Value::Bool(_) => "bool",
+            Value::Str(_) => "str",
+            Value::Unit => "()",
+            Value::Vec2(_) => "vec2",
+            Value::Vec3(_) => "vec3",
+            Value::Vec4(_) => "vec4",
+            Value::IVec2(_) => "ivec2",
+            Value::IVec3(_) => "ivec3",
+            Value::IVec4(_) => "ivec4",
+            Value::Mat2(_) => "mat2",
+            Value::Mat3(_) => "mat3",
+            Value::Mat4(_) => "mat4",
+            Value::Quat(_) => "quat",
             Value::Tensor(_) => "tensor",
-            Value::Tuple(_)  => "tuple",
-            Value::Array(_)  => "array",
+            Value::Tuple(_) => "tuple",
+            Value::Array(_) => "array",
             Value::HashMap(_) => "map",
             Value::Struct { name, .. } => name,
-            Value::Some(_)   => "Some",
-            Value::None      => "None",
-            Value::Ok(_)     => "Ok",
-            Value::Err(_)    => "Err",
-            Value::Fn(_)     => "fn",
+            Value::Some(_) => "Some",
+            Value::None => "None",
+            Value::Ok(_) => "Ok",
+            Value::Err(_) => "Err",
+            Value::Fn(_) => "fn",
             Value::Entity(_) => "entity",
-            Value::World(_)  => "world",
-            Value::Model(_)  => "model",
+            Value::World(_) => "world",
+            Value::Model(_) => "model",
             Value::Return(_) | Value::Break(_) | Value::Continue => "<control-flow>",
         }
     }
@@ -151,9 +169,9 @@ impl Value {
             Value::I64(x) => Some(*x as f64),
             Value::U32(x) => Some(*x as f64),
             Value::U64(x) => Some(*x as f64),
-            Value::I8(x)  => Some(*x as f64),
+            Value::I8(x) => Some(*x as f64),
             Value::I16(x) => Some(*x as f64),
-            Value::U8(x)  => Some(*x as f64),
+            Value::U8(x) => Some(*x as f64),
             Value::U16(x) => Some(*x as f64),
             _ => None,
         }
@@ -165,23 +183,27 @@ impl Value {
             Value::I64(x) => Some(*x),
             Value::U32(x) => Some(*x as i64),
             Value::U64(x) => Some(*x as i64),
-            Value::I8(x)  => Some(*x as i64),
+            Value::I8(x) => Some(*x as i64),
             Value::I16(x) => Some(*x as i64),
-            Value::U8(x)  => Some(*x as i64),
+            Value::U8(x) => Some(*x as i64),
             Value::U16(x) => Some(*x as i64),
             _ => None,
         }
     }
 
     pub fn as_bool(&self) -> Option<bool> {
-        if let Value::Bool(b) = self { Some(*b) } else { None }
+        if let Value::Bool(b) = self {
+            Some(*b)
+        } else {
+            None
+        }
     }
 
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Bool(b) => *b,
-            Value::I32(x)  => *x != 0,
-            Value::F32(x)  => *x != 0.0,
+            Value::I32(x) => *x != 0,
+            Value::F32(x) => *x != 0.0,
             _ => true,
         }
     }
@@ -195,14 +217,19 @@ impl Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::I8(x)   => write!(f, "{x}"),  Value::I16(x)  => write!(f, "{x}"),
-            Value::I32(x)  => write!(f, "{x}"),  Value::I64(x)  => write!(f, "{x}"),
-            Value::U8(x)   => write!(f, "{x}"),  Value::U16(x)  => write!(f, "{x}"),
-            Value::U32(x)  => write!(f, "{x}"),  Value::U64(x)  => write!(f, "{x}"),
-            Value::F32(x)  => write!(f, "{x}"),  Value::F64(x)  => write!(f, "{x}"),
+            Value::I8(x) => write!(f, "{x}"),
+            Value::I16(x) => write!(f, "{x}"),
+            Value::I32(x) => write!(f, "{x}"),
+            Value::I64(x) => write!(f, "{x}"),
+            Value::U8(x) => write!(f, "{x}"),
+            Value::U16(x) => write!(f, "{x}"),
+            Value::U32(x) => write!(f, "{x}"),
+            Value::U64(x) => write!(f, "{x}"),
+            Value::F32(x) => write!(f, "{x}"),
+            Value::F64(x) => write!(f, "{x}"),
             Value::Bool(b) => write!(f, "{b}"),
-            Value::Str(s)  => write!(f, "{s}"),
-            Value::Unit    => write!(f, "()"),
+            Value::Str(s) => write!(f, "{s}"),
+            Value::Unit => write!(f, "()"),
             Value::Vec2(v) => write!(f, "vec2({}, {})", v[0], v[1]),
             Value::Vec3(v) => write!(f, "vec3({}, {}, {})", v[0], v[1], v[2]),
             Value::Vec4(v) => write!(f, "vec4({}, {}, {}, {})", v[0], v[1], v[2], v[3]),
@@ -219,24 +246,24 @@ impl fmt::Display for Value {
             }
             Value::Struct { name, .. } => write!(f, "{name} {{ … }}"),
             Value::Some(v) => write!(f, "Some({})", v),
-            Value::None    => write!(f, "None"),
-            Value::Ok(v)   => write!(f, "Ok({})", v),
-            Value::Err(v)  => write!(f, "Err({})", v),
+            Value::None => write!(f, "None"),
+            Value::Ok(v) => write!(f, "Ok({})", v),
+            Value::Err(v) => write!(f, "Err({})", v),
             Value::HashMap(m) => {
                 let m = m.lock().unwrap();
                 write!(f, "{{ {} items }}", m.len())
             }
             Value::Entity(id) => write!(f, "Entity({id})"),
-            Value::World(_)   => write!(f, "<world>"),
-            Value::Model(_)   => write!(f, "<model>"),
-            Value::Fn(_)      => write!(f, "<fn>"),
-            Value::Array(a)   => {
+            Value::World(_) => write!(f, "<world>"),
+            Value::Model(_) => write!(f, "<model>"),
+            Value::Fn(_) => write!(f, "<fn>"),
+            Value::Array(a) => {
                 let a = a.lock().unwrap();
                 write!(f, "[…; {}]", a.len())
             }
-            Value::Return(v)  => write!(f, "return {v}"),
-            Value::Break(_)   => write!(f, "break"),
-            Value::Continue   => write!(f, "continue"),
+            Value::Return(v) => write!(f, "return {v}"),
+            Value::Break(_) => write!(f, "break"),
+            Value::Continue => write!(f, "continue"),
             _ => write!(f, "<value>"),
         }
     }
@@ -250,11 +277,11 @@ impl fmt::Display for Value {
 /// GPU tensors use the same shape metadata but store data behind a `GpuBuffer`.
 #[derive(Debug, Clone)]
 pub struct Tensor {
-    pub elem:  ElemType,
+    pub elem: ElemType,
     pub shape: Vec<usize>,
-    pub data:  TensorStorage,
+    pub data: TensorStorage,
     /// When `Some`, this tensor has a gradient buffer attached (`@grad`).
-    pub grad:  Option<Box<Tensor>>,
+    pub grad: Option<Box<Tensor>>,
 }
 
 #[derive(Debug, Clone)]
@@ -280,7 +307,12 @@ impl Tensor {
     }
 
     pub fn from_data(shape: Vec<usize>, data: Vec<f32>) -> Self {
-        Tensor { elem: ElemType::F32, shape, data: TensorStorage::Cpu(data), grad: None }
+        Tensor {
+            elem: ElemType::F32,
+            shape,
+            data: TensorStorage::Cpu(data),
+            grad: None,
+        }
     }
 
     pub fn numel(&self) -> usize {
@@ -308,8 +340,14 @@ impl Tensor {
         if self.shape.len() < 2 || rhs.shape.len() < 2 {
             return Err(RuntimeError::new("matmul requires ≥2-D tensors"));
         }
-        let (m, k) = (self.shape[self.shape.len() - 2], self.shape[self.shape.len() - 1]);
-        let (k2, n) = (rhs.shape[rhs.shape.len() - 2], rhs.shape[rhs.shape.len() - 1]);
+        let (m, k) = (
+            self.shape[self.shape.len() - 2],
+            self.shape[self.shape.len() - 1],
+        );
+        let (k2, n) = (
+            rhs.shape[rhs.shape.len() - 2],
+            rhs.shape[rhs.shape.len() - 1],
+        );
         if k != k2 {
             return Err(RuntimeError::new(format!(
                 "matmul shape mismatch: [{m}, {k}] @ [{k2}, {n}]"
@@ -379,7 +417,10 @@ impl Tensor {
         let n = rhs.shape[0];
         let a = self.cpu_data();
         let b = rhs.cpu_data();
-        let c: Vec<f32> = a.iter().flat_map(|&ai| b.iter().map(move |&bj| ai * bj)).collect();
+        let c: Vec<f32> = a
+            .iter()
+            .flat_map(|&ai| b.iter().map(move |&bj| ai * bj))
+            .collect();
         Ok(Tensor::from_data(vec![m, n], c))
     }
 
@@ -393,9 +434,12 @@ impl Tensor {
         self.elementwise(rhs, |a, b| a / b, "./")
     }
 
-    fn elementwise(&self, rhs: &Tensor, op: impl Fn(f32, f32) -> f32, name: &str)
-        -> Result<Tensor, RuntimeError>
-    {
+    fn elementwise(
+        &self,
+        rhs: &Tensor,
+        op: impl Fn(f32, f32) -> f32,
+        name: &str,
+    ) -> Result<Tensor, RuntimeError> {
         // Exact shape match (fast path)
         if self.shape == rhs.shape {
             let a = self.cpu_data();
@@ -405,10 +449,12 @@ impl Tensor {
         }
 
         // Numpy-style broadcasting
-        let result_shape = broadcast_shape(&self.shape, &rhs.shape)
-            .ok_or_else(|| RuntimeError::new(format!(
-                "`{name}` shape mismatch: {:?} vs {:?}", self.shape, rhs.shape
-            )))?;
+        let result_shape = broadcast_shape(&self.shape, &rhs.shape).ok_or_else(|| {
+            RuntimeError::new(format!(
+                "`{name}` shape mismatch: {:?} vs {:?}",
+                self.shape, rhs.shape
+            ))
+        })?;
 
         let n: usize = result_shape.iter().product();
         let mut c = vec![0.0_f32; n];
@@ -456,19 +502,41 @@ impl Tensor {
 
     /// Apply an activation function element-wise.
     pub fn apply_activation(&self, act: &Activation) -> Tensor {
-        let data: Vec<f32> = self.cpu_data().iter().map(|&x| match act {
-            Activation::Relu      => x.max(0.0),
-            Activation::LeakyRelu => if x > 0.0 { x } else { 0.01 * x },
-            Activation::Sigmoid   => 1.0 / (1.0 + (-x).exp()),
-            Activation::Tanh      => x.tanh(),
-            Activation::Gelu      => {
-                0.5 * x * (1.0 + ((2.0_f32 / std::f32::consts::PI).sqrt()
-                    * (x + 0.044715 * x * x * x)).tanh())
-            }
-            Activation::Silu      => x / (1.0 + (-x).exp()),
-            Activation::Softmax   => x,  // applied below per-row
-            Activation::Linear | Activation::Custom(_) => x,
-        }).collect();
+        let data: Vec<f32> = self
+            .cpu_data()
+            .iter()
+            .map(|&x| match act {
+                Activation::Relu => x.max(0.0),
+                Activation::LeakyRelu => {
+                    if x > 0.0 {
+                        x
+                    } else {
+                        0.01 * x
+                    }
+                }
+                Activation::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+                Activation::Tanh => x.tanh(),
+                Activation::Gelu => {
+                    0.5 * x
+                        * (1.0
+                            + ((2.0_f32 / std::f32::consts::PI).sqrt()
+                                * (x + 0.044715 * x * x * x))
+                                .tanh())
+                }
+                Activation::Silu => x / (1.0 + (-x).exp()),
+                Activation::Elu => {
+                    if x > 0.0 {
+                        x
+                    } else {
+                        x.exp() - 1.0
+                    }
+                }
+                Activation::Swish => x / (1.0 + (-x).exp()),
+                Activation::Mish => x * (1.0 + x.exp()).ln().tanh(),
+                Activation::Softmax => x, // applied below per-row
+                Activation::Linear | Activation::Custom(_) => x,
+            })
+            .collect();
 
         let mut t = Tensor::from_data(self.shape.clone(), data);
 
@@ -481,7 +549,9 @@ impl Tensor {
                 let row = &mut d[r * cols..(r + 1) * cols];
                 let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = row.iter().map(|x| (x - max).exp()).sum();
-                for x in row.iter_mut() { *x = (*x - max).exp() / sum; }
+                for x in row.iter_mut() {
+                    *x = (*x - max).exp() / sum;
+                }
             }
         }
         t
@@ -505,7 +575,9 @@ impl Tensor {
         }
         let b = rhs.cpu_data().to_vec();
         let a = self.cpu_data_mut();
-        for (x, y) in a.iter_mut().zip(b) { *x += y; }
+        for (x, y) in a.iter_mut().zip(b) {
+            *x += y;
+        }
         Ok(())
     }
 
@@ -516,8 +588,7 @@ impl Tensor {
         }
         let a = self.cpu_data();
         let b = targets.cpu_data();
-        let loss: f32 = a.iter().zip(b).map(|(p, t)| (p - t).powi(2)).sum::<f32>()
-            / a.len() as f32;
+        let loss: f32 = a.iter().zip(b).map(|(p, t)| (p - t).powi(2)).sum::<f32>() / a.len() as f32;
         Ok(loss)
     }
 
@@ -528,9 +599,12 @@ impl Tensor {
         }
         let a = self.cpu_data();
         let b = targets.cpu_data();
-        let loss: f32 = a.iter().zip(b)
+        let loss: f32 = a
+            .iter()
+            .zip(b)
             .map(|(p, t)| -t * p.max(1e-9).ln())
-            .sum::<f32>() / self.shape[0] as f32;
+            .sum::<f32>()
+            / self.shape[0] as f32;
         Ok(loss)
     }
 }
@@ -548,20 +622,20 @@ pub type EntityId = u64;
 /// The two vecs stay in sync: `dense_ids[i]` owns `dense_vals[i]`.
 #[derive(Debug, Default)]
 pub struct EcsWorld {
-    next_id:    EntityId,
-    alive:      std::collections::HashSet<EntityId>,
+    next_id: EntityId,
+    alive: std::collections::HashSet<EntityId>,
     /// component_type → SparseSet
     components: HashMap<String, SparseSet>,
     /// Pending events (signal_name → Vec<EntityId>)
-    events:     HashMap<String, Vec<EntityId>>,
+    events: HashMap<String, Vec<EntityId>>,
 }
 
 /// Sparse-set component storage.
 #[derive(Debug, Default)]
 struct SparseSet {
     /// Maps EntityId → index into `dense_ids` / `dense_vals`.
-    sparse:     HashMap<EntityId, usize>,
-    dense_ids:  Vec<EntityId>,
+    sparse: HashMap<EntityId, usize>,
+    dense_ids: Vec<EntityId>,
     dense_vals: Vec<Value>,
 }
 
@@ -582,7 +656,10 @@ impl SparseSet {
     }
 
     fn get_mut(&mut self, id: EntityId) -> Option<&mut Value> {
-        self.sparse.get(&id).copied().map(|i| &mut self.dense_vals[i])
+        self.sparse
+            .get(&id)
+            .copied()
+            .map(|i| &mut self.dense_vals[i])
     }
 
     fn remove(&mut self, id: EntityId) {
@@ -651,7 +728,8 @@ impl EcsWorld {
             self.alive.iter().cloned().collect()
         } else {
             // Find the component with the fewest entities (cheapest to iterate).
-            let smallest = with.iter()
+            let smallest = with
+                .iter()
                 .filter_map(|c| self.components.get(c))
                 .min_by_key(|s| s.dense_ids.len());
             match smallest {
@@ -663,19 +741,26 @@ impl EcsWorld {
         base.into_iter()
             .filter(|id| {
                 self.alive.contains(id)
-                && with.iter().all(|c| {
-                    self.components.get(c).map_or(false, |s| s.get(*id).is_some())
-                })
-                && without.iter().all(|c| {
-                    self.components.get(c).map_or(true, |s| s.get(*id).is_none())
-                })
+                    && with.iter().all(|c| {
+                        self.components
+                            .get(c)
+                            .map_or(false, |s| s.get(*id).is_some())
+                    })
+                    && without.iter().all(|c| {
+                        self.components
+                            .get(c)
+                            .map_or(true, |s| s.get(*id).is_none())
+                    })
             })
             .collect()
     }
 
     /// Emit an event signal for the training loop.
     pub fn emit_event(&mut self, signal: &str, entity: EntityId) {
-        self.events.entry(signal.to_owned()).or_default().push(entity);
+        self.events
+            .entry(signal.to_owned())
+            .or_default()
+            .push(entity);
     }
 
     /// Drain all events for a named signal.
@@ -691,31 +776,66 @@ impl EcsWorld {
 /// A weight layer in the runtime model.
 #[derive(Debug, Clone)]
 pub(crate) enum WeightLayer {
-    Dense    { w: Tensor, b: Tensor, act: Activation },
-    Conv2d   { filters: u64, kh: u64, kw: u64, act: Activation },
-    Pool     { ph: u64, pw: u64, op: PoolOp },
-    Dropout  { rate: f32, training: bool },
-    Norm     { kind: NormKind, scale: Tensor, shift: Tensor },
-    Attention{ num_heads: u64, head_dim: u64,
-               wq: Tensor, wk: Tensor, wv: Tensor, wo: Tensor },
-    Embed    { table: Tensor },
-    Recurrent{ units: u64, cell: RecurrentCell,
-               wh: Tensor, wx: Tensor, bh: Tensor },
-    SubModel { name: String },
+    Dense {
+        w: Tensor,
+        b: Tensor,
+        act: Activation,
+    },
+    Conv2d {
+        filters: u64,
+        kh: u64,
+        kw: u64,
+        act: Activation,
+    },
+    Pool {
+        ph: u64,
+        pw: u64,
+        op: PoolOp,
+    },
+    Dropout {
+        rate: f32,
+        training: bool,
+    },
+    Norm {
+        kind: NormKind,
+        scale: Tensor,
+        shift: Tensor,
+    },
+    Attention {
+        num_heads: u64,
+        head_dim: u64,
+        wq: Tensor,
+        wk: Tensor,
+        wv: Tensor,
+        wo: Tensor,
+    },
+    Embed {
+        table: Tensor,
+    },
+    Recurrent {
+        units: u64,
+        cell: RecurrentCell,
+        wh: Tensor,
+        wx: Tensor,
+        bh: Tensor,
+    },
+    SubModel {
+        name: String,
+    },
 }
 
 /// The live neural network model with allocated weights.
 #[derive(Debug)]
 pub struct NnModel {
-    pub name:    String,
-    pub layers:  Vec<WeightLayer>,
+    pub name: String,
+    pub layers: Vec<WeightLayer>,
     pub training: bool,
     /// Gradient accumulator: one tensor per weight tensor, same shape.
-    pub grads:   Vec<Vec<Tensor>>,
+    pub grads: Vec<Vec<Tensor>>,
     /// Adam state: first and second moment estimates.
-    pub m1:      Vec<Vec<Tensor>>,
-    pub m2:      Vec<Vec<Tensor>>,
-    pub step:    u64,
+    pub m1: Vec<Vec<Tensor>>,
+    pub m2: Vec<Vec<Tensor>>,
+    pub step: u64,
 }
 
 impl NnModel {
@@ -729,7 +849,12 @@ impl NnModel {
                 ModelLayer::Input { size, .. } => {
                     last_width = *size as usize;
                 }
-                ModelLayer::Dense { units, activation, bias, .. } => {
+                ModelLayer::Dense {
+                    units,
+                    activation,
+                    bias,
+                    ..
+                } => {
                     let u = *units as usize;
                     // He initialisation: std = sqrt(2 / fan_in)
                     let std = (2.0_f32 / last_width as f32).sqrt();
@@ -737,12 +862,21 @@ impl NnModel {
                         vec![last_width, u],
                         (0..last_width * u).map(|_| rand_normal(0.0, std)).collect(),
                     );
-                    let b = if *bias { Tensor::zeros(vec![u]) }
-                            else    { Tensor::zeros(vec![u]) };
-                    layers.push(WeightLayer::Dense { w, b, act: activation.clone() });
+                    let b = if *bias {
+                        Tensor::zeros(vec![u])
+                    } else {
+                        Tensor::zeros(vec![u])
+                    };
+                    layers.push(WeightLayer::Dense {
+                        w,
+                        b,
+                        act: activation.clone(),
+                    });
                     last_width = u;
                 }
-                ModelLayer::Output { units, activation, .. } => {
+                ModelLayer::Output {
+                    units, activation, ..
+                } => {
                     let u = *units as usize;
                     let std = (2.0_f32 / last_width as f32).sqrt();
                     let w = Tensor::from_data(
@@ -750,35 +884,55 @@ impl NnModel {
                         (0..last_width * u).map(|_| rand_normal(0.0, std)).collect(),
                     );
                     let b = Tensor::zeros(vec![u]);
-                    layers.push(WeightLayer::Dense { w, b, act: activation.clone() });
+                    layers.push(WeightLayer::Dense {
+                        w,
+                        b,
+                        act: activation.clone(),
+                    });
                     last_width = u;
                 }
                 ModelLayer::Dropout { rate, .. } => {
                     layers.push(WeightLayer::Dropout {
-                        rate: *rate as f32, training: true,
+                        rate: *rate as f32,
+                        training: true,
                     });
                 }
                 ModelLayer::Norm { kind, .. } => {
                     let scale = Tensor::from_data(vec![last_width], vec![1.0; last_width]);
                     let shift = Tensor::zeros(vec![last_width]);
-                    layers.push(WeightLayer::Norm { kind: *kind, scale, shift });
+                    layers.push(WeightLayer::Norm {
+                        kind: *kind,
+                        scale,
+                        shift,
+                    });
                 }
-                ModelLayer::Attention { num_heads, head_dim, .. } => {
+                ModelLayer::Attention {
+                    num_heads,
+                    head_dim,
+                    ..
+                } => {
                     let d = (*num_heads * *head_dim) as usize;
                     let std = (2.0_f32 / last_width as f32).sqrt();
-                    let mk = |rows: usize, cols: usize| Tensor::from_data(
-                        vec![rows, cols],
-                        (0..rows * cols).map(|_| rand_normal(0.0, std)).collect(),
-                    );
+                    let mk = |rows: usize, cols: usize| {
+                        Tensor::from_data(
+                            vec![rows, cols],
+                            (0..rows * cols).map(|_| rand_normal(0.0, std)).collect(),
+                        )
+                    };
                     layers.push(WeightLayer::Attention {
-                        num_heads: *num_heads, head_dim: *head_dim,
+                        num_heads: *num_heads,
+                        head_dim: *head_dim,
                         wq: mk(last_width, d),
                         wk: mk(last_width, d),
                         wv: mk(last_width, d),
                         wo: mk(d, last_width),
                     });
                 }
-                ModelLayer::Embed { vocab_size, embed_dim, .. } => {
+                ModelLayer::Embed {
+                    vocab_size,
+                    embed_dim,
+                    ..
+                } => {
                     let v = *vocab_size as usize;
                     let e = *embed_dim as usize;
                     let table = Tensor::from_data(
@@ -788,33 +942,54 @@ impl NnModel {
                     layers.push(WeightLayer::Embed { table });
                     last_width = e;
                 }
-                ModelLayer::Conv2d { filters, kernel_h, kernel_w, activation, .. } => {
+                ModelLayer::Conv2d {
+                    filters,
+                    kernel_h,
+                    kernel_w,
+                    activation,
+                    ..
+                } => {
                     layers.push(WeightLayer::Conv2d {
-                        filters: *filters, kh: *kernel_h, kw: *kernel_w,
+                        filters: *filters,
+                        kh: *kernel_h,
+                        kw: *kernel_w,
                         act: activation.clone(),
                     });
                 }
-                ModelLayer::Pool { size_h, size_w, op, .. } => {
+                ModelLayer::Pool {
+                    size_h, size_w, op, ..
+                } => {
                     layers.push(WeightLayer::Pool {
-                        ph: *size_h, pw: *size_w, op: *op,
+                        ph: *size_h,
+                        pw: *size_w,
+                        op: *op,
                     });
                 }
                 ModelLayer::Recurrent { units, cell, .. } => {
                     let u = *units as usize;
                     let std = (2.0_f32 / (last_width + u) as f32).sqrt();
-                    let wh = Tensor::from_data(vec![u, u],
-                        (0..u * u).map(|_| rand_normal(0.0, std)).collect());
-                    let wx = Tensor::from_data(vec![last_width, u],
-                        (0..last_width * u).map(|_| rand_normal(0.0, std)).collect());
+                    let wh = Tensor::from_data(
+                        vec![u, u],
+                        (0..u * u).map(|_| rand_normal(0.0, std)).collect(),
+                    );
+                    let wx = Tensor::from_data(
+                        vec![last_width, u],
+                        (0..last_width * u).map(|_| rand_normal(0.0, std)).collect(),
+                    );
                     let bh = Tensor::zeros(vec![u]);
                     layers.push(WeightLayer::Recurrent {
-                        units: *units, cell: *cell, wh, wx, bh,
+                        units: *units,
+                        cell: *cell,
+                        wh,
+                        wx,
+                        bh,
                     });
                     last_width = u;
                 }
                 ModelLayer::SubModel { name, .. } => {
                     layers.push(WeightLayer::SubModel { name: name.clone() });
                 }
+                ModelLayer::Residual { .. } | ModelLayer::Flatten { .. } => {}
             }
         }
 
@@ -824,9 +999,9 @@ impl NnModel {
             layers,
             training: false,
             grads: vec![vec![]; n],
-            m1:    vec![vec![]; n],
-            m2:    vec![vec![]; n],
-            step:  0,
+            m1: vec![vec![]; n],
+            m2: vec![vec![]; n],
+            step: 0,
         }
     }
 
@@ -853,12 +1028,16 @@ impl NnModel {
                 Ok(y.apply_activation(act))
             }
             WeightLayer::Dropout { rate, training } => {
-                if !training || *rate == 0.0 { return Ok(x); }
+                if !training || *rate == 0.0 {
+                    return Ok(x);
+                }
                 // Bernoulli dropout mask.
                 let keep = 1.0 - rate;
-                let data: Vec<f32> = x.cpu_data().iter().map(|v| {
-                    if pseudo_rand() > *rate { v / keep } else { 0.0 }
-                }).collect();
+                let data: Vec<f32> = x
+                    .cpu_data()
+                    .iter()
+                    .map(|v| if pseudo_rand() > *rate { v / keep } else { 0.0 })
+                    .collect();
                 Ok(Tensor::from_data(x.shape.clone(), data))
             }
             WeightLayer::Norm { scale, shift, .. } => {
@@ -872,7 +1051,7 @@ impl NnModel {
                 for r in 0..rows {
                     let row = &x_data[r * d..(r + 1) * d];
                     let mean: f32 = row.iter().sum::<f32>() / d as f32;
-                    let var: f32  = row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / d as f32;
+                    let var: f32 = row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / d as f32;
                     let std = (var + 1e-6).sqrt();
                     for c in 0..d {
                         out[r * d + c] = (row[c] - mean) / std * s_data[c] + sh_data[c];
@@ -880,7 +1059,14 @@ impl NnModel {
                 }
                 Ok(Tensor::from_data(x.shape.clone(), out))
             }
-            WeightLayer::Attention { num_heads, head_dim, wq, wk, wv, wo } => {
+            WeightLayer::Attention {
+                num_heads,
+                head_dim,
+                wq,
+                wk,
+                wv,
+                wo,
+            } => {
                 // Simplified single-head for the interpreter (full MHA in prod).
                 let q = x.matmul(wq)?;
                 let k = x.matmul(wk)?;
@@ -889,15 +1075,13 @@ impl NnModel {
                 let scores = q.matmul(&k.transpose()?)?.scale(1.0 / d.sqrt());
                 let scores = scores.apply_activation(&Activation::Softmax);
                 let attn = scores.matmul(&v)?;
-                let out  = attn.matmul(wo)?;
+                let out = attn.matmul(wo)?;
                 let _ = num_heads;
                 Ok(out)
             }
             WeightLayer::Embed { table } => {
                 // Expect x to contain integer indices (stored as f32).
-                let indices: Vec<usize> = x.cpu_data().iter()
-                    .map(|&v| v as usize)
-                    .collect();
+                let indices: Vec<usize> = x.cpu_data().iter().map(|&v| v as usize).collect();
                 let embed_dim = table.shape[1];
                 let mut out = vec![0.0_f32; indices.len() * embed_dim];
                 let t = table.cpu_data();
@@ -907,7 +1091,9 @@ impl NnModel {
                 }
                 Ok(Tensor::from_data(vec![indices.len(), embed_dim], out))
             }
-            WeightLayer::Recurrent { units, wh, wx, bh, .. } => {
+            WeightLayer::Recurrent {
+                units, wh, wx, bh, ..
+            } => {
                 // Single-step GRU approximation (simplest stateful layer).
                 let u = *units as usize;
                 let h = Tensor::zeros(vec![1, u]);
@@ -916,7 +1102,10 @@ impl NnModel {
                 let b_data = bh.cpu_data();
                 let xw_d = xw.cpu_data();
                 let hw_d = hw.cpu_data();
-                let out: Vec<f32> = xw_d.iter().zip(hw_d).enumerate()
+                let out: Vec<f32> = xw_d
+                    .iter()
+                    .zip(hw_d)
+                    .enumerate()
                     .map(|(i, (a, b))| (a + b + b_data[i % u]).tanh())
                     .collect();
                 Ok(Tensor::from_data(vec![1, u], out))
@@ -936,7 +1125,10 @@ impl Tensor {
         if self.shape.len() < 2 {
             return Err(RuntimeError::new("transpose requires ≥2-D tensor"));
         }
-        let (rows, cols) = (self.shape[self.shape.len() - 2], self.shape[self.shape.len() - 1]);
+        let (rows, cols) = (
+            self.shape[self.shape.len() - 2],
+            self.shape[self.shape.len() - 1],
+        );
         let data = self.cpu_data();
         let mut out = vec![0.0_f32; rows * cols];
         for r in 0..rows {
@@ -967,9 +1159,7 @@ impl Scheduler {
     pub fn build(program: &Program) -> Self {
         // Simple heuristic: systems that only read run before systems that write.
         // A proper Kahn's-algorithm scheduler goes here in a full compiler.
-        let mut order: Vec<String> = program.systems()
-            .map(|s| s.name.clone())
-            .collect();
+        let mut order: Vec<String> = program.systems().map(|s| s.name.clone()).collect();
         order.sort(); // stable alphabetic fallback
         Scheduler { order }
     }
@@ -977,9 +1167,9 @@ impl Scheduler {
     /// Tick: run all systems in scheduled order against the world.
     pub fn tick(
         &self,
-        systems:    &HashMap<String, Arc<SystemDecl>>,
-        world:      &Arc<Mutex<EcsWorld>>,
-        interp:     &mut Interpreter,
+        systems: &HashMap<String, Arc<SystemDecl>>,
+        world: &Arc<Mutex<EcsWorld>>,
+        interp: &mut Interpreter,
         delta_time: f32,
     ) -> Result<(), RuntimeError> {
         for name in &self.order {
@@ -1005,11 +1195,19 @@ pub struct Env {
 }
 
 impl Env {
-    pub fn new() -> Self { Env { frames: vec![Frame::new()] } }
+    pub fn new() -> Self {
+        Env {
+            frames: vec![Frame::new()],
+        }
+    }
 
-    pub fn push(&mut self) { self.frames.push(Frame::new()); }
+    pub fn push(&mut self) {
+        self.frames.push(Frame::new());
+    }
 
-    pub fn pop(&mut self) { self.frames.pop(); }
+    pub fn pop(&mut self) {
+        self.frames.pop();
+    }
 
     pub fn set(&mut self, name: &str, val: Value) {
         for frame in self.frames.iter_mut().rev() {
@@ -1032,7 +1230,9 @@ impl Env {
 
     pub fn get(&self, name: &str) -> Option<&Value> {
         for frame in self.frames.iter().rev() {
-            if let Some(v) = frame.get(name) { return Some(v); }
+            if let Some(v) = frame.get(name) {
+                return Some(v);
+            }
         }
         None
     }
@@ -1045,21 +1245,27 @@ impl Env {
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
     pub message: String,
-    pub span:    Option<Span>,
+    pub span: Option<Span>,
 }
 
 impl RuntimeError {
     pub fn new(msg: impl Into<String>) -> Self {
-        RuntimeError { message: msg.into(), span: None }
+        RuntimeError {
+            message: msg.into(),
+            span: None,
+        }
     }
-    pub fn at(mut self, span: Span) -> Self { self.span = Some(span); self }
+    pub fn at(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
+    }
 }
 
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.span {
             Some(s) => write!(f, "runtime error at {}: {}", s, self.message),
-            None    => write!(f, "runtime error: {}", self.message),
+            None => write!(f, "runtime error: {}", self.message),
         }
     }
 }
@@ -1076,8 +1282,8 @@ macro_rules! rt_err {
 // =============================================================================
 
 pub struct FnClosure {
-    pub decl:    FnDecl,
-    pub capture: Frame,   // captured environment for closures
+    pub decl: FnDecl,
+    pub capture: Frame, // captured environment for closures
 }
 
 impl fmt::Debug for FnClosure {
@@ -1093,19 +1299,19 @@ impl fmt::Debug for FnClosure {
 /// The main tree-walking interpreter.
 pub struct Interpreter {
     /// Top-level function registry.
-    pub fns:      HashMap<String, Arc<FnClosure>>,
+    pub fns: HashMap<String, Arc<FnClosure>>,
     /// Top-level model registry (AST decls; instantiated on demand).
     pub model_decls: HashMap<String, ModelDecl>,
     /// Live model instances.
-    pub models:   HashMap<String, Arc<Mutex<NnModel>>>,
+    pub models: HashMap<String, Arc<Mutex<NnModel>>>,
     /// Agent declarations.
     pub agent_decls: HashMap<String, AgentDecl>,
     /// Struct/component type registry (name → field list).
-    pub types:    HashMap<String, Vec<String>>,
+    pub types: HashMap<String, Vec<String>>,
     /// ECS world (global singleton for now).
-    pub world:    Arc<Mutex<EcsWorld>>,
+    pub world: Arc<Mutex<EcsWorld>>,
     /// GPU dispatch backend (None = CPU-only).
-    pub gpu:      Option<Box<dyn GpuBackend>>,
+    pub gpu: Option<Box<dyn GpuBackend>>,
     /// Thread pool size for `spawn` / parallel loops.
     pub n_threads: usize,
     /// Physics engine (game systems integration)
@@ -1123,14 +1329,14 @@ pub struct Interpreter {
 impl Interpreter {
     pub fn new() -> Self {
         Interpreter {
-            fns:          HashMap::new(),
-            model_decls:  HashMap::new(),
-            models:       HashMap::new(),
-            agent_decls:  HashMap::new(),
-            types:        HashMap::new(),
-            world:        Arc::new(Mutex::new(EcsWorld::default())),
-            gpu:          None,
-            n_threads:    4,
+            fns: HashMap::new(),
+            model_decls: HashMap::new(),
+            models: HashMap::new(),
+            agent_decls: HashMap::new(),
+            types: HashMap::new(),
+            world: Arc::new(Mutex::new(EcsWorld::default())),
+            gpu: None,
+            n_threads: 4,
             physics_world: Some(Arc::new(Mutex::new(PhysicsWorld::new()))),
             render_state: Some(Arc::new(Mutex::new(RenderState::new()))),
             input_state: Some(Arc::new(Mutex::new(InputState::new()))),
@@ -1151,7 +1357,10 @@ impl Interpreter {
     fn load_item(&mut self, item: &Item) {
         match item {
             Item::Fn(f) => {
-                let closure = FnClosure { decl: f.clone(), capture: Frame::new() };
+                let closure = FnClosure {
+                    decl: f.clone(),
+                    capture: Frame::new(),
+                };
                 self.fns.insert(f.name.clone(), Arc::new(closure));
             }
             Item::Component(c) => {
@@ -1162,10 +1371,18 @@ impl Interpreter {
                 let fields: Vec<String> = s.fields.iter().map(|f| f.name.clone()).collect();
                 self.types.insert(s.name.clone(), fields);
             }
-            Item::Agent(a)  => { self.agent_decls.insert(a.name.clone(), a.clone()); }
-            Item::Model(m)  => { self.model_decls.insert(m.name.clone(), m.clone()); }
-            Item::Mod { items: Some(inner), .. } => {
-                for i in inner { self.load_item(i); }
+            Item::Agent(a) => {
+                self.agent_decls.insert(a.name.clone(), a.clone());
+            }
+            Item::Model(m) => {
+                self.model_decls.insert(m.name.clone(), m.clone());
+            }
+            Item::Mod {
+                items: Some(inner), ..
+            } => {
+                for i in inner {
+                    self.load_item(i);
+                }
             }
             _ => {}
         }
@@ -1174,7 +1391,10 @@ impl Interpreter {
     // ── Run a function by name ──────────────────────────────────────────────
 
     pub fn call_fn(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
-        let closure = self.fns.get(name).cloned()
+        let closure = self
+            .fns
+            .get(name)
+            .cloned()
             .ok_or_else(|| RuntimeError::new(format!("undefined function `{name}`")))?;
         let mut env = Env::new();
         env.push();
@@ -1190,7 +1410,7 @@ impl Interpreter {
             env.pop();
             match result {
                 Value::Return(v) => Ok(*v),
-                other            => Ok(other),
+                other => Ok(other),
             }
         } else {
             env.pop();
@@ -1202,8 +1422,8 @@ impl Interpreter {
 
     pub fn run_system(
         &mut self,
-        sys:        &SystemDecl,
-        world:      &Arc<Mutex<EcsWorld>>,
+        sys: &SystemDecl,
+        world: &Arc<Mutex<EcsWorld>>,
         delta_time: f32,
     ) -> Result<(), RuntimeError> {
         let mut env = Env::new();
@@ -1232,531 +1452,766 @@ impl Interpreter {
         let mut result = Value::Unit;
         for stmt in &block.stmts {
             result = self.eval_stmt(stmt, env)?;
-impl AiArchitectureSpec {
-    /// Parse @AI("256->512->10-opt-adam-lr-0.001-explore-epsilon-gamma-0.99")
-    fn parse_from_string(s: &str) -> Result<Self, String> {
-        let s = s.trim();
-        if s.is_empty() {
-            return Err("empty architecture specification".into());
-        }
-
-        // Find learning config start
-        let config_start = s.char_indices()
-            .find(|(i, _)| {
-                s[*i..].starts_with("-opt-") ||
-                s[*i..].starts_with("-lr-") ||
-                s[*i..].starts_with("-explore-") ||
-                s[*i..].starts_with("-gamma-") ||
-                s[*i..].starts_with("-epsilon-") ||
-                s[*i..].starts_with("-temp-")
-            })
-            .map(|(i, _)| i);
-
-        let (arch_str, config_str) = match config_start {
-            Some(pos) => {
-                let (arch, cfg) = s.split_at(pos);
-                (arch.trim(), Some(cfg[1..].trim()))
+            if result.is_signal() {
+                break;
             }
-            None => (s, None),
+        }
+        if !result.is_signal() {
+            if let Some(tail) = &block.tail {
+                result = self.eval_expr(tail, env)?;
+            }
+        }
+        env.pop();
+        Ok(result)
+    }
+
+    // =========================================================================
+    // §11  STATEMENT EVALUATION
+    // =========================================================================
+
+    pub fn eval_stmt(&mut self, stmt: &Stmt, env: &mut Env) -> Result<Value, RuntimeError> {
+        match stmt {
+            Stmt::Let { pattern, init, .. } => {
+                let val = if let Some(e) = init {
+                    self.eval_expr(e, env)?
+                } else {
+                    Value::Unit
+                };
+                self.bind_pattern(pattern, val, env);
+                Ok(Value::Unit)
+            }
+
+            Stmt::Expr { expr, .. } => self.eval_expr(expr, env),
+
+            Stmt::Return { value, .. } => {
+                let v = if let Some(e) = value {
+                    self.eval_expr(e, env)?
+                } else {
+                    Value::Unit
+                };
+                Ok(Value::Return(Box::new(v)))
+            }
+
+            Stmt::Break { value, .. } => {
+                let v = if let Some(e) = value {
+                    Some(Box::new(self.eval_expr(e, env)?))
+                } else {
+                    None
+                };
+                Ok(Value::Break(v))
+            }
+
+            Stmt::Continue { .. } => Ok(Value::Continue),
+
+            Stmt::ForIn {
+                pattern,
+                iter,
+                body,
+                ..
+            } => {
+                let iter_val = self.eval_expr(iter, env)?;
+                let items = self.value_to_iter(iter_val)?;
+                for item in items {
+                    env.push();
+                    self.bind_pattern(pattern, item, env);
+                    let r = self.eval_block(body, env)?;
+                    env.pop();
+                    match r {
+                        Value::Break(_) => break,
+                        Value::Continue => continue,
+                        v if v.is_signal() => return Ok(v),
+                        _ => {}
+                    }
+                }
+                Ok(Value::Unit)
+            }
+
+            Stmt::EntityFor {
+                var,
+                query,
+                body,
+                parallelism,
+                ..
+            } => self.eval_entity_for(var, query, body, *parallelism, env),
+
+            Stmt::While { cond, body, .. } => {
+                loop {
+                    let c = self.eval_expr(cond, env)?;
+                    if !c.is_truthy() {
+                        break;
+                    }
+                    let r = self.eval_block(body, env)?;
+                    match r {
+                        Value::Break(_) => break,
+                        Value::Continue => continue,
+                        v if v.is_signal() => return Ok(v),
+                        _ => {}
+                    }
+                }
+                Ok(Value::Unit)
+            }
+
+            Stmt::Loop { body, .. } => loop {
+                let r = self.eval_block(body, env)?;
+                match r {
+                    Value::Break(v) => return Ok(v.map(|b| *b).unwrap_or(Value::Unit)),
+                    Value::Continue => continue,
+                    v if v.is_signal() => return Ok(v),
+                    _ => {}
+                }
+            },
+
+            Stmt::If {
+                cond, then, else_, ..
+            } => {
+                let c = self.eval_expr(cond, env)?;
+                if c.is_truthy() {
+                    self.eval_block(then, env)
+                } else if let Some(e) = else_ {
+                    match e.as_ref() {
+                        crate::ast::IfOrBlock::If(s) => self.eval_stmt(s, env),
+                        crate::ast::IfOrBlock::Block(b) => self.eval_block(b, env),
+                    }
+                } else {
+                    Ok(Value::Unit)
+                }
+            }
+
+            Stmt::Match { expr, arms, .. } => {
+                let scrutinee = self.eval_expr(expr, env)?;
+                for arm in arms {
+                    if self.pattern_matches(&arm.pat, &scrutinee) {
+                        env.push();
+                        self.bind_pattern(&arm.pat, scrutinee.clone(), env);
+                        let guard_ok = if let Some(g) = &arm.guard {
+                            self.eval_expr(g, env)?.is_truthy()
+                        } else {
+                            true
+                        };
+                        let result = if guard_ok {
+                            self.eval_expr(&arm.body, env)?
+                        } else {
+                            env.pop();
+                            continue;
+                        };
+                        env.pop();
+                        return Ok(result);
+                    }
+                }
+                Ok(Value::Unit)
+            }
+
+            Stmt::Item(i) => {
+                self.load_item(i);
+                Ok(Value::Unit)
+            }
+
+            Stmt::ParallelFor(pf) => {
+                let iter_val = self.eval_expr(&pf.iter, env)?;
+                let items = self.value_to_iter(iter_val)?;
+                // In the interpreter we execute sequentially;
+                // a rayon par_iter() call replaces this in the compiled backend.
+                for item in items {
+                    env.push();
+                    self.bind_pattern(&pf.var, item, env);
+                    let r = self.eval_block(&pf.body, env)?;
+                    env.pop();
+                    match r {
+                        Value::Break(_) => break,
+                        Value::Continue => continue,
+                        v if v.is_signal() => return Ok(v),
+                        _ => {}
+                    }
+                }
+                Ok(Value::Unit)
+            }
+
+            Stmt::Spawn(sb) => {
+                // In the interpreter we run the body inline (no true async).
+                self.eval_block(&sb.body, env)
+            }
+
+            Stmt::Sync(sb) => self.eval_block(&sb.body, env),
+            Stmt::Atomic(ab) => self.eval_block(&ab.body, env),
+        }
+    }
+
+    // ── Entity-for evaluation ──────────────────────────────────────────────
+
+    fn eval_entity_for(
+        &mut self,
+        var: &str,
+        query: &EntityQuery,
+        body: &Block,
+        parallelism: ParallelismHint,
+        env: &mut Env,
+    ) -> Result<Value, RuntimeError> {
+        // Snapshot the matching entity list (safe: world locked briefly).
+        let entity_ids = {
+            let w = self.world.lock().unwrap();
+            w.query(&query.with, &query.without)
         };
 
-        // Parse architecture
-        let mut spec = Self::parse_architecture(arch_str)?;
-
-        // Apply learning config if present
-        if let Some(cfg) = config_str {
-            Self::apply_learning_config_to_spec(&mut spec, cfg)?;
-        }
-
-        Ok(spec)
-    }
-
-    fn parse_architecture(s: &str) -> Result<Self, String> {
-        let s = s.trim();
-        if s.is_empty() {
-            return Err("empty architecture specification".into());
-        }
-
-        // Check for type prefix
-        let (arch_type, rest) = if let Some(colon_pos) = s.find(':') {
-            let (prefix, tail) = s.split_at(colon_pos);
-            (prefix.trim().to_lowercase(), tail[1..].trim())
-        } else {
-            ("mlp".to_string(), s)
-        };
-
-        match arch_type.as_str() {
-            "mlp" => Self::parse_mlp(rest),
-            "lstm" => Self::parse_lstm(rest),
-            "cnn" => Self::parse_cnn(rest),
-            "dueling" => Self::parse_dueling(rest),
-            "transformer" => Self::parse_transformer(rest),
-            _ => Err(format!(
-                "unknown architecture type `{}`. Supported: mlp, lstm, cnn, dueling, transformer",
-                arch_type
-            )),
-        }
-    }
-
-    fn parse_u64(s: &str, context: &str) -> Result<u64, String> {
-        s.parse()
-            .map_err(|_| format!("invalid {} `{}`", context, s))
-    }
-
-    fn extract_bracketed_content(s: &str, context: &str) -> Result<String, String> {
-        let bracket_start = s.find('[').ok_or(format!("missing `[` in {}", context))?;
-        let bracket_end = s.find(']').ok_or(format!("unclosed `[` in {}", context))?;
-        Ok(s[bracket_start + 1..bracket_end].to_string())
-    }
-
-    fn parse_mlp(s: &str) -> Result<Self, String> {
-        let s = s.trim();
-        if !s.contains("->") {
-            return Err("MLP must have layers separated by `->`".into());
-        }
-
-        let mut layers = Vec::with_capacity(8);
-        let mut activations = Vec::with_capacity(8);
-
-        for segment in s.split("->") {
-            let segment = segment.trim();
-
-            // Extract number and optional activation
-            let (num_str, act) = if let Some(bracket_pos) = segment.find('[') {
-                let num = &segment[..bracket_pos];
-                let act_start = bracket_pos + 1;
-                let act_end = segment.find(']').ok_or("unclosed `[` in activation")?;
-                let act_name = &segment[act_start..act_end].trim();
-                (num, ActivationType::from_str(act_name)?)
+        // Apply optional filter expression.
+        let mut ids_to_run = Vec::new();
+        for id in entity_ids {
+            if let Some(filter_expr) = &query.filter {
+                env.push();
+                env.set_local(var, Value::Entity(id));
+                let ok = self.eval_expr(filter_expr, env)?.is_truthy();
+                env.pop();
+                if ok {
+                    ids_to_run.push(id);
+                }
             } else {
-                (segment, ActivationType::Relu)
+                ids_to_run.push(id);
+            }
+        }
+
+        match parallelism {
+            ParallelismHint::Sequential | ParallelismHint::Auto => {
+                // Sequential: deterministic order guaranteed.
+                for id in &ids_to_run {
+                    env.push();
+                    env.set_local(var, Value::Entity(*id));
+                    let r = self.eval_block(body, env)?;
+                    env.pop();
+                    match r {
+                        Value::Break(_) => break,
+                        Value::Continue => continue,
+                        v if v.is_signal() => return Ok(v),
+                        _ => {}
+                    }
+                }
+            }
+            ParallelismHint::Parallel
+            | ParallelismHint::Simd
+            | ParallelismHint::Gpu
+            | ParallelismHint::SimdOrGpu { .. } => {
+                // Parallel: interpreter falls back to sequential with a note.
+                // A real backend uses rayon::par_iter() or GPU dispatch here.
+                for id in &ids_to_run {
+                    env.push();
+                    env.set_local(var, Value::Entity(*id));
+                    let r = self.eval_block(body, env)?;
+                    env.pop();
+                    if r.is_signal() {
+                        return Ok(r);
+                    }
+                }
+            }
+        }
+        Ok(Value::Unit)
+    }
+
+    // =========================================================================
+    // §12  EXPRESSION EVALUATION
+    // =========================================================================
+
+    pub fn eval_expr(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, RuntimeError> {
+        match expr {
+            Expr::IntLit { value, .. } => Ok(Value::I32(*value as i32)),
+            Expr::FloatLit { value, .. } => Ok(Value::F32(*value as f32)),
+            Expr::BoolLit { value, .. } => Ok(Value::Bool(*value)),
+            Expr::StrLit { value, .. } => Ok(Value::Str(value.clone())),
+
+            Expr::Ident { name, span } => {
+                // Check local env first, then built-ins.
+                if let Some(v) = env.get(name) {
+                    return Ok(v.clone());
+                }
+                if name == "world" {
+                    return Ok(Value::World(self.world.clone()));
+                }
+                if let Some(f) = self.fns.get(name.as_str()).cloned() {
+                    return Ok(Value::Fn(f));
+                }
+                if let Some(m) = self.models.get(name.as_str()).cloned() {
+                    return Ok(Value::Model(m));
+                }
+                rt_err!("undefined variable `{name}`")
+            }
+
+            Expr::Path { segments, .. } => {
+                let name = segments.join("::");
+                if let Some(v) = env.get(&name) {
+                    return Ok(v.clone());
+                }
+                if let Some(f) = self.fns.get(name.as_str()).cloned() {
+                    return Ok(Value::Fn(f));
+                }
+                rt_err!("undefined path `{name}`")
+            }
+
+            // ── Vector constructors ────────────────────────────────────────────
+            Expr::VecCtor { size, elems, span } => {
+                let vals: Vec<f32> = elems
+                    .iter()
+                    .map(|e| {
+                        self.eval_expr(e, env).and_then(|v| {
+                            v.as_f64()
+                                .map(|f| f as f32)
+                                .ok_or_else(|| RuntimeError::new("vec element must be numeric"))
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                match size {
+                    VecSize::N2 => Ok(Value::Vec2([vals[0], vals[1]])),
+                    VecSize::N3 => Ok(Value::Vec3([vals[0], vals[1], vals[2]])),
+                    VecSize::N4 => Ok(Value::Vec4([vals[0], vals[1], vals[2], vals[3]])),
+                }
+            }
+
+            Expr::ArrayLit { elems, .. } => {
+                let vals: Vec<Value> = elems
+                    .iter()
+                    .map(|e| self.eval_expr(e, env))
+                    .collect::<Result<_, _>>()?;
+                Ok(Value::Array(Arc::new(Mutex::new(vals))))
+            }
+
+            Expr::Tuple { elems, .. } => {
+                let vals: Vec<Value> = elems
+                    .iter()
+                    .map(|e| self.eval_expr(e, env))
+                    .collect::<Result<_, _>>()?;
+                Ok(Value::Tuple(vals))
+            }
+
+            // ── Arithmetic ────────────────────────────────────────────────────
+            Expr::BinOp { op, lhs, rhs, span } => {
+                self.eval_binop(*op, lhs, rhs, env).map_err(|e| e.at(*span))
+            }
+
+            Expr::UnOp { op, expr, span } => {
+                let v = self.eval_expr(expr, env)?;
+                self.eval_unop(*op, v).map_err(|e| e.at(*span))
+            }
+
+            // ── Assignment ────────────────────────────────────────────────────
+            Expr::Assign {
+                op, target, value, ..
+            } => {
+                let rhs = self.eval_expr(value, env)?;
+                self.eval_assign(*op, target, rhs, env)
+            }
+
+            // ── Field access ──────────────────────────────────────────────────
+            Expr::Field {
+                object,
+                field,
+                span,
+            } => {
+                let obj = self.eval_expr(object, env)?;
+                self.eval_field(obj, field).map_err(|e| e.at(*span))
+            }
+
+            // ── Index ─────────────────────────────────────────────────────────
+            Expr::Index {
+                object,
+                indices,
+                span,
+            } => {
+                let obj = self.eval_expr(object, env)?;
+                let idxs: Vec<Value> = indices
+                    .iter()
+                    .map(|i| self.eval_expr(i, env))
+                    .collect::<Result<_, _>>()?;
+                self.eval_index(obj, idxs).map_err(|e| e.at(*span))
+            }
+
+            // ── Calls ─────────────────────────────────────────────────────────
+            Expr::Call {
+                func,
+                args,
+                named,
+                span,
+            } => {
+                // Check for built-in functions by name first
+                if let Expr::Ident { name, .. } = func.as_ref() {
+                    let args_v: Vec<Value> = args
+                        .iter()
+                        .map(|a| self.eval_expr(a, env))
+                        .collect::<Result<_, _>>()?;
+                    if let Ok(result) = self.eval_builtin(name, args_v) {
+                        return Ok(result);
+                    }
+                }
+                // Otherwise, try normal function evaluation
+                let args_v: Vec<Value> = args
+                    .iter()
+                    .map(|a| self.eval_expr(a, env))
+                    .collect::<Result<_, _>>()?;
+                let func_v = self.eval_expr(func, env)?;
+                self.eval_call(func_v, args_v, env).map_err(|e| e.at(*span))
+            }
+
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+                span,
+            } => {
+                let recv = self.eval_expr(receiver, env)?;
+                let args_v: Vec<Value> = args
+                    .iter()
+                    .map(|a| self.eval_expr(a, env))
+                    .collect::<Result<_, _>>()?;
+                self.eval_method(recv, method, args_v)
+                    .map_err(|e| e.at(*span))
+            }
+
+            // ── Tensor-specific (Feature 1) ───────────────────────────────────
+            Expr::MatMul { lhs, rhs, span } => {
+                let l = self.eval_expr(lhs, env)?;
+                let r = self.eval_expr(rhs, env)?;
+                self.eval_matmul(l, r).map_err(|e| e.at(*span))
+            }
+
+            Expr::HadamardMul { lhs, rhs, span } => {
+                let l = self.eval_tensor(lhs, env)?;
+                let r = self.eval_tensor(rhs, env)?;
+                let out = l.read().unwrap().hadamard_mul(&r.read().unwrap())?;
+                Ok(Value::Tensor(Arc::new(RwLock::new(out))))
+            }
+
+            Expr::HadamardDiv { lhs, rhs, span } => {
+                let l = self.eval_tensor(lhs, env)?;
+                let r = self.eval_tensor(rhs, env)?;
+                let out = l.read().unwrap().hadamard_div(&r.read().unwrap())?;
+                Ok(Value::Tensor(Arc::new(RwLock::new(out))))
+            }
+
+            Expr::TensorConcat { lhs, rhs, span } => {
+                let l = self.eval_tensor(lhs, env)?;
+                let r = self.eval_tensor(rhs, env)?;
+                let out = l.read().unwrap().concat(&r.read().unwrap())?;
+                Ok(Value::Tensor(Arc::new(RwLock::new(out))))
+            }
+
+            Expr::Grad { inner, .. } => {
+                let v = self.eval_expr(inner, env)?;
+                if let Value::Tensor(t) = &v {
+                    t.write().unwrap().enable_grad();
+                }
+                Ok(v)
+            }
+
+            Expr::Pow { base, exp, .. } => {
+                let b = self.eval_expr(base, env)?;
+                let e = self.eval_expr(exp, env)?;
+                match (&b, &e) {
+                    (Value::F32(x), Value::F32(y)) => Ok(Value::F32(x.powf(*y))),
+                    (Value::F64(x), Value::F64(y)) => Ok(Value::F64(x.powf(*y))),
+                    (Value::I32(x), Value::I32(y)) => Ok(Value::I32(x.pow(*y as u32))),
+                    _ => {
+                        if let (Some(x), Some(y)) = (b.as_f64(), e.as_f64()) {
+                            Ok(Value::F64(x.powf(y)))
+                        } else {
+                            rt_err!("** requires numeric operands")
+                        }
+                    }
+                }
+            }
+
+            Expr::Range {
+                lo, hi, inclusive, ..
+            } => {
+                let lo_v = lo.as_ref().map(|e| self.eval_expr(e, env)).transpose()?;
+                let hi_v = hi.as_ref().map(|e| self.eval_expr(e, env)).transpose()?;
+                let start = lo_v.and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let end = hi_v.and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let range: Vec<Value> = if *inclusive {
+                    (start..=end).map(Value::I32).collect()
+                } else {
+                    (start..end).map(Value::I32).collect()
+                };
+                Ok(Value::Array(Arc::new(Mutex::new(range))))
+            }
+
+            Expr::Cast { expr, ty, .. } => {
+                let v = self.eval_expr(expr, env)?;
+                self.eval_cast(v, ty)
+            }
+
+            Expr::IfExpr {
+                cond, then, else_, ..
+            } => {
+                let c = self.eval_expr(cond, env)?;
+                if c.is_truthy() {
+                    self.eval_block(then, env)
+                } else if let Some(b) = else_ {
+                    self.eval_block(b, env)
+                } else {
+                    Ok(Value::Unit)
+                }
+            }
+
+            Expr::Closure { params, body, .. } => {
+                // Capture current environment.
+                let mut capture = Frame::new();
+                for frame in &env.frames {
+                    for (k, v) in frame {
+                        capture.insert(k.clone(), v.clone());
+                    }
+                }
+                let decl = FnDecl {
+                    span: crate::lexer::Span::dummy(),
+                    attrs: vec![],
+                    name: "<closure>".into(),
+                    generics: vec![],
+                    params: params.clone(),
+                    ret_ty: None,
+                    body: Some(Block {
+                        span: crate::lexer::Span::dummy(),
+                        stmts: vec![],
+                        tail: Some(body.clone()),
+                    }),
+                    is_async: false,
+                };
+                Ok(Value::Fn(Arc::new(FnClosure { decl, capture })))
+            }
+
+            Expr::Block(b) => self.eval_block(b, env),
+
+            Expr::StructLit { name, fields, .. } => {
+                let mut field_vals = HashMap::new();
+                for (fname, fexpr) in fields {
+                    field_vals.insert(fname.clone(), self.eval_expr(fexpr, env)?);
+                }
+                Ok(Value::Struct {
+                    name: name.clone(),
+                    fields: field_vals,
+                })
+            }
+            Expr::KronProd { lhs, rhs, .. } => {
+                let l = self.eval_tensor(lhs, env)?;
+                let r = self.eval_tensor(rhs, env)?;
+                let out = l.read().unwrap().kron(&r.read().unwrap())?;
+                Ok(Value::Tensor(Arc::new(RwLock::new(out))))
+            }
+            Expr::OuterProd { lhs, rhs, .. } => {
+                let l = self.eval_tensor(lhs, env)?;
+                let r = self.eval_tensor(rhs, env)?;
+                let out = l.read().unwrap().outer(&r.read().unwrap())?;
+                Ok(Value::Tensor(Arc::new(RwLock::new(out))))
+            }
+        }
+    }
+
+    // ── Tensor helper ──────────────────────────────────────────────────────
+
+    fn eval_tensor(
+        &mut self,
+        expr: &Expr,
+        env: &mut Env,
+    ) -> Result<Arc<RwLock<Tensor>>, RuntimeError> {
+        match self.eval_expr(expr, env)? {
+            Value::Tensor(t) => Ok(t),
+            other => rt_err!("expected tensor, got `{}`", other.type_name()),
+        }
+    }
+
+    // =========================================================================
+    // §13  OPERATOR EVALUATION
+    // =========================================================================
+
+    fn eval_binop(
+        &mut self,
+        op: BinOpKind,
+        lhs: &Expr,
+        rhs: &Expr,
+        env: &mut Env,
+    ) -> Result<Value, RuntimeError> {
+        // Short-circuit logical operators.
+        if op == BinOpKind::And {
+            let l = self.eval_expr(lhs, env)?;
+            return if !l.is_truthy() {
+                Ok(Value::Bool(false))
+            } else {
+                Ok(Value::Bool(self.eval_expr(rhs, env)?.is_truthy()))
             };
+        }
+        if op == BinOpKind::Or {
+            let l = self.eval_expr(lhs, env)?;
+            return if l.is_truthy() {
+                Ok(Value::Bool(true))
+            } else {
+                Ok(Value::Bool(self.eval_expr(rhs, env)?.is_truthy()))
+            };
+        }
 
-            let size = Self::parse_u64(num_str, "layer size")?;
-            if size == 0 {
-                return Err("layer size must be > 0".into());
+        let l = self.eval_expr(lhs, env)?;
+        let r = self.eval_expr(rhs, env)?;
+        eval_numeric_binop(op, l, r)
+    }
+
+    fn eval_unop(&self, op: UnOpKind, v: Value) -> Result<Value, RuntimeError> {
+        match op {
+            UnOpKind::Neg => match v {
+                Value::F32(x) => Ok(Value::F32(-x)),
+                Value::F64(x) => Ok(Value::F64(-x)),
+                Value::I32(x) => Ok(Value::I32(-x)),
+                Value::I64(x) => Ok(Value::I64(-x)),
+                Value::Vec3(v) => Ok(Value::Vec3([-v[0], -v[1], -v[2]])),
+                Value::Tensor(t) => {
+                    let data: Vec<f32> = t.read().unwrap().cpu_data().iter().map(|x| -x).collect();
+                    let shape = t.read().unwrap().shape.clone();
+                    Ok(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(
+                        shape, data,
+                    )))))
+                }
+                _ => rt_err!("unary `-` on `{}`", v.type_name()),
+            },
+            UnOpKind::Not => match v {
+                Value::Bool(b) => Ok(Value::Bool(!b)),
+                Value::I32(x) => Ok(Value::I32(!x)),
+                Value::I64(x) => Ok(Value::I64(!x)),
+                _ => rt_err!("unary `!` on `{}`", v.type_name()),
+            },
+            UnOpKind::Deref | UnOpKind::Ref | UnOpKind::RefMut => Ok(v),
+        }
+    }
+
+    fn eval_matmul(&mut self, l: Value, r: Value) -> Result<Value, RuntimeError> {
+        match (l, r) {
+            (Value::Tensor(a), Value::Tensor(b)) => {
+                let out = a.read().unwrap().matmul(&b.read().unwrap())?;
+                Ok(Value::Tensor(Arc::new(RwLock::new(out))))
             }
-
-            layers.push(size);
-            activations.push(act);
+            (Value::Mat3(a), Value::Mat3(b)) => Ok(Value::Mat3(mat3_mul(a, b))),
+            (Value::Mat4(a), Value::Mat4(b)) => Ok(Value::Mat4(mat4_mul(a, b))),
+            (Value::Mat3(m), Value::Vec3(v)) => Ok(Value::Vec3(mat3_vec3_mul(m, v))),
+            (Value::Mat4(m), Value::Vec4(v)) => Ok(Value::Vec4(mat4_vec4_mul(m, v))),
+            (l, r) => rt_err!(
+                "@ requires tensor/matrix operands, got `{}` @ `{}`",
+                l.type_name(),
+                r.type_name()
+            ),
         }
-
-        if layers.len() < 2 {
-            return Err("MLP must have at least input and output layers".into());
-        }
-
-        // Pad activations and set final layer to softmax
-        while activations.len() < layers.len() {
-            activations.push(ActivationType::Relu);
-        }
-        activations.truncate(layers.len());
-        activations[layers.len() - 1] = ActivationType::Softmax;
-
-        let output_size = *layers.last().unwrap();
-        Ok(AiArchitectureSpec::Mlp {
-            layers,
-            activations,
-            output_size,
-            learning: LearningConfig::default(),
-        })
     }
 
-    fn parse_lstm(s: &str) -> Result<Self, String> {
-        let s = s.trim();
-        if !s.contains("->") {
-            return Err("LSTM must have layers separated by `->`".into());
-        }
+    // =========================================================================
+    // §14  ASSIGNMENT
+    // =========================================================================
 
-        let mut units = Vec::with_capacity(8);
-        for segment in s.split("->") {
-            let size = Self::parse_u64(segment.trim(), "LSTM size")?;
-            if size == 0 {
-                return Err("LSTM unit size must be > 0".into());
+    fn eval_assign(
+        &mut self,
+        op: AssignOpKind,
+        target: &Expr,
+        rhs: Value,
+        env: &mut Env,
+    ) -> Result<Value, RuntimeError> {
+        // For compound assignments, read current value first.
+        let effective_rhs = if op == AssignOpKind::Assign {
+            rhs
+        } else {
+            let current = self.eval_expr(target, env)?;
+            let bin_op = op
+                .to_binop()
+                .ok_or_else(|| RuntimeError::new("unknown compound assignment"))?;
+            // MatMulAssign: @=
+            if op == AssignOpKind::MatMulAssign {
+                self.eval_matmul(current, rhs)?
+            } else {
+                eval_numeric_binop(bin_op, current, rhs)?
             }
-            units.push(size);
-        }
-
-        if units.len() < 2 {
-            return Err("LSTM must have at least input and output".into());
-        }
-
-        let output_size = *units.last().unwrap();
-        let mut activations = vec![ActivationType::Tanh; units.len()];
-        activations[units.len() - 1] = ActivationType::Softmax;
-
-        Ok(AiArchitectureSpec::Lstm {
-            units,
-            activations,
-            output_size,
-            learning: LearningConfig::default(),
-        })
-    }
-
-    fn parse_cnn(s: &str) -> Result<Self, String> {
-        let s = s.trim();
-        let parts: Vec<&str> = s.split('-').map(|p| p.trim()).collect();
-
-        if parts.len() < 4 {
-            return Err("CNN format: kernel-filter1-filter2-spatial_h-spatial_w (minimum 4 params)".into());
-        }
-
-        let kernel_size = Self::parse_u64(parts[0], "kernel size")?;
-        let spatial_h = Self::parse_u64(parts[parts.len() - 2], "spatial height")?;
-        let spatial_w = Self::parse_u64(parts[parts.len() - 1], "spatial width")?;
-
-        let mut filters = Vec::with_capacity(4);
-        for i in 1..parts.len() - 2 {
-            let filter = Self::parse_u64(parts[i], "filter count")?;
-            if filter == 0 {
-                return Err("filter count must be > 0".into());
-            }
-            filters.push(filter);
-        }
-
-        if filters.is_empty() {
-            return Err("CNN must specify at least one filter count".into());
-        }
-
-        let output_size = *filters.last().unwrap();
-        let activations = vec![ActivationType::Relu; filters.len()];
-
-        Ok(AiArchitectureSpec::Cnn {
-            filters,
-            kernel_size,
-            spatial: (spatial_h, spatial_w),
-            activations,
-            output_size,
-            learning: LearningConfig::default(),
-        })
-    }
-
-    fn parse_dueling(s: &str) -> Result<Self, String> {
-        let s = s.trim();
-        let parts: Vec<&str> = s.split("->").map(|p| p.trim()).collect();
-
-        if parts.len() != 3 {
-            return Err("Dueling format: input_size->value[units]->policy[units]".into());
-        }
-
-        let input_size = Self::parse_u64(parts[0], "input size")?;
-        let value_units = Self::parse_named_layer_value(parts[1], "value")?;
-        let policy_units = Self::parse_named_layer_value(parts[2], "policy")?;
-
-        Ok(AiArchitectureSpec::Dueling {
-            input_size,
-            value_units,
-            policy_units,
-            learning: LearningConfig::default(),
-        })
-    }
-
-    fn parse_named_layer_value(s: &str, expected_name: &str) -> Result<u64, String> {
-        let s = s.trim();
-        if !s.starts_with(expected_name) {
-            return Err(format!("expected `{}[...]`, got `{}`", expected_name, s));
-        }
-        let bracket_start = s.find('[').ok_or("missing `[` in layer spec")?;
-        let bracket_end = s.find(']').ok_or("unclosed `[` in layer spec")?;
-        let units_str = &s[bracket_start + 1..bracket_end];
-        Self::parse_u64(units_str, &format!("{} units", expected_name))
-    }
-
-    fn parse_transformer(s: &str) -> Result<Self, String> {
-        let s = s.trim();
-
-        let bracket_start = s.find('[').ok_or("Transformer format: transformer[heads-N-dim-D-depth-L-ff-F]")?;
-        let bracket_end = s.find(']').ok_or("unclosed `[` in transformer spec")?;
-        let content = &s[bracket_start + 1..bracket_end];
-
-        let mut heads = None;
-        let mut dim = None;
-        let mut depth = None;
-        let mut ff_dim = None;
-
-        let parts: Vec<&str> = content.split('-').collect();
-        let mut i = 0;
-        while i < parts.len() {
-            match parts[i].trim() {
-                "heads" => {
-                    if i + 1 < parts.len() {
-                        heads = Some(Self::parse_u64(parts[i + 1], "heads value")?);
-                        i += 2;
-                    } else {
-                        return Err("heads requires a value".into());
-                    }
-                }
-                "dim" => {
-                    if i + 1 < parts.len() {
-                        dim = Some(Self::parse_u64(parts[i + 1], "dim value")?);
-                        i += 2;
-                    } else {
-                        return Err("dim requires a value".into());
-                    }
-                }
-                "depth" | "layers" => {
-                    if i + 1 < parts.len() {
-                        depth = Some(Self::parse_u64(parts[i + 1], "depth value")?);
-                        i += 2;
-                    } else {
-                        return Err("depth requires a value".into());
-                    }
-                }
-                "ff" => {
-                    if i + 1 < parts.len() {
-                        ff_dim = Some(Self::parse_u64(parts[i + 1], "ff value")?);
-                        i += 2;
-                    } else {
-                        return Err("ff requires a value".into());
-                    }
-                }
-                _ => {
-                    return Err(format!("unknown transformer param `{}`", parts[i]));
-                }
-            }
-        }
-
-        let heads = heads.ok_or("Transformer must specify heads-N")?;
-        let dim = dim.ok_or("Transformer must specify dim-D")?;
-        let depth = depth.unwrap_or(6);
-        let ff_dim = ff_dim.unwrap_or_else(|| dim * 4);
-
-        if heads == 0 || dim == 0 || depth == 0 {
-            return Err("Transformer parameters must be > 0".into());
-        }
-
-        Ok(AiArchitectureSpec::Transformer {
-            heads,
-            dim,
-            depth,
-            ff_dim,
-            learning: LearningConfig::default(),
-        })
-    }
-
-    fn apply_learning_config_to_spec(spec: &mut Self, cfg: &str) -> Result<(), String> {
-        let parts: Vec<&str> = cfg.split('-').collect();
-        let mut i = 0;
-
-        let mut config = match spec {
-            AiArchitectureSpec::Mlp { learning, .. } => learning.clone(),
-            AiArchitectureSpec::Lstm { learning, .. } => learning.clone(),
-            AiArchitectureSpec::Cnn { learning, .. } => learning.clone(),
-            AiArchitectureSpec::Dueling { learning, .. } => learning.clone(),
-            AiArchitectureSpec::Transformer { learning, .. } => learning.clone(),
         };
 
-        while i < parts.len() {
-            match parts[i] {
-                "opt" => {
-                    if i + 1 < parts.len() {
-                        config.optimizer = match parts[i + 1].to_lowercase().as_str() {
-                            "adam" => OptimizerType::Adam,
-                            "adamw" => OptimizerType::AdamW,
-                            "sgd" => OptimizerType::Sgd,
-                            "rmsprop" => OptimizerType::Rmsprop,
-                            "lamb" => OptimizerType::Lamb,
-                            opt => return Err(format!(
-                                "unknown optimizer `{}`. Supported: adam, adamw, sgd, rmsprop, lamb",
-                                opt
-                            )),
-                        };
-                        i += 2;
-                    } else {
-                        return Err("opt requires a value".into());
-                    }
-                }
-                "lr" => {
-                    if i + 1 < parts.len() {
-                        let lr: f32 = parts[i + 1].parse()
-                            .map_err(|_| format!("invalid learning rate `{}`", parts[i + 1]))?;
-                        if lr <= 0.0 || lr > 0.1 {
-                            return Err("learning rate must be in (0, 0.1]".into());
+        // Write back to the target.
+        match target {
+            Expr::Ident { name, .. } => {
+                env.set(name, effective_rhs);
+            }
+            Expr::Field { object, field, .. } => {
+                if let Expr::Ident { name, .. } = object.as_ref() {
+                    // For entity field access, write to the world.
+                    if let Some(Value::Entity(id)) = env.get(name).cloned() {
+                        let mut w = self.world.lock().unwrap();
+                        if let Some(comp) = w.get_component_mut(id, field) {
+                            *comp = effective_rhs;
+                        } else {
+                            w.insert_component(id, field, effective_rhs);
                         }
-                        config.learning_rate = lr;
-                        i += 2;
-                    } else {
-                        return Err("lr requires a value".into());
-                    }
-                }
-                "explore" => {
-                    if i + 1 < parts.len() {
-                        config.exploration_strategy = match parts[i + 1].to_lowercase().as_str() {
-                            "epsilon" => ExplorationStrategy::Epsilon,
-                            "ucb" => ExplorationStrategy::Ucb,
-                            "boltzmann" => ExplorationStrategy::Boltzmann,
-                            strategy => return Err(format!(
-                                "unknown exploration strategy `{}`. Supported: epsilon, ucb, boltzmann",
-                                strategy
-                            )),
-                        };
-                        i += 2;
-                    } else {
-                        return Err("explore requires a value".into());
-                    }
-                }
-                "gamma" => {
-                    if i + 1 < parts.len() {
-                        let g: f32 = parts[i + 1].parse()
-                            .map_err(|_| format!("invalid gamma value `{}`", parts[i + 1]))?;
-                        if g < 0.0 || g > 1.0 {
-                            return Err("gamma must be in [0, 1]".into());
+                    } else if let Some(Value::Struct { fields, .. }) = env.get(name).cloned() {
+                        let mut s = env.get(name).unwrap().clone();
+                        if let Value::Struct { ref mut fields, .. } = s {
+                            fields.insert(field.clone(), effective_rhs);
                         }
-                        config.gamma = g;
-                        i += 2;
-                    } else {
-                        return Err("gamma requires a value".into());
+                        env.set(name, s);
                     }
-                }
-                "epsilon" => {
-                    if i + 1 < parts.len() {
-                        let eps: f32 = parts[i + 1].parse()
-                            .map_err(|_| format!("invalid epsilon value `{}`", parts[i + 1]))?;
-                        if eps < 0.0 || eps > 1.0 {
-                            return Err("epsilon must be in [0, 1]".into());
-                        }
-                        config.epsilon = Some(eps);
-                        i += 2;
-                    } else {
-                        return Err("epsilon requires a value".into());
-                    }
-                }
-                "temp" => {
-                    if i + 1 < parts.len() {
-                        let t: f32 = parts[i + 1].parse()
-                            .map_err(|_| format!("invalid temperature value `{}`", parts[i + 1]))?;
-                        if t <= 0.0 {
-                            return Err("temperature must be > 0".into());
-                        }
-                        config.temperature = Some(t);
-                        i += 2;
-                    } else {
-                        return Err("temp requires a value".into());
-                    }
-                }
-                _ => {
-                    return Err(format!("unknown learning config parameter `{}`", parts[i]));
                 }
             }
+            Expr::Index {
+                object, indices, ..
+            } => {
+                if let Expr::Ident { name, .. } = object.as_ref() {
+                    let idx = if let Some(e) = indices.first() {
+                        self.eval_expr(e, env)?.as_i64().unwrap_or(0) as usize
+                    } else {
+                        0
+                    };
+                    if let Some(Value::Array(arr)) = env.get(name).cloned() {
+                        arr.lock().unwrap()[idx] = effective_rhs;
+                    }
+                }
+            }
+            _ => {}
         }
-
-        // Apply updated config back to spec
-        match spec {
-            AiArchitectureSpec::Mlp { learning, .. } => *learning = config,
-            AiArchitectureSpec::Lstm { learning, .. } => *learning = config,
-            AiArchitectureSpec::Cnn { learning, .. } => *learning = config,
-            AiArchitectureSpec::Dueling { learning, .. } => *learning = config,
-            AiArchitectureSpec::Transformer { learning, .. } => *learning = config,
-        }
-
-        Ok(())
+        Ok(Value::Unit)
     }
 
-    fn to_model_decl(&self, agent_name: &str, _span: Span) -> ModelDecl {
-        let model_name = format!("{}Brain", agent_name);
-        let mut model_layers = Vec::new();
+    // =========================================================================
+    // §15  FIELD AND INDEX ACCESS
+    // =========================================================================
 
-        // Add input layer
-        let input_size = match self {
-            AiArchitectureSpec::Mlp { layers, .. } => layers.first().cloned().unwrap_or(256),
-            AiArchitectureSpec::Lstm { units, .. } => units.first().cloned().unwrap_or(256),
-            AiArchitectureSpec::Cnn { .. } => 224, // Default image size
-            AiArchitectureSpec::Dueling { input_size, .. } => *input_size,
-            AiArchitectureSpec::Transformer { dim, .. } => *dim,
-        };
-
-        model_layers.push(ModelLayer::Input {
-            span: Span::dummy(),
-            size: input_size,
-        });
-
-        // Add network-specific layers
-        match self {
-            AiArchitectureSpec::Mlp { layers, activations, .. } => {
-                for i in 1..layers.len() {
-                    model_layers.push(ModelLayer::Dense {
-                        span: Span::dummy(),
-                        units: layers[i],
-                        activation: self.activation_to_enum(activations.get(i).cloned().unwrap_or(ActivationType::Relu)),
-                        bias: true,
-                    });
-                }
+    fn eval_field(&mut self, obj: Value, field: &str) -> Result<Value, RuntimeError> {
+        match obj {
+            Value::Struct { ref fields, .. } => fields
+                .get(field)
+                .cloned()
+                .ok_or_else(|| RuntimeError::new(format!("no field `{field}`"))),
+            Value::Entity(id) => {
+                let w = self.world.lock().unwrap();
+                // Field name maps to component type by convention (lowercase → CamelCase).
+                // We try the field name directly, then a title-cased version.
+                let comp = w.get_component(id, field).or_else(|| {
+                    let titled = title_case(field);
+                    w.get_component(id, &titled)
+                });
+                comp.cloned()
+                    .ok_or_else(|| RuntimeError::new(format!("entity has no component `{field}`")))
             }
-            AiArchitectureSpec::Lstm { units, activations, .. } => {
-                for i in 1..units.len() {
-                    model_layers.push(ModelLayer::Dense {
-                        span: Span::dummy(),
-                        units: units[i],
-                        activation: self.activation_to_enum(activations.get(i).cloned().unwrap_or(ActivationType::Tanh)),
-                        bias: true,
-                    });
-                }
+            Value::Vec2(v) => swizzle_vec(&v, field).map_err(RuntimeError::new),
+            Value::Vec3(v) => swizzle_vec(&v, field).map_err(RuntimeError::new),
+            Value::Vec4(v) => swizzle_vec(&v, field).map_err(RuntimeError::new),
+            Value::Quat(q) => match field {
+                "x" => Ok(Value::F32(q[0])),
+                "y" => Ok(Value::F32(q[1])),
+                "z" => Ok(Value::F32(q[2])),
+                "w" => Ok(Value::F32(q[3])),
+                _ => rt_err!("quat has no field `{field}`"),
+            },
+            Value::Tuple(vs) => {
+                let idx: usize = field
+                    .parse()
+                    .map_err(|_| RuntimeError::new(format!("bad tuple field `{field}`")))?;
+                vs.into_iter()
+                    .nth(idx)
+                    .ok_or_else(|| RuntimeError::new(format!("tuple index {idx} out of range")))
             }
-            AiArchitectureSpec::Cnn { filters, kernel_size, activations, .. } => {
-                for (i, &num_filters) in filters.iter().enumerate() {
-                    model_layers.push(ModelLayer::Conv2d {
-                        span: Span::dummy(),
-                        filters: num_filters,
-                        kernel_h: *kernel_size,
-                        kernel_w: *kernel_size,
-                        activation: self.activation_to_enum(activations.get(i).cloned().unwrap_or(ActivationType::Relu)),
-                        stride: 1,
-                        padding: Padding::Same,
-                    });
-                }
-            }
-            AiArchitectureSpec::Transformer { heads, dim, depth, .. } => {
-                for _ in 0..*depth {
-                    model_layers.push(ModelLayer::Attention {
-                        span: Span::dummy(),
-                        num_heads: *heads,
-                        head_dim: dim / heads,
-                    });
-                }
-            }
-            AiArchitectureSpec::Dueling { .. } => {}
-        }
-
-        // Add output layer
-        let output_size = match self {
-            AiArchitectureSpec::Mlp { output_size, .. } => *output_size,
-            AiArchitectureSpec::Lstm { output_size, .. } => *output_size,
-            AiArchitectureSpec::Cnn { output_size, .. } => *output_size,
-            AiArchitectureSpec::Dueling { policy_units, .. } => *policy_units,
-            AiArchitectureSpec::Transformer { dim, .. } => *dim,
-        };
-
-        model_layers.push(ModelLayer::Output {
-            span: Span::dummy(),
-            units: output_size,
-            activation: Activation::Softmax,
-        });
-
-        ModelDecl {
-            span: Span::dummy(),
-            attrs: vec![Attribute::Grad],
-            name: model_name,
-            layers: model_layers,
-            device: ModelDevice::Auto,
-            optimizer: None,
+            other => rt_err!("`{}` has no field `{field}`", other.type_name()),
         }
     }
 
-    fn activation_to_enum(&self, act: ActivationType) -> Activation {
-        match act {
-            ActivationType::Relu => Activation::Relu,
-            ActivationType::LeakyRelu => Activation::LeakyRelu,
-            ActivationType::Tanh => Activation::Tanh,
-            ActivationType::Sigmoid => Activation::Sigmoid,
-            ActivationType::Gelu => Activation::Gelu,
-            ActivationType::Elu => Activation::Elu,
-            ActivationType::Swish => Activation::Swish,
-            ActivationType::Mish => Activation::Mish,
-            ActivationType::Softmax => Activation::Softmax,
-            ActivationType::Linear => Activation::Linear,
-        }
-    }
-}
-
+    fn eval_index(&self, obj: Value, indices: Vec<Value>) -> Result<Value, RuntimeError> {
+        match obj {
+            Value::Array(arr) => {
+                let idx = indices.first().and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+                let a = arr.lock().unwrap();
+                a.get(idx)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::new(format!("index {idx} out of bounds")))
             }
             Value::Tensor(t) => {
                 let t = t.read().unwrap();
@@ -1765,7 +2220,8 @@ impl AiArchitectureSpec {
             }
             Value::Str(s) => {
                 let idx = indices.first().and_then(|v| v.as_i64()).unwrap_or(0) as usize;
-                s.chars().nth(idx)
+                s.chars()
+                    .nth(idx)
                     .map(|c| Value::Str(c.to_string()))
                     .ok_or_else(|| RuntimeError::new("string index out of range"))
             }
@@ -1777,9 +2233,12 @@ impl AiArchitectureSpec {
     // §16  FUNCTION CALLS
     // =========================================================================
 
-    fn eval_call(&mut self, func: Value, args: Vec<Value>, env: &mut Env)
-        -> Result<Value, RuntimeError>
-    {
+    fn eval_call(
+        &mut self,
+        func: Value,
+        args: Vec<Value>,
+        env: &mut Env,
+    ) -> Result<Value, RuntimeError> {
         match func {
             Value::Fn(closure) => {
                 let closure = closure.clone();
@@ -1795,11 +2254,13 @@ impl AiArchitectureSpec {
                 let body = closure.decl.body.clone();
                 let result = if let Some(b) = body {
                     self.eval_block(&b, &mut call_env)?
-                } else { Value::Unit };
+                } else {
+                    Value::Unit
+                };
                 call_env.pop();
                 match result {
                     Value::Return(v) => Ok(*v),
-                    other            => Ok(other),
+                    other => Ok(other),
                 }
             }
             _ => {
@@ -1819,130 +2280,184 @@ impl AiArchitectureSpec {
             "sin" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.sin() as f32))
-                } else { rt_err!("sin() requires a number") }
+                } else {
+                    rt_err!("sin() requires a number")
+                }
             }
             "cos" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.cos() as f32))
-                } else { rt_err!("cos() requires a number") }
+                } else {
+                    rt_err!("cos() requires a number")
+                }
             }
             "tan" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.tan() as f32))
-                } else { rt_err!("tan() requires a number") }
+                } else {
+                    rt_err!("tan() requires a number")
+                }
             }
             "asin" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.asin() as f32))
-                } else { rt_err!("asin() requires a number") }
+                } else {
+                    rt_err!("asin() requires a number")
+                }
             }
             "acos" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.acos() as f32))
-                } else { rt_err!("acos() requires a number") }
+                } else {
+                    rt_err!("acos() requires a number")
+                }
             }
             "atan" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.atan() as f32))
-                } else { rt_err!("atan() requires a number") }
+                } else {
+                    rt_err!("atan() requires a number")
+                }
             }
             "atan2" => {
-                match (args.get(0).and_then(|v| v.as_f64()), args.get(1).and_then(|v| v.as_f64())) {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                ) {
                     (Some(y), Some(x)) => Ok(Value::F32(y.atan2(x) as f32)),
-                    _ => rt_err!("atan2() requires two numbers")
+                    _ => rt_err!("atan2() requires two numbers"),
                 }
             }
             "sqrt" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.sqrt() as f32))
-                } else { rt_err!("sqrt() requires a number") }
+                } else {
+                    rt_err!("sqrt() requires a number")
+                }
             }
             "cbrt" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.cbrt() as f32))
-                } else { rt_err!("cbrt() requires a number") }
+                } else {
+                    rt_err!("cbrt() requires a number")
+                }
             }
             "pow" => {
-                match (args.get(0).and_then(|v| v.as_f64()), args.get(1).and_then(|v| v.as_f64())) {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                ) {
                     (Some(x), Some(y)) => Ok(Value::F32(x.powf(y) as f32)),
-                    _ => rt_err!("pow() requires two numbers")
+                    _ => rt_err!("pow() requires two numbers"),
                 }
             }
             "exp" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.exp() as f32))
-                } else { rt_err!("exp() requires a number") }
+                } else {
+                    rt_err!("exp() requires a number")
+                }
             }
             "exp2" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.exp2() as f32))
-                } else { rt_err!("exp2() requires a number") }
+                } else {
+                    rt_err!("exp2() requires a number")
+                }
             }
             "exp10" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.log10().exp() as f32))
-                } else { rt_err!("exp10() requires a number") }
+                } else {
+                    rt_err!("exp10() requires a number")
+                }
             }
             "ln" | "log" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.ln() as f32))
-                } else { rt_err!("ln() requires a number") }
+                } else {
+                    rt_err!("ln() requires a number")
+                }
             }
             "log2" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.log2() as f32))
-                } else { rt_err!("log2() requires a number") }
+                } else {
+                    rt_err!("log2() requires a number")
+                }
             }
             "log10" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.log10() as f32))
-                } else { rt_err!("log10() requires a number") }
-            }
-            "abs" => {
-                match args.first() {
-                    Some(Value::F32(x)) => Ok(Value::F32(x.abs())),
-                    Some(Value::F64(x)) => Ok(Value::F64(x.abs())),
-                    Some(Value::I32(x)) => Ok(Value::I32(x.abs())),
-                    Some(Value::I64(x)) => Ok(Value::I64(x.abs())),
-                    Some(v) if let Some(x) = v.as_f64() => Ok(Value::F32(x.abs() as f32)),
-                    _ => rt_err!("abs() requires a number")
+                } else {
+                    rt_err!("log10() requires a number")
                 }
             }
+            "abs" => match args.first() {
+                Some(Value::F32(x)) => Ok(Value::F32(x.abs())),
+                Some(Value::F64(x)) => Ok(Value::F64(x.abs())),
+                Some(Value::I32(x)) => Ok(Value::I32(x.abs())),
+                Some(Value::I64(x)) => Ok(Value::I64(x.abs())),
+                Some(v) => {
+                    if let Some(x) = v.as_f64() {
+                        Ok(Value::F32(x.abs() as f32))
+                    } else {
+                        rt_err!("abs() requires a number")
+                    }
+                }
+                _ => rt_err!("abs() requires a number"),
+            },
             "floor" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.floor() as f32))
-                } else { rt_err!("floor() requires a number") }
+                } else {
+                    rt_err!("floor() requires a number")
+                }
             }
             "ceil" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.ceil() as f32))
-                } else { rt_err!("ceil() requires a number") }
+                } else {
+                    rt_err!("ceil() requires a number")
+                }
             }
             "round" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.round() as f32))
-                } else { rt_err!("round() requires a number") }
+                } else {
+                    rt_err!("round() requires a number")
+                }
             }
             "trunc" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.trunc() as f32))
-                } else { rt_err!("trunc() requires a number") }
+                } else {
+                    rt_err!("trunc() requires a number")
+                }
             }
             "fract" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x.fract() as f32))
-                } else { rt_err!("fract() requires a number") }
+                } else {
+                    rt_err!("fract() requires a number")
+                }
             }
             "min" => {
-                match (args.get(0).and_then(|v| v.as_f64()), args.get(1).and_then(|v| v.as_f64())) {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                ) {
                     (Some(x), Some(y)) => Ok(Value::F32(x.min(y) as f32)),
-                    _ => rt_err!("min() requires two numbers")
+                    _ => rt_err!("min() requires two numbers"),
                 }
             }
             "max" => {
-                match (args.get(0).and_then(|v| v.as_f64()), args.get(1).and_then(|v| v.as_f64())) {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                ) {
                     (Some(x), Some(y)) => Ok(Value::F32(x.max(y) as f32)),
-                    _ => rt_err!("max() requires two numbers")
+                    _ => rt_err!("max() requires two numbers"),
                 }
             }
             "clamp" => {
@@ -1952,30 +2467,43 @@ impl AiArchitectureSpec {
                     args.get(2).and_then(|v| v.as_f64()),
                 ) {
                     (Some(x), Some(lo), Some(hi)) => Ok(Value::F32((x.max(lo).min(hi)) as f32)),
-                    _ => rt_err!("clamp() requires three numbers")
+                    _ => rt_err!("clamp() requires three numbers"),
                 }
             }
             "degrees" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32((x * 180.0 / consts::PI) as f32))
-                } else { rt_err!("degrees() requires a number") }
+                } else {
+                    rt_err!("degrees() requires a number")
+                }
             }
             "radians" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32((x * consts::PI / 180.0) as f32))
-                } else { rt_err!("radians() requires a number") }
+                } else {
+                    rt_err!("radians() requires a number")
+                }
             }
             "sign" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
-                    if x > 0.0 { Ok(Value::F32(1.0)) }
-                    else if x < 0.0 { Ok(Value::F32(-1.0)) }
-                    else { Ok(Value::F32(0.0)) }
-                } else { rt_err!("sign() requires a number") }
+                    if x > 0.0 {
+                        Ok(Value::F32(1.0))
+                    } else if x < 0.0 {
+                        Ok(Value::F32(-1.0))
+                    } else {
+                        Ok(Value::F32(0.0))
+                    }
+                } else {
+                    rt_err!("sign() requires a number")
+                }
             }
             "step" => {
-                match (args.get(0).and_then(|v| v.as_f64()), args.get(1).and_then(|v| v.as_f64())) {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                ) {
                     (Some(edge), Some(x)) => Ok(Value::F32(if x >= edge { 1.0 } else { 0.0 })),
-                    _ => rt_err!("step() requires two numbers")
+                    _ => rt_err!("step() requires two numbers"),
                 }
             }
             "smoothstep" => {
@@ -1988,7 +2516,7 @@ impl AiArchitectureSpec {
                         let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
                         Ok(Value::F32((t * t * (3.0 - 2.0 * t)) as f32))
                     }
-                    _ => rt_err!("smoothstep() requires three numbers")
+                    _ => rt_err!("smoothstep() requires three numbers"),
                 }
             }
             "mix" => {
@@ -1997,24 +2525,26 @@ impl AiArchitectureSpec {
                     args.get(1).and_then(|v| v.as_f64()),
                     args.get(2).and_then(|v| v.as_f64()),
                 ) {
-                    (Some(x), Some(y), Some(a)) => {
-                        Ok(Value::F32((x * (1.0 - a) + y * a) as f32))
-                    }
-                    _ => rt_err!("mix() requires three numbers")
+                    (Some(x), Some(y), Some(a)) => Ok(Value::F32((x * (1.0 - a) + y * a) as f32)),
+                    _ => rt_err!("mix() requires three numbers"),
                 }
             }
 
             // ── I/O functions ─────────────────────────────────────────────────
             "print" => {
                 for (i, arg) in args.iter().enumerate() {
-                    if i > 0 { print!(" "); }
+                    if i > 0 {
+                        print!(" ");
+                    }
                     print!("{}", arg);
                 }
                 Ok(Value::Unit)
             }
             "println" => {
                 for (i, arg) in args.iter().enumerate() {
-                    if i > 0 { print!(" "); }
+                    if i > 0 {
+                        print!(" ");
+                    }
                     print!("{}", arg);
                 }
                 println!();
@@ -2031,331 +2561,548 @@ impl AiArchitectureSpec {
                     Ok(Value::I32(x as i32))
                 } else if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::I32(x as i32))
-                } else { rt_err!("i32() requires a number") }
+                } else {
+                    rt_err!("i32() requires a number")
+                }
             }
             "i64" => {
                 if let Some(x) = args.first().and_then(|v| v.as_i64()) {
                     Ok(Value::I64(x))
                 } else if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::I64(x as i64))
-                } else { rt_err!("i64() requires a number") }
+                } else {
+                    rt_err!("i64() requires a number")
+                }
             }
             "f32" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F32(x as f32))
-                } else { rt_err!("f32() requires a number") }
+                } else {
+                    rt_err!("f32() requires a number")
+                }
             }
             "f64" => {
                 if let Some(x) = args.first().and_then(|v| v.as_f64()) {
                     Ok(Value::F64(x))
-                } else { rt_err!("f64() requires a number") }
-            }
-            "bool" => {
-                Ok(Value::Bool(args.first().map(|v| v.is_truthy()).unwrap_or(false)))
-            }
-            "str" => {
-                Ok(Value::Str(args.first().map(|v| v.to_string()).unwrap_or_default()))
-            }
-
-            // ── Collection functions ──────────────────────────────────────────
-            "len" => {
-                match args.first() {
-                    Some(Value::Array(a)) => Ok(Value::I32(a.lock().unwrap().len() as i32)),
-                    Some(Value::Str(s)) => Ok(Value::I32(s.len() as i32)),
-                    Some(v) => rt_err!("len() not applicable to {}", v.type_name()),
-                    None => rt_err!("len() requires an argument")
+                } else {
+                    rt_err!("f64() requires a number")
                 }
             }
+            "bool" => Ok(Value::Bool(
+                args.first().map(|v| v.is_truthy()).unwrap_or(false),
+            )),
+            "str" => Ok(Value::Str(
+                args.first().map(|v| v.to_string()).unwrap_or_default(),
+            )),
+
+            // ── Collection functions ──────────────────────────────────────────
+            "len" => match args.first() {
+                Some(Value::Array(a)) => Ok(Value::I32(a.lock().unwrap().len() as i32)),
+                Some(Value::Str(s)) => Ok(Value::I32(s.len() as i32)),
+                Some(v) => rt_err!("len() not applicable to {}", v.type_name()),
+                None => rt_err!("len() requires an argument"),
+            },
             "range" => {
-                match (args.get(0).and_then(|v| v.as_i64()), args.get(1).and_then(|v| v.as_i64())) {
+                match (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                ) {
                     (Some(start), Some(end)) => {
-                        let range: Vec<Value> = (start as i32..end as i32).map(Value::I32).collect();
+                        let range: Vec<Value> =
+                            (start as i32..end as i32).map(Value::I32).collect();
                         Ok(Value::Array(Arc::new(Mutex::new(range))))
                     }
-                    _ => rt_err!("range() requires two numbers")
+                    _ => rt_err!("range() requires two numbers"),
                 }
             }
 
             // ── Option / Result constructors ───────────────────────────────────
-            "Some" => {
-                Ok(Value::Some(Box::new(args.into_iter().next().unwrap_or(Value::Unit))))
-            }
-            "None" => {
-                Ok(Value::None)
-            }
-            "Ok" => {
-                Ok(Value::Ok(Box::new(args.into_iter().next().unwrap_or(Value::Unit))))
-            }
-            "Err" => {
-                Ok(Value::Err(Box::new(args.into_iter().next().unwrap_or(Value::Unit))))
-            }
-            "unwrap" => {
-                match args.first() {
-                    Some(Value::Some(v)) => Ok((**v).clone()),
-                    Some(Value::Ok(v)) => Ok((**v).clone()),
-                    Some(Value::None) => rt_err!("called unwrap() on None"),
-                    Some(Value::Err(e)) => rt_err!("called unwrap() on Err: {}", e),
-                    _ => rt_err!("unwrap() requires Option or Result")
-                }
-            }
-            "is_some" => {
-                match args.first() {
-                    Some(Value::Some(_)) => Ok(Value::Bool(true)),
-                    Some(Value::None) => Ok(Value::Bool(false)),
-                    _ => rt_err!("is_some() requires Option")
-                }
-            }
-            "is_none" => {
-                match args.first() {
-                    Some(Value::Some(_)) => Ok(Value::Bool(false)),
-                    Some(Value::None) => Ok(Value::Bool(true)),
-                    _ => rt_err!("is_none() requires Option")
-                }
-            }
-            "is_ok" => {
-                match args.first() {
-                    Some(Value::Ok(_)) => Ok(Value::Bool(true)),
-                    Some(Value::Err(_)) => Ok(Value::Bool(false)),
-                    _ => rt_err!("is_ok() requires Result")
-                }
-            }
-            "is_err" => {
-                match args.first() {
-                    Some(Value::Ok(_)) => Ok(Value::Bool(false)),
-                    Some(Value::Err(_)) => Ok(Value::Bool(true)),
-                    _ => rt_err!("is_err() requires Result")
-                }
-            }
+            "Some" => Ok(Value::Some(Box::new(
+                args.into_iter().next().unwrap_or(Value::Unit),
+            ))),
+            "None" => Ok(Value::None),
+            "Ok" => Ok(Value::Ok(Box::new(
+                args.into_iter().next().unwrap_or(Value::Unit),
+            ))),
+            "Err" => Ok(Value::Err(Box::new(
+                args.into_iter().next().unwrap_or(Value::Unit),
+            ))),
+            "unwrap" => match args.first() {
+                Some(Value::Some(v)) => Ok((**v).clone()),
+                Some(Value::Ok(v)) => Ok((**v).clone()),
+                Some(Value::None) => rt_err!("called unwrap() on None"),
+                Some(Value::Err(e)) => rt_err!("called unwrap() on Err: {}", e),
+                _ => rt_err!("unwrap() requires Option or Result"),
+            },
+            "is_some" => match args.first() {
+                Some(Value::Some(_)) => Ok(Value::Bool(true)),
+                Some(Value::None) => Ok(Value::Bool(false)),
+                _ => rt_err!("is_some() requires Option"),
+            },
+            "is_none" => match args.first() {
+                Some(Value::Some(_)) => Ok(Value::Bool(false)),
+                Some(Value::None) => Ok(Value::Bool(true)),
+                _ => rt_err!("is_none() requires Option"),
+            },
+            "is_ok" => match args.first() {
+                Some(Value::Ok(_)) => Ok(Value::Bool(true)),
+                Some(Value::Err(_)) => Ok(Value::Bool(false)),
+                _ => rt_err!("is_ok() requires Result"),
+            },
+            "is_err" => match args.first() {
+                Some(Value::Ok(_)) => Ok(Value::Bool(false)),
+                Some(Value::Err(_)) => Ok(Value::Bool(true)),
+                _ => rt_err!("is_err() requires Result"),
+            },
 
             // ── String functions ──────────────────────────────────────────────
             "concat" => {
-                let strs: Vec<String> = args.iter()
-                    .map(|v| v.to_string())
-                    .collect();
+                let strs: Vec<String> = args.iter().map(|v| v.to_string()).collect();
                 Ok(Value::Str(strs.join("")))
             }
 
             // ── HashMap / Collection constructors ──────────────────────────────
-            "HashMap::new" => {
-                Ok(Value::HashMap(Arc::new(Mutex::new(HashMap::new()))))
-            }
+            "HashMap::new" => Ok(Value::HashMap(Arc::new(Mutex::new(HashMap::new())))),
 
             // ── File I/O ───────────────────────────────────────────────────────
             "read_file" => {
                 if let Some(Value::Str(path)) = args.first() {
                     match std::fs::read_to_string(path) {
                         Ok(content) => Ok(Value::Str(content)),
-                        Err(e) => rt_err!("read_file failed: {}", e)
+                        Err(e) => rt_err!("read_file failed: {}", e),
                     }
-                } else { rt_err!("read_file requires a path string") }
-            }
-            "write_file" => {
-                match (args.get(0), args.get(1)) {
-                    (Some(Value::Str(path)), Some(Value::Str(content))) => {
-                        match std::fs::write(path, content) {
-                            Ok(_) => Ok(Value::Bool(true)),
-                            Err(e) => rt_err!("write_file failed: {}", e)
-                        }
-                    }
-                    _ => rt_err!("write_file requires (path, content) strings")
+                } else {
+                    rt_err!("read_file requires a path string")
                 }
             }
+            "write_file" => match (args.get(0), args.get(1)) {
+                (Some(Value::Str(path)), Some(Value::Str(content))) => {
+                    match std::fs::write(path, content) {
+                        Ok(_) => Ok(Value::Bool(true)),
+                        Err(e) => rt_err!("write_file failed: {}", e),
+                    }
+                }
+                _ => rt_err!("write_file requires (path, content) strings"),
+            },
             "file_exists" => {
                 if let Some(Value::Str(path)) = args.first() {
                     Ok(Value::Bool(std::path::Path::new(path).exists()))
-                } else { rt_err!("file_exists requires a path string") }
+                } else {
+                    rt_err!("file_exists requires a path string")
+                }
             }
             "delete_file" => {
                 if let Some(Value::Str(path)) = args.first() {
                     match std::fs::remove_file(path) {
                         Ok(_) => Ok(Value::Bool(true)),
-                        Err(e) => rt_err!("delete_file failed: {}", e)
+                        Err(e) => rt_err!("delete_file failed: {}", e),
                     }
-                } else { rt_err!("delete_file requires a path string") }
-            }
-            "append_file" => {
-                match (args.get(0), args.get(1)) {
-                    (Some(Value::Str(path)), Some(Value::Str(content))) => {
-                        use std::io::Write;
-                        match std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(path)
-                        {
-                            Ok(mut f) => {
-                                if f.write_all(content.as_bytes()).is_ok() {
-                                    Ok(Value::Bool(true))
-                                } else {
-                                    rt_err!("append_file write failed")
-                                }
-                            }
-                            Err(e) => rt_err!("append_file failed: {}", e)
-                        }
-                    }
-                    _ => rt_err!("append_file requires (path, content) strings")
+                } else {
+                    rt_err!("delete_file requires a path string")
                 }
             }
+            "append_file" => match (args.get(0), args.get(1)) {
+                (Some(Value::Str(path)), Some(Value::Str(content))) => {
+                    use std::io::Write;
+                    match std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        Ok(mut f) => {
+                            if f.write_all(content.as_bytes()).is_ok() {
+                                Ok(Value::Bool(true))
+                            } else {
+                                rt_err!("append_file write failed")
+                            }
+                        }
+                        Err(e) => rt_err!("append_file failed: {}", e),
+                    }
+                }
+                _ => rt_err!("append_file requires (path, content) strings"),
+            },
 
             // ── Physics functions ──────────────────────────────────────────────
-            "physics::world_new" => {
-                let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
-                Ok(Value::I64(world.entity_count() as i64))
-            }
+            "physics::world_new" => Ok(Value::I64(1)),
             "physics::create_body" => {
-                if let (Some(mass), Some(x), Some(y), Some(z)) =
-                    (args.get(0).and_then(|v| v.as_f64()),
-                     args.get(1).and_then(|v| v.as_f64()),
-                     args.get(2).and_then(|v| v.as_f64()),
-                     args.get(3).and_then(|v| v.as_f64()))
-                {
+                if let (Some(mass), Some(x), Some(y), Some(z)) = (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                    args.get(3).and_then(|v| v.as_f64()),
+                ) {
                     let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
-                    let body_id = world.create_body(mass as f32, x as f32, y as f32, z as f32);
+                    let body_id = world.create_rigid_body(
+                        mass as f32,
+                        PhysicsShape::Sphere { radius: 0.5 },
+                        [x as f32, y as f32, z as f32],
+                    );
                     Ok(Value::I64(body_id as i64))
-                } else { rt_err!("physics::create_body requires (mass, x, y, z) numbers") }
+                } else {
+                    rt_err!("physics::create_body requires (mass, x, y, z) numbers")
+                }
             }
             "physics::set_velocity" => {
-                if let (Some(body_id), Some(vx), Some(vy), Some(vz)) =
-                    (args.get(0).and_then(|v| v.as_i64()),
-                     args.get(1).and_then(|v| v.as_f64()),
-                     args.get(2).and_then(|v| v.as_f64()),
-                     args.get(3).and_then(|v| v.as_f64()))
-                {
+                if let (Some(body_id), Some(vx), Some(vy), Some(vz)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                    args.get(3).and_then(|v| v.as_f64()),
+                ) {
                     let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
-                    world.set_velocity(body_id as u64, vx as f32, vy as f32, vz as f32);
+                    world.set_velocity(body_id as u32, vx as f32, vy as f32, vz as f32);
                     Ok(Value::Bool(true))
-                } else { rt_err!("physics::set_velocity requires (body_id, vx, vy, vz)") }
+                } else {
+                    rt_err!("physics::set_velocity requires (body_id, vx, vy, vz)")
+                }
             }
             "physics::get_position" => {
                 if let Some(body_id) = args.first().and_then(|v| v.as_i64()) {
                     let world = self.physics_world.as_ref().unwrap().lock().unwrap();
-                    if let Some((x, y, z)) = world.get_position(body_id as u64) {
+                    if let Some([x, y, z]) = world.get_position(body_id as u32) {
                         Ok(Value::Vec3([x, y, z]))
-                    } else { rt_err!("physics::get_position: body not found") }
-                } else { rt_err!("physics::get_position requires body_id") }
+                    } else {
+                        rt_err!("physics::get_position: body not found")
+                    }
+                } else {
+                    rt_err!("physics::get_position requires body_id")
+                }
             }
             "physics::get_velocity" => {
                 if let Some(body_id) = args.first().and_then(|v| v.as_i64()) {
                     let world = self.physics_world.as_ref().unwrap().lock().unwrap();
-                    if let Some((vx, vy, vz)) = world.get_velocity(body_id as u64) {
+                    if let Some([vx, vy, vz]) = world.get_velocity(body_id as u32) {
                         Ok(Value::Vec3([vx, vy, vz]))
-                    } else { rt_err!("physics::get_velocity: body not found") }
-                } else { rt_err!("physics::get_velocity requires body_id") }
+                    } else {
+                        rt_err!("physics::get_velocity: body not found")
+                    }
+                } else {
+                    rt_err!("physics::get_velocity requires body_id")
+                }
             }
             "physics::step" => {
                 if let Some(dt) = args.first().and_then(|v| v.as_f64()) {
                     let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
                     world.step(dt as f32);
                     Ok(Value::Bool(true))
-                } else { rt_err!("physics::step requires dt (number)") }
+                } else {
+                    rt_err!("physics::step requires dt (number)")
+                }
             }
             "physics::apply_force" => {
-                if let (Some(body_id), Some(fx), Some(fy), Some(fz)) =
-                    (args.get(0).and_then(|v| v.as_i64()),
-                     args.get(1).and_then(|v| v.as_f64()),
-                     args.get(2).and_then(|v| v.as_f64()),
-                     args.get(3).and_then(|v| v.as_f64()))
-                {
+                if let (Some(body_id), Some(fx), Some(fy), Some(fz)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                    args.get(3).and_then(|v| v.as_f64()),
+                ) {
                     let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
-                    world.apply_force(body_id as u64, fx as f32, fy as f32, fz as f32);
-                    Ok(Value::Bool(true))
-                } else { rt_err!("physics::apply_force requires (body_id, fx, fy, fz)") }
+                    // Placeholder: force integration API is not currently exposed.
+                    let _ = (body_id, fx, fy, fz);
+                    Ok(Value::Bool(false))
+                } else {
+                    rt_err!("physics::apply_force requires (body_id, fx, fy, fz)")
+                }
             }
 
             // ── Graphics functions ─────────────────────────────────────────────
             "graphics::set_camera" => {
-                if let (Some(x), Some(y), Some(z)) =
-                    (args.get(0).and_then(|v| v.as_f64()),
-                     args.get(1).and_then(|v| v.as_f64()),
-                     args.get(2).and_then(|v| v.as_f64()))
-                {
+                if let (Some(x), Some(y), Some(z)) = (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                ) {
                     let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    render.set_camera_position(x as f32, y as f32, z as f32);
+                    render.update_camera_position(x as f32, y as f32, z as f32);
                     Ok(Value::Bool(true))
-                } else { rt_err!("graphics::set_camera requires (x, y, z)") }
+                } else {
+                    rt_err!("graphics::set_camera requires (x, y, z)")
+                }
             }
             "graphics::create_mesh" => {
                 if let (Some(Value::Str(mesh_type)), Some(scale)) =
                     (args.get(0), args.get(1).and_then(|v| v.as_f64()))
                 {
                     let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    match mesh_type.as_str() {
-                        "cube" => {
-                            let mesh = render.create_cube_mesh(scale as f32);
-                            Ok(Value::I64(mesh.id as i64))
-                        }
-                        "sphere" => {
-                            let mesh = render.create_sphere_mesh(scale as f32, 32, 32);
-                            Ok(Value::I64(mesh.id as i64))
-                        }
-                        _ => rt_err!("graphics::create_mesh: unknown mesh type")
-                    }
-                } else { rt_err!("graphics::create_mesh requires (type_str, scale)") }
+                    let s = scale as f32;
+                    let vertices = vec![[-s, -s, 0.0], [s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0]];
+                    let indices = vec![0, 1, 2, 0, 2, 3];
+                    let mesh_id = render.create_mesh(vertices, indices);
+                    let _ = mesh_type;
+                    Ok(Value::I64(mesh_id as i64))
+                } else {
+                    rt_err!("graphics::create_mesh requires (type_str, scale)")
+                }
             }
             "graphics::create_material" => {
-                if let (Some(r), Some(g), Some(b), Some(a)) =
-                    (args.get(0).and_then(|v| v.as_f64()),
-                     args.get(1).and_then(|v| v.as_f64()),
-                     args.get(2).and_then(|v| v.as_f64()),
-                     args.get(3).and_then(|v| v.as_f64()))
-                {
+                if let (Some(r), Some(g), Some(b), Some(a)) = (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                    args.get(3).and_then(|v| v.as_f64()),
+                ) {
                     let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    let material_id = render.create_material(r as f32, g as f32, b as f32, a as f32);
+                    let material_id =
+                        render.create_material([r as f32, g as f32, b as f32, a as f32]);
                     Ok(Value::I64(material_id as i64))
-                } else { rt_err!("graphics::create_material requires (r, g, b, a)") }
+                } else {
+                    rt_err!("graphics::create_material requires (r, g, b, a)")
+                }
             }
             "graphics::render_mesh" => {
-                if let (Some(mesh_id), Some(mat_id)) =
-                    (args.get(0).and_then(|v| v.as_i64()),
-                     args.get(1).and_then(|v| v.as_i64()))
+                if let (Some(mesh_id), Some(mat_id)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                ) {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    let _ = (mesh_id, mat_id);
+                    Ok(Value::Bool(false))
+                } else {
+                    rt_err!("graphics::render_mesh requires (mesh_id, material_id)")
+                }
+            }
+            "graphics::create_sprite" => {
+                if let (Some(Value::Str(name)), Some(w), Some(h)) = (
+                    args.get(0),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                ) {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    let id = render.create_sprite(name.clone(), w as f32, h as f32);
+                    Ok(Value::I64(id as i64))
+                } else {
+                    rt_err!("graphics::create_sprite requires (name, width, height)")
+                }
+            }
+            "graphics::create_model" => {
+                if let (Some(Value::Str(name)), Some(mesh_id)) =
+                    (args.get(0), args.get(1).and_then(|v| v.as_i64()))
                 {
                     let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    render.render_mesh(mesh_id as u32, mat_id as u32);
-                    Ok(Value::Bool(true))
-                } else { rt_err!("graphics::render_mesh requires (mesh_id, material_id)") }
+                    match render.create_model(name.clone(), mesh_id as u32) {
+                        Ok(id) => Ok(Value::I64(id as i64)),
+                        Err(e) => rt_err!("{}", e),
+                    }
+                } else {
+                    rt_err!("graphics::create_model requires (name, mesh_id)")
+                }
             }
-            "graphics::clear" => {
-                let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                render.clear_screen();
-                Ok(Value::Bool(true))
+            "graphics::create_object" => {
+                if let (Some(Value::Str(kind)), Some(asset_id), material_id) = (
+                    args.get(0),
+                    args.get(1).and_then(|v| v.as_i64()),
+                    args.get(2).and_then(|v| v.as_i64()),
+                ) {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    let obj_kind = match kind.as_str() {
+                        "sprite" => crate::game_systems::SceneObjectKind::Sprite(asset_id as u32),
+                        "model" => crate::game_systems::SceneObjectKind::Model(asset_id as u32),
+                        _ => return rt_err!("graphics::create_object kind must be \"sprite\" or \"model\""),
+                    };
+                    match render.create_object(obj_kind, material_id.map(|v| v as u32)) {
+                        Ok(id) => Ok(Value::I64(id as i64)),
+                        Err(e) => rt_err!("{}", e),
+                    }
+                } else {
+                    rt_err!("graphics::create_object requires (kind, asset_id, material_id)")
+                }
             }
+            "graphics::create_grid_map" => {
+                if let (Some(w), Some(h)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                ) {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    let map_id = render.create_grid_map(w as usize, h as usize);
+                    Ok(Value::I64(map_id as i64))
+                } else {
+                    rt_err!("graphics::create_grid_map requires (width, height)")
+                }
+            }
+            "graphics::create_chunked_grid_map" => {
+                if let (Some(w), Some(h), Some(chunk)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                    args.get(2).and_then(|v| v.as_i64()),
+                ) {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    let map_id = render.create_chunked_grid_map(w as usize, h as usize, chunk as usize);
+                    Ok(Value::I64(map_id as i64))
+                } else {
+                    rt_err!("graphics::create_chunked_grid_map requires (width, height, chunk_size)")
+                }
+            }
+            "graphics::set_grid_cell" => {
+                if let (Some(map_id), Some(x), Some(y), Some(object_id)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                    args.get(2).and_then(|v| v.as_i64()),
+                    args.get(3).and_then(|v| v.as_i64()),
+                ) {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    match render.set_grid_cell(map_id as u32, x as usize, y as usize, object_id as u32) {
+                        Ok(()) => Ok(Value::Bool(true)),
+                        Err(e) => rt_err!("{}", e),
+                    }
+                } else {
+                    rt_err!("graphics::set_grid_cell requires (map_id, x, y, object_id)")
+                }
+            }
+            "graphics::set_chunked_grid_cell" => {
+                if let (Some(map_id), Some(x), Some(y), Some(object_id)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                    args.get(2).and_then(|v| v.as_i64()),
+                    args.get(3).and_then(|v| v.as_i64()),
+                ) {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    match render.set_chunked_grid_cell(map_id as u32, x as usize, y as usize, object_id as u32) {
+                        Ok(()) => Ok(Value::Bool(true)),
+                        Err(e) => rt_err!("{}", e),
+                    }
+                } else {
+                    rt_err!("graphics::set_chunked_grid_cell requires (map_id, x, y, object_id)")
+                }
+            }
+            "graphics::render_grid_map" => {
+                if let Some(map_id) = args.get(0).and_then(|v| v.as_i64()) {
+                    let render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    match render.render_grid_map(map_id as u32) {
+                        Ok(drawn) => Ok(Value::I64(drawn as i64)),
+                        Err(e) => rt_err!("{}", e),
+                    }
+                } else {
+                    rt_err!("graphics::render_grid_map requires (map_id)")
+                }
+            }
+            "graphics::render_chunked_grid_map" => {
+                if let Some(map_id) = args.get(0).and_then(|v| v.as_i64()) {
+                    let render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    match render.render_chunked_grid_map(map_id as u32) {
+                        Ok(drawn) => Ok(Value::I64(drawn as i64)),
+                        Err(e) => rt_err!("{}", e),
+                    }
+                } else {
+                    rt_err!("graphics::render_chunked_grid_map requires (map_id)")
+                }
+            }
+            "game::make_object" => {
+                if let (Some(Value::Str(kind)), Some(Value::Str(name)), Some(size), Some(r), Some(g), Some(b), Some(a)) = (
+                    args.get(0),
+                    args.get(1),
+                    args.get(2).and_then(|v| v.as_f64()),
+                    args.get(3).and_then(|v| v.as_f64()),
+                    args.get(4).and_then(|v| v.as_f64()),
+                    args.get(5).and_then(|v| v.as_f64()),
+                    args.get(6).and_then(|v| v.as_f64()),
+                ) {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    let mat = render.create_material([r as f32, g as f32, b as f32, a as f32]);
+                    let obj_id = match kind.as_str() {
+                        "sprite" => {
+                            let sprite_id = render.create_sprite(name.clone(), size as f32, size as f32);
+                            render.create_object(SceneObjectKind::Sprite(sprite_id), Some(mat))
+                        }
+                        "model" => {
+                            let cube = create_cube_mesh(size as f32);
+                            let mesh_id = render.create_mesh(cube.vertices, cube.indices);
+                            let model_id = render.create_model(name.clone(), mesh_id);
+                            match model_id {
+                                Ok(mid) => render.create_object(SceneObjectKind::Model(mid), Some(mat)),
+                                Err(e) => return rt_err!("{}", e),
+                            }
+                        }
+                        _ => return rt_err!("game::make_object kind must be \"sprite\" or \"model\""),
+                    };
+                    match obj_id {
+                        Ok(id) => Ok(Value::I64(id as i64)),
+                        Err(e) => rt_err!("{}", e),
+                    }
+                } else {
+                    rt_err!("game::make_object requires (kind, name, size, r, g, b, a)")
+                }
+            }
+            "game::build_map" => {
+                if let (Some(w), Some(h), Some(Value::Array(cells))) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                    args.get(2),
+                ) {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    let width = w as usize;
+                    let height = h as usize;
+                    let map_id = render.create_grid_map(width, height);
+                    let cells_guard = cells.lock().unwrap();
+                    let max_cells = width.saturating_mul(height).min(cells_guard.len());
+                    for idx in 0..max_cells {
+                        let object_id = cells_guard[idx].as_i64().unwrap_or(0).max(0) as u32;
+                        let x = idx % width;
+                        let y = idx / width;
+                        let _ = render.set_grid_cell(map_id, x, y, object_id);
+                    }
+                    Ok(Value::I64(map_id as i64))
+                } else {
+                    rt_err!("game::build_map requires (width, height, cells_array)")
+                }
+            }
+            "game::run_loop" => {
+                if let (Some(map_id), Some(ticks), Some(dt)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                ) {
+                    let mut frames_drawn = 0i64;
+                    for _ in 0..ticks.max(0) {
+                        if let Some(world) = &self.physics_world {
+                            world.lock().unwrap().step(dt as f32);
+                        }
+                        if let Some(render) = &self.render_state {
+                            if let Ok(count) = render.lock().unwrap().render_grid_map(map_id as u32) {
+                                frames_drawn += count as i64;
+                            }
+                        }
+                    }
+                    Ok(Value::I64(frames_drawn))
+                } else {
+                    rt_err!("game::run_loop requires (map_id, ticks, dt)")
+                }
+            }
+            "graphics::clear" => Ok(Value::Bool(true)),
 
             // ── Input functions ───────────────────────────────────────────────────
             "input::is_key_pressed" => {
                 if let Some(Value::Str(key)) = args.first() {
                     let input = self.input_state.as_ref().unwrap().lock().unwrap();
-                    let pressed = input.is_key_pressed(key);
+                    let _ = key;
+                    let pressed = false;
                     Ok(Value::Bool(pressed))
-                } else { rt_err!("input::is_key_pressed requires a key name string") }
+                } else {
+                    rt_err!("input::is_key_pressed requires a key name string")
+                }
             }
-            "input::get_mouse_position" => {
-                let input = self.input_state.as_ref().unwrap().lock().unwrap();
-                let (x, y) = input.get_mouse_position();
-                Ok(Value::Vec3([x, y, 0.0]))
-            }
-            "input::get_mouse_scroll" => {
-                let input = self.input_state.as_ref().unwrap().lock().unwrap();
-                let scroll = input.get_mouse_scroll();
-                Ok(Value::F32(scroll))
-            }
+            "input::get_mouse_position" => Ok(Value::Vec3([0.0, 0.0, 0.0])),
+            "input::get_mouse_scroll" => Ok(Value::F32(0.0)),
             "input::get_gamepad_axis" => {
-                if let (Some(gamepad_id), Some(axis_id)) =
-                    (args.get(0).and_then(|v| v.as_i64()),
-                     args.get(1).and_then(|v| v.as_i64()))
-                {
-                    let input = self.input_state.as_ref().unwrap().lock().unwrap();
-                    let value = input.get_gamepad_axis(gamepad_id as u32, axis_id as u32);
-                    Ok(Value::F32(value))
-                } else { rt_err!("input::get_gamepad_axis requires (gamepad_id, axis_id)") }
+                if let (Some(gamepad_id), Some(axis_id)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                ) {
+                    let _ = (gamepad_id, axis_id);
+                    Ok(Value::F32(0.0))
+                } else {
+                    rt_err!("input::get_gamepad_axis requires (gamepad_id, axis_id)")
+                }
             }
             "input::get_gamepad_button" => {
-                if let (Some(gamepad_id), Some(btn_id)) =
-                    (args.get(0).and_then(|v| v.as_i64()),
-                     args.get(1).and_then(|v| v.as_i64()))
-                {
-                    let input = self.input_state.as_ref().unwrap().lock().unwrap();
-                    let pressed = input.get_gamepad_button(gamepad_id as u32, btn_id as u32);
-                    Ok(Value::Bool(pressed))
-                } else { rt_err!("input::get_gamepad_button requires (gamepad_id, button_id)") }
+                if let (Some(gamepad_id), Some(btn_id)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                ) {
+                    let _ = (gamepad_id, btn_id);
+                    Ok(Value::Bool(false))
+                } else {
+                    rt_err!("input::get_gamepad_button requires (gamepad_id, button_id)")
+                }
             }
 
             // ── Autodiff functions ─────────────────────────────────────────────────
@@ -2363,21 +3110,28 @@ impl AiArchitectureSpec {
                 if let Some(Value::Tensor(t)) = args.first() {
                     // Create tensor input for tracking
                     Ok(Value::I64(1)) // Return node_id (simplified)
-                } else { rt_err!("autodiff::enable requires a tensor") }
+                } else {
+                    rt_err!("autodiff::enable requires a tensor")
+                }
             }
             "autodiff::backward" => {
                 if let Some(_node_id) = args.first().and_then(|v| v.as_i64()) {
                     // In full implementation: call computation_graph.backward()
                     Ok(Value::Bool(true))
-                } else { rt_err!("autodiff::backward requires node_id") }
+                } else {
+                    rt_err!("autodiff::backward requires node_id")
+                }
             }
             "autodiff::get_gradient" => {
                 if let Some(_node_id) = args.first().and_then(|v| v.as_i64()) {
                     // Return zero tensor as placeholder
-                    Ok(Value::Tensor(Arc::new(RwLock::new(
-                        Tensor::from_data(vec![1], vec![0.0f32])
-                    ))))
-                } else { rt_err!("autodiff::get_gradient requires node_id") }
+                    Ok(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(
+                        vec![1],
+                        vec![0.0f32],
+                    )))))
+                } else {
+                    rt_err!("autodiff::get_gradient requires node_id")
+                }
             }
 
             // ── Optimizer functions ────────────────────────────────────────────────
@@ -2385,9 +3139,11 @@ impl AiArchitectureSpec {
                 if let (Some(Value::Str(opt_type)), Some(lr)) =
                     (args.get(0), args.get(1).and_then(|v| v.as_f64()))
                 {
-                    let config = crate::optimizer::OptimizerConfig::new(opt_type.clone(), lr as f32);
+                    let _ = (opt_type, lr);
                     Ok(Value::I64(0)) // Return optimizer handle
-                } else { rt_err!("optimizer::create requires (optimizer_type, learning_rate)") }
+                } else {
+                    rt_err!("optimizer::create requires (optimizer_type, learning_rate)")
+                }
             }
             "optimizer::step" => {
                 // Simplified: actual implementation would update weights based on gradients
@@ -2413,7 +3169,9 @@ impl AiArchitectureSpec {
                     mse /= pred_data.len() as f32;
 
                     Ok(Value::F32(mse))
-                } else { rt_err!("loss::mse requires (predictions, targets) tensors") }
+                } else {
+                    rt_err!("loss::mse requires (predictions, targets) tensors")
+                }
             }
             "loss::cross_entropy" => {
                 if let (Some(Value::Tensor(logits)), Some(Value::Tensor(targets))) =
@@ -2435,7 +3193,9 @@ impl AiArchitectureSpec {
                     ce /= logits_data.len() as f32;
 
                     Ok(Value::F32(ce))
-                } else { rt_err!("loss::cross_entropy requires (logits, targets) tensors") }
+                } else {
+                    rt_err!("loss::cross_entropy requires (logits, targets) tensors")
+                }
             }
 
             // ── Metrics functions ──────────────────────────────────────────────────
@@ -2458,7 +3218,9 @@ impl AiArchitectureSpec {
 
                     let accuracy = correct as f32 / pred_data.len() as f32;
                     Ok(Value::F32(accuracy))
-                } else { rt_err!("metrics::accuracy requires (predictions, targets) tensors") }
+                } else {
+                    rt_err!("metrics::accuracy requires (predictions, targets) tensors")
+                }
             }
             "metrics::precision" => {
                 if let (Some(Value::Tensor(pred)), Some(Value::Tensor(target))) =
@@ -2475,13 +3237,23 @@ impl AiArchitectureSpec {
                     for (p, t) in pred_data.iter().zip(target_data.iter()) {
                         let pred_pos = p.round() > 0.5;
                         let target_pos = t.round() > 0.5;
-                        if pred_pos && target_pos { tp += 1; }
-                        if pred_pos && !target_pos { fp += 1; }
+                        if pred_pos && target_pos {
+                            tp += 1;
+                        }
+                        if pred_pos && !target_pos {
+                            fp += 1;
+                        }
                     }
 
-                    let precision = if tp + fp > 0 { tp as f32 / (tp + fp) as f32 } else { 0.0 };
+                    let precision = if tp + fp > 0 {
+                        tp as f32 / (tp + fp) as f32
+                    } else {
+                        0.0
+                    };
                     Ok(Value::F32(precision))
-                } else { rt_err!("metrics::precision requires (predictions, targets) tensors") }
+                } else {
+                    rt_err!("metrics::precision requires (predictions, targets) tensors")
+                }
             }
             "metrics::recall" => {
                 if let (Some(Value::Tensor(pred)), Some(Value::Tensor(target))) =
@@ -2498,13 +3270,23 @@ impl AiArchitectureSpec {
                     for (p, t) in pred_data.iter().zip(target_data.iter()) {
                         let pred_pos = p.round() > 0.5;
                         let target_pos = t.round() > 0.5;
-                        if pred_pos && target_pos { tp += 1; }
-                        if !pred_pos && target_pos { fn_count += 1; }
+                        if pred_pos && target_pos {
+                            tp += 1;
+                        }
+                        if !pred_pos && target_pos {
+                            fn_count += 1;
+                        }
                     }
 
-                    let recall = if tp + fn_count > 0 { tp as f32 / (tp + fn_count) as f32 } else { 0.0 };
+                    let recall = if tp + fn_count > 0 {
+                        tp as f32 / (tp + fn_count) as f32
+                    } else {
+                        0.0
+                    };
                     Ok(Value::F32(recall))
-                } else { rt_err!("metrics::recall requires (predictions, targets) tensors") }
+                } else {
+                    rt_err!("metrics::recall requires (predictions, targets) tensors")
+                }
             }
             "metrics::f1_score" => {
                 if let (Some(Value::Tensor(pred)), Some(Value::Tensor(target))) =
@@ -2523,96 +3305,138 @@ impl AiArchitectureSpec {
                     for (p, t) in pred_data.iter().zip(target_data.iter()) {
                         let pred_pos = p.round() > 0.5;
                         let target_pos = t.round() > 0.5;
-                        if pred_pos && target_pos { tp += 1; }
-                        if pred_pos && !target_pos { fp += 1; }
-                        if !pred_pos && target_pos { fn_count += 1; }
+                        if pred_pos && target_pos {
+                            tp += 1;
+                        }
+                        if pred_pos && !target_pos {
+                            fp += 1;
+                        }
+                        if !pred_pos && target_pos {
+                            fn_count += 1;
+                        }
                     }
 
-                    let precision = if tp + fp > 0 { tp as f32 / (tp + fp) as f32 } else { 0.0 };
-                    let recall = if tp + fn_count > 0 { tp as f32 / (tp + fn_count) as f32 } else { 0.0 };
-                    let f1 = if precision + recall > 0.0 { 2.0 * (precision * recall) / (precision + recall) } else { 0.0 };
+                    let precision = if tp + fp > 0 {
+                        tp as f32 / (tp + fp) as f32
+                    } else {
+                        0.0
+                    };
+                    let recall = if tp + fn_count > 0 {
+                        tp as f32 / (tp + fn_count) as f32
+                    } else {
+                        0.0
+                    };
+                    let f1 = if precision + recall > 0.0 {
+                        2.0 * (precision * recall) / (precision + recall)
+                    } else {
+                        0.0
+                    };
 
                     Ok(Value::F32(f1))
-                } else { rt_err!("metrics::f1_score requires (predictions, targets) tensors") }
+                } else {
+                    rt_err!("metrics::f1_score requires (predictions, targets) tensors")
+                }
             }
 
             // Not a built-in
             _ => Err(RuntimeError {
                 message: format!("unknown function: {}", name),
                 span: None,
-            })
+            }),
         }
     }
 
     // ── Built-in method dispatch ───────────────────────────────────────────
 
-    fn eval_method(&mut self, recv: Value, method: &str, args: Vec<Value>)
-        -> Result<Value, RuntimeError>
-    {
+    fn eval_method(
+        &mut self,
+        recv: Value,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
         match (&recv, method) {
             // ── Tensor methods ─────────────────────────────────────────────────
             (Value::Tensor(_), "transpose") => {
                 if let Value::Tensor(t) = recv {
                     let out = t.read().unwrap().transpose()?;
                     Ok(Value::Tensor(Arc::new(RwLock::new(out))))
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::Tensor(_), "sum") => {
                 if let Value::Tensor(t) = recv {
                     Ok(Value::F32(t.read().unwrap().sum_all()))
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::Tensor(_), "mean") => {
                 if let Value::Tensor(t) = recv {
                     let tt = t.read().unwrap();
                     Ok(Value::F32(tt.sum_all() / tt.numel() as f32))
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::Tensor(_), "relu") => {
                 if let Value::Tensor(t) = recv {
                     let out = t.read().unwrap().apply_activation(&Activation::Relu);
                     Ok(Value::Tensor(Arc::new(RwLock::new(out))))
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::Tensor(_), "softmax") => {
                 if let Value::Tensor(t) = recv {
                     let out = t.read().unwrap().apply_activation(&Activation::Softmax);
                     Ok(Value::Tensor(Arc::new(RwLock::new(out))))
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::Tensor(_), "reshape") => {
                 if let Value::Tensor(t) = recv {
-                    let new_shape: Vec<usize> = args.iter()
+                    let new_shape: Vec<usize> = args
+                        .iter()
                         .filter_map(|v| v.as_i64().map(|i| i as usize))
                         .collect();
                     let data = t.read().unwrap().cpu_data().to_vec();
-                    Ok(Value::Tensor(Arc::new(RwLock::new(
-                        Tensor::from_data(new_shape, data)
-                    ))))
-                } else { unreachable!() }
+                    Ok(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(
+                        new_shape, data,
+                    )))))
+                } else {
+                    unreachable!()
+                }
             }
             // ── Vec methods ────────────────────────────────────────────────────
             (Value::Vec3(v), "dot") => {
                 if let Some(Value::Vec3(r)) = args.first() {
-                    Ok(Value::F32(v[0]*r[0] + v[1]*r[1] + v[2]*r[2]))
-                } else { rt_err!("dot() expects vec3") }
+                    Ok(Value::F32(v[0] * r[0] + v[1] * r[1] + v[2] * r[2]))
+                } else {
+                    rt_err!("dot() expects vec3")
+                }
             }
             (Value::Vec3(v), "cross") => {
                 if let Some(Value::Vec3(r)) = args.first() {
                     Ok(Value::Vec3([
-                        v[1]*r[2] - v[2]*r[1],
-                        v[2]*r[0] - v[0]*r[2],
-                        v[0]*r[1] - v[1]*r[0],
+                        v[1] * r[2] - v[2] * r[1],
+                        v[2] * r[0] - v[0] * r[2],
+                        v[0] * r[1] - v[1] * r[0],
                     ]))
-                } else { rt_err!("cross() expects vec3") }
+                } else {
+                    rt_err!("cross() expects vec3")
+                }
             }
             (Value::Vec3(v), "normalize") => {
-                let len = (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt();
-                if len < 1e-8 { return Ok(Value::Vec3(*v)); }
-                Ok(Value::Vec3([v[0]/len, v[1]/len, v[2]/len]))
+                let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                if len < 1e-8 {
+                    return Ok(Value::Vec3(*v));
+                }
+                Ok(Value::Vec3([v[0] / len, v[1] / len, v[2] / len]))
             }
             (Value::Vec3(v), "length" | "magnitude") => {
-                Ok(Value::F32((v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt()))
+                Ok(Value::F32((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()))
             }
             // ── Model forward pass ─────────────────────────────────────────────
             (Value::Model(_), "forward") => {
@@ -2623,18 +3447,25 @@ impl AiArchitectureSpec {
                                 let t = a.read().unwrap().clone();
                                 RwLock::new(t)
                             })
-                            .into_inner().unwrap();
+                            .into_inner()
+                            .unwrap();
                         let out = m.lock().unwrap().forward(x_owned)?;
                         Ok(Value::Tensor(Arc::new(RwLock::new(out))))
-                    } else { rt_err!("forward() expects tensor") }
-                } else { unreachable!() }
+                    } else {
+                        rt_err!("forward() expects tensor")
+                    }
+                } else {
+                    unreachable!()
+                }
             }
             // ── World methods ──────────────────────────────────────────────────
             (Value::World(_), "spawn") => {
                 if let Value::World(w) = recv {
                     let id = w.lock().unwrap().spawn();
                     Ok(Value::Entity(id))
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::World(_), "despawn") => {
                 if let Value::World(w) = recv {
@@ -2642,13 +3473,17 @@ impl AiArchitectureSpec {
                         w.lock().unwrap().despawn(*id);
                     }
                     Ok(Value::Unit)
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             // ── Array / string methods ─────────────────────────────────────────
             (Value::Array(_), "len") => {
                 if let Value::Array(a) = recv {
                     Ok(Value::I32(a.lock().unwrap().len() as i32))
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::Array(_), "push") => {
                 if let Value::Array(a) = recv {
@@ -2656,18 +3491,24 @@ impl AiArchitectureSpec {
                         a.lock().unwrap().push(v);
                     }
                     Ok(Value::Unit)
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::Array(_), "pop") => {
                 if let Value::Array(a) = recv {
                     Ok(a.lock().unwrap().pop().unwrap_or(Value::Unit))
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::Array(_), "clear") => {
                 if let Value::Array(a) = recv {
                     a.lock().unwrap().clear();
                     Ok(Value::Unit)
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
 
             // ── HashMap methods ───────────────────────────────────────────────
@@ -2678,60 +3519,81 @@ impl AiArchitectureSpec {
                             m.lock().unwrap().insert(k.clone(), v.clone());
                             Ok(Value::Unit)
                         }
-                        _ => rt_err!("insert() requires (string_key, value)")
+                        _ => rt_err!("insert() requires (string_key, value)"),
                     }
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::HashMap(_), "get") => {
                 if let Value::HashMap(m) = recv {
                     if let Some(Value::Str(k)) = args.first() {
                         let map = m.lock().unwrap();
                         Ok(map.get(k).cloned().unwrap_or(Value::None))
-                    } else { rt_err!("get() requires string key") }
-                } else { unreachable!() }
+                    } else {
+                        rt_err!("get() requires string key")
+                    }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::HashMap(_), "remove") => {
                 if let Value::HashMap(m) = recv {
                     if let Some(Value::Str(k)) = args.first() {
                         Ok(m.lock().unwrap().remove(k).unwrap_or(Value::None))
-                    } else { rt_err!("remove() requires string key") }
-                } else { unreachable!() }
+                    } else {
+                        rt_err!("remove() requires string key")
+                    }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::HashMap(_), "len") => {
                 if let Value::HashMap(m) = recv {
                     Ok(Value::I32(m.lock().unwrap().len() as i32))
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::HashMap(_), "clear") => {
                 if let Value::HashMap(m) = recv {
                     m.lock().unwrap().clear();
                     Ok(Value::Unit)
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::HashMap(_), "keys") => {
                 if let Value::HashMap(m) = recv {
-                    let keys: Vec<Value> = m.lock().unwrap()
+                    let keys: Vec<Value> = m
+                        .lock()
+                        .unwrap()
                         .keys()
                         .map(|k| Value::Str(k.clone()))
                         .collect();
                     Ok(Value::Array(Arc::new(Mutex::new(keys))))
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::HashMap(_), "values") => {
                 if let Value::HashMap(m) = recv {
-                    let values: Vec<Value> = m.lock().unwrap()
-                        .values()
-                        .cloned()
-                        .collect();
+                    let values: Vec<Value> = m.lock().unwrap().values().cloned().collect();
                     Ok(Value::Array(Arc::new(Mutex::new(values))))
-                } else { unreachable!() }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::HashMap(_), "contains_key") => {
                 if let Value::HashMap(m) = recv {
                     if let Some(Value::Str(k)) = args.first() {
                         Ok(Value::Bool(m.lock().unwrap().contains_key(k)))
-                    } else { rt_err!("contains_key() requires string key") }
-                } else { unreachable!() }
+                    } else {
+                        rt_err!("contains_key() requires string key")
+                    }
+                } else {
+                    unreachable!()
+                }
             }
             (Value::Str(s), "len") => Ok(Value::I32(s.len() as i32)),
 
@@ -2742,45 +3604,48 @@ impl AiArchitectureSpec {
             (Value::Str(s), "trim_start") => Ok(Value::Str(s.trim_start().to_string())),
             (Value::Str(s), "trim_end") => Ok(Value::Str(s.trim_end().to_string())),
             (Value::Str(s), "chars") => {
-                let chars: Vec<Value> = s.chars()
-                    .map(|c| Value::Str(c.to_string()))
-                    .collect();
+                let chars: Vec<Value> = s.chars().map(|c| Value::Str(c.to_string())).collect();
                 Ok(Value::Array(Arc::new(Mutex::new(chars))))
             }
-            (Value::Str(s), "reverse") => {
-                Ok(Value::Str(s.chars().rev().collect()))
-            }
+            (Value::Str(s), "reverse") => Ok(Value::Str(s.chars().rev().collect())),
             (Value::Str(s), "starts_with") => {
                 if let Some(Value::Str(prefix)) = args.first() {
                     Ok(Value::Bool(s.starts_with(prefix)))
-                } else { rt_err!("starts_with() requires a string argument") }
+                } else {
+                    rt_err!("starts_with() requires a string argument")
+                }
             }
             (Value::Str(s), "ends_with") => {
                 if let Some(Value::Str(suffix)) = args.first() {
                     Ok(Value::Bool(s.ends_with(suffix)))
-                } else { rt_err!("ends_with() requires a string argument") }
+                } else {
+                    rt_err!("ends_with() requires a string argument")
+                }
             }
             (Value::Str(s), "contains") => {
                 if let Some(Value::Str(needle)) = args.first() {
                     Ok(Value::Bool(s.contains(needle)))
-                } else { rt_err!("contains() requires a string argument") }
+                } else {
+                    rt_err!("contains() requires a string argument")
+                }
             }
             (Value::Str(s), "split") => {
                 if let Some(Value::Str(delim)) = args.first() {
-                    let parts: Vec<Value> = s.split(delim.as_str())
+                    let parts: Vec<Value> = s
+                        .split(delim.as_str())
                         .map(|part| Value::Str(part.to_string()))
                         .collect();
                     Ok(Value::Array(Arc::new(Mutex::new(parts))))
-                } else { rt_err!("split() requires a string argument") }
-            }
-            (Value::Str(s), "replace") => {
-                match (args.get(0), args.get(1)) {
-                    (Some(Value::Str(from)), Some(Value::Str(to))) => {
-                        Ok(Value::Str(s.replace(from, to)))
-                    }
-                    _ => rt_err!("replace() requires two string arguments")
+                } else {
+                    rt_err!("split() requires a string argument")
                 }
             }
+            (Value::Str(s), "replace") => match (args.get(0), args.get(1)) {
+                (Some(Value::Str(from)), Some(Value::Str(to))) => {
+                    Ok(Value::Str(s.replace(from, to)))
+                }
+                _ => rt_err!("replace() requires two string arguments"),
+            },
 
             // ── Option/Result methods ───────────────────────────────────────────
             (Value::Some(v), "unwrap") => Ok((**v).clone()),
@@ -2810,15 +3675,15 @@ impl AiArchitectureSpec {
     // =========================================================================
 
     fn eval_cast(&self, v: Value, ty: &crate::ast::Type) -> Result<Value, RuntimeError> {
-        use crate::ast::{Type, ElemType as E};
+        use crate::ast::{ElemType as E, Type};
         let f = v.as_f64().unwrap_or(0.0);
         match ty {
-            Type::Scalar(E::F32)  => Ok(Value::F32(f as f32)),
-            Type::Scalar(E::F64)  => Ok(Value::F64(f)),
-            Type::Scalar(E::I32)  => Ok(Value::I32(f as i32)),
-            Type::Scalar(E::I64)  => Ok(Value::I64(f as i64)),
-            Type::Scalar(E::U32)  => Ok(Value::U32(f as u32)),
-            Type::Scalar(E::U64)  => Ok(Value::U64(f as u64)),
+            Type::Scalar(E::F32) => Ok(Value::F32(f as f32)),
+            Type::Scalar(E::F64) => Ok(Value::F64(f)),
+            Type::Scalar(E::I32) => Ok(Value::I32(f as i32)),
+            Type::Scalar(E::I64) => Ok(Value::I64(f as i64)),
+            Type::Scalar(E::U32) => Ok(Value::U32(f as u32)),
+            Type::Scalar(E::U64) => Ok(Value::U64(f as u64)),
             Type::Scalar(E::Bool) => Ok(Value::Bool(f != 0.0)),
             _ => Ok(v),
         }
@@ -2835,21 +3700,22 @@ impl AiArchitectureSpec {
             (Pattern::Lit(_, lit), v) => {
                 use crate::ast::LitVal;
                 match (lit, v) {
-                    (LitVal::Int(n),   Value::I32(x)) => *n == *x as u128,
-                    (LitVal::Int(n),   Value::I64(x)) => *n == *x as u128,
+                    (LitVal::Int(n), Value::I32(x)) => *n == *x as u128,
+                    (LitVal::Int(n), Value::I64(x)) => *n == *x as u128,
                     (LitVal::Float(f), Value::F32(x)) => (*f as f32 - x).abs() < f32::EPSILON,
-                    (LitVal::Bool(b),  Value::Bool(x)) => b == x,
-                    (LitVal::Str(s),   Value::Str(x))  => s == x,
+                    (LitVal::Bool(b), Value::Bool(x)) => b == x,
+                    (LitVal::Str(s), Value::Str(x)) => s == x,
                     _ => false,
                 }
             }
             (Pattern::Tuple { elems, .. }, Value::Tuple(vs)) => {
                 elems.len() == vs.len()
-                && elems.iter().zip(vs).all(|(p, v)| self.pattern_matches(p, v))
+                    && elems
+                        .iter()
+                        .zip(vs)
+                        .all(|(p, v)| self.pattern_matches(p, v))
             }
-            (Pattern::Or { arms, .. }, v) => {
-                arms.iter().any(|p| self.pattern_matches(p, v))
-            }
+            (Pattern::Or { arms, .. }, v) => arms.iter().any(|p| self.pattern_matches(p, v)),
             _ => false,
         }
     }
@@ -2900,29 +3766,29 @@ impl AiArchitectureSpec {
 
 /// Configuration resolved from a `TrainDecl`.
 pub struct TrainingConfig {
-    pub agent_name:   String,
-    pub world_name:   String,
-    pub model_name:   Option<String>,
-    pub max_steps:    u64,
-    pub num_envs:     u64,
-    pub lr:           f32,
-    pub gamma:        f32,
-    pub signals:      Vec<(String, f32, bool)>, // (name, weight, is_reward)
-    pub optimizer:    OptimizerKind,
+    pub agent_name: String,
+    pub world_name: String,
+    pub model_name: Option<String>,
+    pub max_steps: u64,
+    pub num_envs: u64,
+    pub lr: f32,
+    pub gamma: f32,
+    pub signals: Vec<(String, f32, bool)>, // (name, weight, is_reward)
+    pub optimizer: OptimizerKind,
 }
 
 impl Default for TrainingConfig {
     fn default() -> Self {
         TrainingConfig {
-            agent_name:  String::new(),
-            world_name:  String::new(),
-            model_name:  None,
-            max_steps:   1000,
-            num_envs:    1,
-            lr:          3e-4,
-            gamma:       0.99,
-            signals:     vec![],
-            optimizer:   OptimizerKind::Adam,
+            agent_name: String::new(),
+            world_name: String::new(),
+            model_name: None,
+            max_steps: 1000,
+            num_envs: 1,
+            lr: 3e-4,
+            gamma: 0.99,
+            signals: vec![],
+            optimizer: OptimizerKind::Adam,
         }
     }
 }
@@ -2934,13 +3800,23 @@ impl Interpreter {
         decl: &TrainDecl,
         interp_env: &mut Env,
     ) -> Result<TrainingStats, RuntimeError> {
-        let max_steps = decl.episode.as_ref()
-            .and_then(|e| e.max_steps).unwrap_or(1000);
-        let num_envs  = decl.episode.as_ref()
-            .and_then(|e| e.num_envs).unwrap_or(1);
-        let gamma     = decl.hyper.iter().find(|(k, _)| k == "gamma")
-            .and_then(|(_, e)| if let Expr::FloatLit { value, .. } = e {
-                Some(*value as f32) } else { None })
+        let max_steps = decl
+            .episode
+            .as_ref()
+            .and_then(|e| e.max_steps)
+            .unwrap_or(1000);
+        let num_envs = decl.episode.as_ref().and_then(|e| e.num_envs).unwrap_or(1);
+        let gamma = decl
+            .hyper
+            .iter()
+            .find(|(k, _)| k == "gamma")
+            .and_then(|(_, e)| {
+                if let Expr::FloatLit { value, .. } = e {
+                    Some(*value as f32)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(0.99);
 
         // Instantiate model (if named).
@@ -2948,7 +3824,8 @@ impl Interpreter {
             if !self.models.contains_key(model_name.as_str()) {
                 if let Some(decl) = self.model_decls.get(model_name).cloned() {
                     let model = NnModel::from_decl(&decl);
-                    self.models.insert(model_name.clone(), Arc::new(Mutex::new(model)));
+                    self.models
+                        .insert(model_name.clone(), Arc::new(Mutex::new(model)));
                 }
             }
         }
@@ -2968,7 +3845,9 @@ impl Interpreter {
             let mut done = false;
 
             for step in 0..max_steps {
-                if done { break; }
+                if done {
+                    break;
+                }
 
                 // 1. Collect observations (stub: agent reports a unit tensor).
                 let obs = Tensor::zeros(vec![1, 4]);
@@ -2978,21 +3857,32 @@ impl Interpreter {
                     if let Some(m) = self.models.get(model_name).cloned() {
                         let out = m.lock().unwrap().forward(obs)?;
                         Value::Tensor(Arc::new(RwLock::new(out)))
-                    } else { Value::Unit }
-                } else { Value::Unit };
+                    } else {
+                        Value::Unit
+                    }
+                } else {
+                    Value::Unit
+                };
 
                 // 3. Step the simulation (tick all systems).
                 // In the full runtime this calls scheduler.tick().
 
                 // 4. Accumulate reward signals.
-                let step_reward: f32 = decl.signals.iter()
+                let step_reward: f32 = decl
+                    .signals
+                    .iter()
                     .map(|sig| {
                         let w = self.world.lock().unwrap();
-                        let count = w.events.get(&sig.name)
+                        let count = w
+                            .events
+                            .get(&sig.name)
                             .map(|v| v.len() as f32)
                             .unwrap_or(0.0);
-                        if sig.is_reward { count * sig.weight as f32 }
-                        else             { -count * sig.weight as f32 }
+                        if sig.is_reward {
+                            count * sig.weight as f32
+                        } else {
+                            -count * sig.weight as f32
+                        }
                     })
                     .sum();
                 episode_reward += step_reward * gamma.powi(step as i32);
@@ -3012,10 +3902,16 @@ impl Interpreter {
         // 6. Policy gradient update (simplified REINFORCE).
         if let Some(model_name) = &decl.model {
             if let Some(model) = self.models.get(model_name).cloned() {
-                let lr = decl.optimizer.as_ref()
+                let lr = decl
+                    .optimizer
+                    .as_ref()
                     .map(|o| o.learning_rate as f32)
                     .unwrap_or(3e-4);
-                update_model_weights(&mut *model.lock().unwrap(), total_reward / num_envs as f32, lr);
+                update_model_weights(
+                    &mut *model.lock().unwrap(),
+                    total_reward / num_envs as f32,
+                    lr,
+                );
             }
         }
 
@@ -3028,8 +3924,8 @@ impl Interpreter {
 /// Summary statistics from one training session.
 #[derive(Debug, Default)]
 pub struct TrainingStats {
-    pub mean_reward:    f32,
-    pub total_steps:    u64,
+    pub mean_reward: f32,
+    pub total_steps: u64,
     pub episode_rewards: Vec<f32>,
 }
 
@@ -3051,9 +3947,13 @@ fn update_model_weights(model: &mut NnModel, reward: f32, lr: f32) {
                 // REINFORCE: w ← w + lr * reward * ∇w (stub: use reward as gradient scale)
                 let grad_scale = lr * reward.clamp(-1.0, 1.0);
                 let w_data = w.cpu_data_mut();
-                for x in w_data.iter_mut() { *x += grad_scale * pseudo_rand_small(); }
+                for x in w_data.iter_mut() {
+                    *x += grad_scale * pseudo_rand_small();
+                }
                 let b_data = b.cpu_data_mut();
-                for x in b_data.iter_mut() { *x += grad_scale * pseudo_rand_small(); }
+                for x in b_data.iter_mut() {
+                    *x += grad_scale * pseudo_rand_small();
+                }
             }
             _ => {}
         }
@@ -3072,18 +3972,29 @@ pub trait GpuBackend: Send + Sync {
     /// Copy a GPU buffer back to a CPU Vec<f32>.
     fn download(&self, handle: &GpuBufferHandle) -> Vec<f32>;
     /// Dispatch a matrix-multiply kernel: C = A @ B.
-    fn matmul(&self, a: &GpuBufferHandle, b: &GpuBufferHandle,
-               shape_a: &[usize], shape_b: &[usize]) -> GpuBufferHandle;
+    fn matmul(
+        &self,
+        a: &GpuBufferHandle,
+        b: &GpuBufferHandle,
+        shape_a: &[usize],
+        shape_b: &[usize],
+    ) -> GpuBufferHandle;
     /// Dispatch an element-wise kernel.
-    fn elementwise(&self, a: &GpuBufferHandle, b: &GpuBufferHandle,
-                   op: GpuOp) -> GpuBufferHandle;
+    fn elementwise(&self, a: &GpuBufferHandle, b: &GpuBufferHandle, op: GpuOp) -> GpuBufferHandle;
     /// Dispatch a parallel entity-loop kernel (SPIR-V / WGSL / CUDA PTX).
     fn dispatch_entity_loop(&self, entities: &[u64], workgroup_size: u32);
 }
 
 /// Primitive operations the GPU backend can dispatch.
 #[derive(Debug, Clone, Copy)]
-pub enum GpuOp { Add, Sub, Mul, Div, HadamardMul, HadamardDiv }
+pub enum GpuOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    HadamardMul,
+    HadamardDiv,
+}
 
 // =============================================================================
 // §21  PURE HELPERS
@@ -3109,13 +4020,17 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
     if let (Value::Tensor(t), ref scalar) | (ref scalar, Value::Tensor(t)) = (&l, &r) {
         if let Some(s) = scalar.as_f64() {
             let tt = t.read().unwrap();
-            let data: Vec<f32> = tt.cpu_data().iter().map(|x| match op {
-                BinOpKind::Add => x + s as f32,
-                BinOpKind::Sub => x - s as f32,
-                BinOpKind::Mul => x * s as f32,
-                BinOpKind::Div => x / s as f32,
-                _ => *x,
-            }).collect();
+            let data: Vec<f32> = tt
+                .cpu_data()
+                .iter()
+                .map(|x| match op {
+                    BinOpKind::Add => x + s as f32,
+                    BinOpKind::Sub => x - s as f32,
+                    BinOpKind::Mul => x * s as f32,
+                    BinOpKind::Div => x / s as f32,
+                    _ => *x,
+                })
+                .collect();
             let out = Tensor::from_data(tt.shape.clone(), data);
             return Ok(Value::Tensor(Arc::new(RwLock::new(out))));
         }
@@ -3124,10 +4039,10 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
     // Vec3 arithmetic.
     if let (Value::Vec3(a), Value::Vec3(b)) = (&l, &r) {
         return Ok(Value::Vec3(match op {
-            BinOpKind::Add => [a[0]+b[0], a[1]+b[1], a[2]+b[2]],
-            BinOpKind::Sub => [a[0]-b[0], a[1]-b[1], a[2]-b[2]],
-            BinOpKind::Mul => [a[0]*b[0], a[1]*b[1], a[2]*b[2]],
-            BinOpKind::Div => [a[0]/b[0], a[1]/b[1], a[2]/b[2]],
+            BinOpKind::Add => [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
+            BinOpKind::Sub => [a[0] - b[0], a[1] - b[1], a[2] - b[2]],
+            BinOpKind::Mul => [a[0] * b[0], a[1] * b[1], a[2] * b[2]],
+            BinOpKind::Div => [a[0] / b[0], a[1] / b[1], a[2] / b[2]],
             _ => return rt_err!("operator not supported for vec3"),
         }));
     }
@@ -3135,7 +4050,7 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
     // Vec3 * scalar.
     if let (Value::Vec3(v), ref s) | (ref s, Value::Vec3(v)) = (&l, &r) {
         if let Some(s) = s.as_f64().map(|f| f as f32) {
-            return Ok(Value::Vec3([v[0]*s, v[1]*s, v[2]*s]));
+            return Ok(Value::Vec3([v[0] * s, v[1] * s, v[2] * s]));
         }
     }
 
@@ -3149,7 +4064,9 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
         BinOpKind::Ge => l.as_f64().zip(r.as_f64()).map(|(a, b)| a >= b),
         _ => None,
     };
-    if let Some(b) = cmp_result { return Ok(Value::Bool(b)); }
+    if let Some(b) = cmp_result {
+        return Ok(Value::Bool(b));
+    }
 
     // Numeric arithmetic — promote to widest common type.
     match (&l, &r) {
@@ -3182,12 +4099,16 @@ fn arith_f64(op: BinOpKind, a: f64, b: f64) -> Result<f64, RuntimeError> {
         BinOpKind::Sub => a - b,
         BinOpKind::Mul => a * b,
         BinOpKind::Div => {
-            if b == 0.0 { return rt_err!("division by zero"); }
+            if b == 0.0 {
+                return rt_err!("division by zero");
+            }
             a / b
         }
         BinOpKind::Rem => a % b,
         BinOpKind::FloorDiv => {
-            if b == 0.0 { return rt_err!("floor division by zero"); }
+            if b == 0.0 {
+                return rt_err!("floor division by zero");
+            }
             (a / b).floor()
         }
         _ => return rt_err!("operator {:?} not defined for floats", op),
@@ -3196,35 +4117,39 @@ fn arith_f64(op: BinOpKind, a: f64, b: f64) -> Result<f64, RuntimeError> {
 
 fn arith_i64(op: BinOpKind, a: i64, b: i64) -> Result<i64, RuntimeError> {
     Ok(match op {
-        BinOpKind::Add    => a.wrapping_add(b),
-        BinOpKind::Sub    => a.wrapping_sub(b),
-        BinOpKind::Mul    => a.wrapping_mul(b),
-        BinOpKind::Div    => {
-            if b == 0 { return rt_err!("division by zero"); }
+        BinOpKind::Add => a.wrapping_add(b),
+        BinOpKind::Sub => a.wrapping_sub(b),
+        BinOpKind::Mul => a.wrapping_mul(b),
+        BinOpKind::Div => {
+            if b == 0 {
+                return rt_err!("division by zero");
+            }
             a / b
         }
-        BinOpKind::Rem    => {
-            if b == 0 { return rt_err!("modulo by zero"); }
+        BinOpKind::Rem => {
+            if b == 0 {
+                return rt_err!("modulo by zero");
+            }
             a % b
         }
         BinOpKind::BitAnd => a & b,
-        BinOpKind::BitOr  => a | b,
+        BinOpKind::BitOr => a | b,
         BinOpKind::BitXor => a ^ b,
-        BinOpKind::Shl    => a << (b as u32),
-        BinOpKind::Shr    => a >> (b as u32),
+        BinOpKind::Shl => a << (b as u32),
+        BinOpKind::Shr => a >> (b as u32),
         _ => return rt_err!("operator not defined for integers"),
     })
 }
 
 fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::I32(x), Value::I32(y))   => x == y,
-        (Value::I64(x), Value::I64(y))   => x == y,
-        (Value::F32(x), Value::F32(y))   => x == y,
-        (Value::F64(x), Value::F64(y))   => x == y,
+        (Value::I32(x), Value::I32(y)) => x == y,
+        (Value::I64(x), Value::I64(y)) => x == y,
+        (Value::F32(x), Value::F32(y)) => x == y,
+        (Value::F64(x), Value::F64(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Str(x), Value::Str(y))   => x == y,
-        (Value::Unit, Value::Unit)        => true,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Unit, Value::Unit) => true,
         _ => false,
     }
 }
@@ -3232,14 +4157,23 @@ fn value_eq(a: &Value, b: &Value) -> bool {
 /// Compute the flat index into a tensor given multi-dimensional indices.
 fn tensor_flat_index(shape: &[usize], indices: &[Value]) -> Result<usize, RuntimeError> {
     if indices.len() != shape.len() {
-        return rt_err!("tensor has rank {} but {} indices given", shape.len(), indices.len());
+        return rt_err!(
+            "tensor has rank {} but {} indices given",
+            shape.len(),
+            indices.len()
+        );
     }
     let mut flat = 0;
     let mut stride = 1;
     for (i, (&dim, idx)) in shape.iter().zip(indices).enumerate().rev() {
         let idx_val = idx.as_i64().unwrap_or(0) as usize;
         if idx_val >= dim {
-            return rt_err!("index {} out of bounds for dimension {} (size {})", idx_val, i, dim);
+            return rt_err!(
+                "index {} out of bounds for dimension {} (size {})",
+                idx_val,
+                i,
+                dim
+            );
         }
         flat += idx_val * stride;
         stride *= dim;
@@ -3249,13 +4183,16 @@ fn tensor_flat_index(shape: &[usize], indices: &[Value]) -> Result<usize, Runtim
 
 /// Vec swizzle: extract x/y/z/w components or multi-component swizzles.
 fn swizzle_vec(components: &[f32], field: &str) -> Result<Value, String> {
-    let mapped: Vec<f32> = field.chars().map(|c| match c {
-        'x' | 'r' => components.get(0).copied(),
-        'y' | 'g' => components.get(1).copied(),
-        'z' | 'b' => components.get(2).copied(),
-        'w' | 'a' => components.get(3).copied(),
-        _ => None,
-    }).collect::<Option<Vec<_>>>()
+    let mapped: Vec<f32> = field
+        .chars()
+        .map(|c| match c {
+            'x' | 'r' => components.get(0).copied(),
+            'y' | 'g' => components.get(1).copied(),
+            'z' | 'b' => components.get(2).copied(),
+            'w' | 'a' => components.get(3).copied(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
         .ok_or_else(|| format!("invalid swizzle `{field}`"))?;
     Ok(match mapped.len() {
         1 => Value::F32(mapped[0]),
@@ -3269,7 +4206,7 @@ fn swizzle_vec(components: &[f32], field: &str) -> Result<Value, String> {
 fn title_case(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
-        None    => String::new(),
+        None => String::new(),
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
     }
 }
@@ -3283,12 +4220,25 @@ pub(crate) fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
     let len = a.len().max(b.len());
     let mut result = vec![0usize; len];
     for i in 0..len {
-        let da = if i < len - a.len() { 1 } else { a[i - (len - a.len())] };
-        let db = if i < len - b.len() { 1 } else { b[i - (len - b.len())] };
-        result[i] = if da == db { da }
-                    else if da == 1 { db }
-                    else if db == 1 { da }
-                    else { return None; };
+        let da = if i < len - a.len() {
+            1
+        } else {
+            a[i - (len - a.len())]
+        };
+        let db = if i < len - b.len() {
+            1
+        } else {
+            b[i - (len - b.len())]
+        };
+        result[i] = if da == db {
+            da
+        } else if da == 1 {
+            db
+        } else if db == 1 {
+            da
+        } else {
+            return None;
+        };
     }
     Some(result)
 }
@@ -3299,14 +4249,14 @@ pub(crate) fn broadcast_index(flat: usize, result_shape: &[usize], src_shape: &[
     let len = result_shape.len();
     let off = len - src_shape.len();
     let mut src_idx = 0usize;
-    let mut stride  = 1usize;
-    let mut rem     = flat;
+    let mut stride = 1usize;
+    let mut rem = flat;
 
     // Decompose flat index into multi-dim, then re-compose for src.
     let mut multi = vec![0usize; len];
     for i in (0..len).rev() {
         multi[i] = rem % result_shape[i];
-        rem      /= result_shape[i];
+        rem /= result_shape[i];
     }
 
     let mut src_strides = vec![1usize; src_shape.len()];
@@ -3352,9 +4302,7 @@ where
     }
 
     // Stack: all outputs must have the same shape
-    let out_shape = outputs.first()
-        .map(|t| t.shape.clone())
-        .unwrap_or_default();
+    let out_shape = outputs.first().map(|t| t.shape.clone()).unwrap_or_default();
     let out_n: usize = out_shape.iter().product::<usize>().max(1);
     let mut stacked = Vec::with_capacity(batch * out_n);
     for t in &outputs {
@@ -3371,10 +4319,16 @@ where
 
 /// Value noise in [0, 1] — cheap, no external dependency.
 pub fn value_noise_2d(x: f32, y: f32) -> f32 {
-    fn fade(t: f32) -> f32 { t * t * t * (t * (t * 6.0 - 15.0) + 10.0) }
-    fn lerp(a: f32, b: f32, t: f32) -> f32 { a + t * (b - a) }
+    fn fade(t: f32) -> f32 {
+        t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+    }
+    fn lerp(a: f32, b: f32, t: f32) -> f32 {
+        a + t * (b - a)
+    }
     fn hash(ix: i32, iy: i32) -> f32 {
-        let n = ix.wrapping_mul(1619).wrapping_add(iy.wrapping_mul(31337))
+        let n = ix
+            .wrapping_mul(1619)
+            .wrapping_add(iy.wrapping_mul(31337))
             .wrapping_mul(1013904223i32);
         (n as u32 as f32) / u32::MAX as f32
     }
@@ -3387,14 +4341,16 @@ pub fn value_noise_2d(x: f32, y: f32) -> f32 {
     let uy = fade(fy);
 
     lerp(
-        lerp(hash(ix, iy),   hash(ix + 1, iy),   ux),
-        lerp(hash(ix, iy+1), hash(ix + 1, iy+1), ux),
+        lerp(hash(ix, iy), hash(ix + 1, iy), ux),
+        lerp(hash(ix, iy + 1), hash(ix + 1, iy + 1), ux),
         uy,
     )
 }
 
 /// White noise uniform in [0, 1].
-pub fn white_noise() -> f32 { pseudo_rand() }
+pub fn white_noise() -> f32 {
+    pseudo_rand()
+}
 
 /// Fractional Brownian Motion — sum of octaves of value noise.
 pub fn fbm_2d(x: f32, y: f32, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
@@ -3402,8 +4358,8 @@ pub fn fbm_2d(x: f32, y: f32, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
     let mut amp = 0.5_f32;
     let mut freq = 1.0_f32;
     for _ in 0..octaves {
-        val  += amp * value_noise_2d(x * freq, y * freq);
-        amp  *= gain;
+        val += amp * value_noise_2d(x * freq, y * freq);
+        amp *= gain;
         freq *= lacunarity;
     }
     val
@@ -3419,21 +4375,21 @@ pub fn fbm_2d(x: f32, y: f32, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
 /// Returns (advantages, returns) each of length T.
 pub fn gae(
     rewards: &[f32],
-    values:  &[f32],
-    dones:   &[f32],  // 1.0 if episode ended, 0.0 otherwise
-    gamma:   f32,
-    lam:     f32,
+    values: &[f32],
+    dones: &[f32], // 1.0 if episode ended, 0.0 otherwise
+    gamma: f32,
+    lam: f32,
     last_value: f32,
 ) -> (Vec<f32>, Vec<f32>) {
     let t = rewards.len();
     let mut advantages = vec![0.0_f32; t];
-    let mut last_gae   = 0.0_f32;
-    let mut next_val   = last_value;
+    let mut last_gae = 0.0_f32;
+    let mut next_val = last_value;
 
     for i in (0..t).rev() {
-        let mask  = 1.0 - dones[i];
+        let mask = 1.0 - dones[i];
         let delta = rewards[i] + gamma * next_val * mask - values[i];
-        last_gae  = delta + gamma * lam * mask * last_gae;
+        last_gae = delta + gamma * lam * mask * last_gae;
         advantages[i] = last_gae;
         next_val = values[i];
     }
@@ -3448,30 +4404,37 @@ pub fn gae(
 pub fn ppo_loss(
     log_probs_old: &[f32],
     log_probs_new: &[f32],
-    advantages:    &[f32],
-    returns:       &[f32],
-    values:        &[f32],
-    clip_eps:      f32,
-    vf_coef:       f32,
-    ent_coef:      f32,
-    entropy:       &[f32],
+    advantages: &[f32],
+    returns: &[f32],
+    values: &[f32],
+    clip_eps: f32,
+    vf_coef: f32,
+    ent_coef: f32,
+    entropy: &[f32],
 ) -> (f32, f32, f32) {
     let n = log_probs_old.len() as f32;
 
     // Policy loss (clipped surrogate)
-    let policy_loss = log_probs_old.iter().zip(log_probs_new).zip(advantages)
+    let policy_loss = log_probs_old
+        .iter()
+        .zip(log_probs_new)
+        .zip(advantages)
         .map(|((old, new), adv)| {
-            let ratio  = (new - old).exp();
-            let surr1  = ratio * adv;
-            let surr2  = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * adv;
+            let ratio = (new - old).exp();
+            let surr1 = ratio * adv;
+            let surr2 = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * adv;
             -surr1.min(surr2)
         })
-        .sum::<f32>() / n;
+        .sum::<f32>()
+        / n;
 
     // Value function loss (MSE, clipped)
-    let value_loss = returns.iter().zip(values)
+    let value_loss = returns
+        .iter()
+        .zip(values)
         .map(|(r, v)| (r - v).powi(2))
-        .sum::<f32>() / n;
+        .sum::<f32>()
+        / n;
 
     // Entropy bonus
     let mean_entropy = entropy.iter().sum::<f32>() / n;
@@ -3490,21 +4453,27 @@ pub fn ppo_loss(
 /// Rigid body state for a single entity.
 #[derive(Debug, Clone, Default)]
 pub struct RigidBody {
-    pub pos:      [f32; 3],
-    pub vel:      [f32; 3],
-    pub mass:     f32,
-    pub drag:     f32,        // linear damping coefficient
+    pub pos: [f32; 3],
+    pub vel: [f32; 3],
+    pub mass: f32,
+    pub drag: f32, // linear damping coefficient
     pub is_static: bool,
 }
 
 impl RigidBody {
     pub fn new(mass: f32) -> Self {
-        RigidBody { mass, drag: 0.02, ..Default::default() }
+        RigidBody {
+            mass,
+            drag: 0.02,
+            ..Default::default()
+        }
     }
 
     /// Semi-implicit Euler integration.
     pub fn integrate(&mut self, gravity: [f32; 3], dt: f32) {
-        if self.is_static { return; }
+        if self.is_static {
+            return;
+        }
         // a = F/m (gravity only here; external forces accumulated elsewhere)
         for i in 0..3 {
             self.vel[i] += gravity[i] * dt;
@@ -3515,9 +4484,13 @@ impl RigidBody {
 
     /// Apply an impulse directly to velocity: v += impulse / mass.
     pub fn apply_impulse(&mut self, impulse: [f32; 3]) {
-        if self.is_static || self.mass == 0.0 { return; }
+        if self.is_static || self.mass == 0.0 {
+            return;
+        }
         let inv_mass = 1.0 / self.mass;
-        for i in 0..3 { self.vel[i] += impulse[i] * inv_mass; }
+        for i in 0..3 {
+            self.vel[i] += impulse[i] * inv_mass;
+        }
     }
 }
 
@@ -3532,25 +4505,31 @@ impl AabbCollider {
     pub fn overlaps(&self, pos_a: [f32; 3], other: &AabbCollider, pos_b: [f32; 3]) -> bool {
         for i in 0..3 {
             let dist = (pos_a[i] - pos_b[i]).abs();
-            if dist > self.half_extents[i] + other.half_extents[i] { return false; }
+            if dist > self.half_extents[i] + other.half_extents[i] {
+                return false;
+            }
         }
         true
     }
 
     /// Compute penetration depth and normal for collision response.
     pub fn penetration(
-        &self, pos_a: [f32; 3],
-        other: &AabbCollider, pos_b: [f32; 3],
+        &self,
+        pos_a: [f32; 3],
+        other: &AabbCollider,
+        pos_b: [f32; 3],
     ) -> Option<([f32; 3], f32)> {
         let mut min_pen = f32::INFINITY;
-        let mut normal  = [0.0_f32; 3];
+        let mut normal = [0.0_f32; 3];
         for i in 0..3 {
-            let delta  = pos_b[i] - pos_a[i];
+            let delta = pos_b[i] - pos_a[i];
             let overlap = (self.half_extents[i] + other.half_extents[i]) - delta.abs();
-            if overlap <= 0.0 { return None; }
+            if overlap <= 0.0 {
+                return None;
+            }
             if overlap < min_pen {
                 min_pen = overlap;
-                normal  = [0.0; 3];
+                normal = [0.0; 3];
                 normal[i] = delta.signum();
             }
         }
@@ -3561,7 +4540,9 @@ impl AabbCollider {
 /// Resolve elastic collision between two rigid bodies.
 pub fn resolve_collision(a: &mut RigidBody, b: &mut RigidBody, normal: [f32; 3], restitution: f32) {
     let rel_vel: f32 = (0..3).map(|i| (a.vel[i] - b.vel[i]) * normal[i]).sum();
-    if rel_vel > 0.0 { return; } // separating
+    if rel_vel > 0.0 {
+        return;
+    } // separating
 
     let inv_a = if a.is_static { 0.0 } else { 1.0 / a.mass };
     let inv_b = if b.is_static { 0.0 } else { 1.0 / b.mass };
@@ -3575,27 +4556,45 @@ pub fn resolve_collision(a: &mut RigidBody, b: &mut RigidBody, normal: [f32; 3],
 
 // ── Matrix arithmetic helpers ──────────────────────────────────────────────
 
-fn mat3_mul(a: [[f32;3];3], b: [[f32;3];3]) -> [[f32;3];3] {
+fn mat3_mul(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
     let mut c = [[0.0_f32; 3]; 3];
-    for i in 0..3 { for j in 0..3 { for k in 0..3 { c[i][j] += a[i][k] * b[k][j]; } } }
+    for i in 0..3 {
+        for j in 0..3 {
+            for k in 0..3 {
+                c[i][j] += a[i][k] * b[k][j];
+            }
+        }
+    }
     c
 }
 
-fn mat4_mul(a: [[f32;4];4], b: [[f32;4];4]) -> [[f32;4];4] {
+fn mat4_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let mut c = [[0.0_f32; 4]; 4];
-    for i in 0..4 { for j in 0..4 { for k in 0..4 { c[i][j] += a[i][k] * b[k][j]; } } }
+    for i in 0..4 {
+        for j in 0..4 {
+            for k in 0..4 {
+                c[i][j] += a[i][k] * b[k][j];
+            }
+        }
+    }
     c
 }
 
-fn mat3_vec3_mul(m: [[f32;3];3], v: [f32;3]) -> [f32;3] {
-    [m[0][0]*v[0]+m[0][1]*v[1]+m[0][2]*v[2],
-     m[1][0]*v[0]+m[1][1]*v[1]+m[1][2]*v[2],
-     m[2][0]*v[0]+m[2][1]*v[1]+m[2][2]*v[2]]
+fn mat3_vec3_mul(m: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
 }
 
-fn mat4_vec4_mul(m: [[f32;4];4], v: [f32;4]) -> [f32;4] {
+fn mat4_vec4_mul(m: [[f32; 4]; 4], v: [f32; 4]) -> [f32; 4] {
     let mut r = [0.0_f32; 4];
-    for i in 0..4 { for j in 0..4 { r[i] += m[i][j] * v[j]; } }
+    for i in 0..4 {
+        for j in 0..4 {
+            r[i] += m[i][j] * v[j];
+        }
+    }
     r
 }
 
@@ -3605,12 +4604,17 @@ static RAND_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 fn pseudo_rand() -> f32 {
     use std::sync::atomic::Ordering::Relaxed;
-    let s = RAND_STATE.fetch_add(2891336453, Relaxed).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let s = RAND_STATE
+        .fetch_add(2891336453, Relaxed)
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     RAND_STATE.store(s, Relaxed);
     (s >> 33) as f32 / u32::MAX as f32
 }
 
-fn pseudo_rand_small() -> f32 { pseudo_rand() * 2.0 - 1.0 }
+fn pseudo_rand_small() -> f32 {
+    pseudo_rand() * 2.0 - 1.0
+}
 
 fn rand_normal(mean: f32, std: f32) -> f32 {
     // Box–Muller (two uniform → one normal).
@@ -3625,9 +4629,7 @@ fn rand_normal(mean: f32, std: f32) -> f32 {
 // =============================================================================
 
 /// Convenience: load a program, evaluate a named function, and return the result.
-pub fn jules_run(program: &Program, entry: &str, args: Vec<Value>)
-    -> Result<Value, RuntimeError>
-{
+pub fn jules_run(program: &Program, entry: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
     let mut interp = Interpreter::new();
     interp.load_program(program);
     interp.call_fn(entry, args)
@@ -3638,9 +4640,17 @@ pub fn jules_train(program: &Program) -> Result<Vec<TrainingStats>, RuntimeError
     let mut interp = Interpreter::new();
     interp.load_program(program);
     let mut all_stats = Vec::new();
-    let trains: Vec<_> = program.items.iter().filter_map(|i| {
-        if let Item::Train(t) = i { Some(t.clone()) } else { None }
-    }).collect();
+    let trains: Vec<_> = program
+        .items
+        .iter()
+        .filter_map(|i| {
+            if let Item::Train(t) = i {
+                Some(t.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
     let mut env = Env::new();
     for t in &trains {
         let stats = interp.run_training(t, &mut env)?;
@@ -3659,24 +4669,29 @@ mod tests {
     use crate::ast::*;
     use crate::lexer::Span;
 
-    fn sp() -> Span { Span::dummy() }
+    fn sp() -> Span {
+        Span::dummy()
+    }
 
     // ── Value helpers ─────────────────────────────────────────────────────────
 
-    #[test] fn test_value_as_f64() {
+    #[test]
+    fn test_value_as_f64() {
         assert_eq!(Value::F32(1.5).as_f64(), Some(1.5));
         assert_eq!(Value::I32(7).as_f64(), Some(7.0));
         assert_eq!(Value::Bool(true).as_f64(), None);
     }
 
-    #[test] fn test_value_is_truthy() {
-        assert!( Value::Bool(true).is_truthy());
+    #[test]
+    fn test_value_is_truthy() {
+        assert!(Value::Bool(true).is_truthy());
         assert!(!Value::Bool(false).is_truthy());
-        assert!( Value::I32(1).is_truthy());
+        assert!(Value::I32(1).is_truthy());
         assert!(!Value::I32(0).is_truthy());
     }
 
-    #[test] fn test_value_display() {
+    #[test]
+    fn test_value_display() {
         assert_eq!(Value::I32(42).to_string(), "42");
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Unit.to_string(), "()");
@@ -3685,7 +4700,8 @@ mod tests {
 
     // ── Tensor operations ─────────────────────────────────────────────────────
 
-    #[test] fn test_tensor_matmul_2x2() {
+    #[test]
+    fn test_tensor_matmul_2x2() {
         // [1 2; 3 4] @ [1 0; 0 1] = [1 2; 3 4]
         let a = Tensor::from_data(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]);
         let b = Tensor::from_data(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0]); // identity
@@ -3698,13 +4714,15 @@ mod tests {
         assert!((d[3] - 4.0).abs() < 1e-5);
     }
 
-    #[test] fn test_tensor_matmul_shape_mismatch() {
+    #[test]
+    fn test_tensor_matmul_shape_mismatch() {
         let a = Tensor::from_data(vec![2, 3], vec![0.0; 6]);
         let b = Tensor::from_data(vec![2, 2], vec![0.0; 4]);
         assert!(a.matmul(&b).is_err());
     }
 
-    #[test] fn test_tensor_hadamard_mul() {
+    #[test]
+    fn test_tensor_hadamard_mul() {
         let a = Tensor::from_data(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
         let b = Tensor::from_data(vec![4], vec![2.0, 2.0, 2.0, 2.0]);
         let c = a.hadamard_mul(&b).unwrap();
@@ -3712,7 +4730,8 @@ mod tests {
         assert_eq!(d, &[2.0, 4.0, 6.0, 8.0]);
     }
 
-    #[test] fn test_tensor_concat_axis0() {
+    #[test]
+    fn test_tensor_concat_axis0() {
         let a = Tensor::from_data(vec![2, 3], vec![1.0; 6]);
         let b = Tensor::from_data(vec![3, 3], vec![2.0; 9]);
         let c = a.concat(&b).unwrap();
@@ -3720,47 +4739,54 @@ mod tests {
         assert_eq!(c.numel(), 15);
     }
 
-    #[test] fn test_tensor_concat_inner_mismatch() {
+    #[test]
+    fn test_tensor_concat_inner_mismatch() {
         let a = Tensor::from_data(vec![2, 3], vec![0.0; 6]);
         let b = Tensor::from_data(vec![2, 4], vec![0.0; 8]);
         assert!(a.concat(&b).is_err());
     }
 
-    #[test] fn test_tensor_activation_relu() {
+    #[test]
+    fn test_tensor_activation_relu() {
         let t = Tensor::from_data(vec![4], vec![-1.0, 0.0, 1.0, 2.0]);
         let out = t.apply_activation(&Activation::Relu);
         assert_eq!(out.cpu_data(), &[0.0, 0.0, 1.0, 2.0]);
     }
 
-    #[test] fn test_tensor_activation_sigmoid() {
+    #[test]
+    fn test_tensor_activation_sigmoid() {
         let t = Tensor::from_data(vec![1], vec![0.0]);
         let out = t.apply_activation(&Activation::Sigmoid);
         assert!((out.cpu_data()[0] - 0.5).abs() < 1e-5);
     }
 
-    #[test] fn test_tensor_softmax_sums_to_one() {
+    #[test]
+    fn test_tensor_softmax_sums_to_one() {
         let t = Tensor::from_data(vec![1, 4], vec![1.0, 2.0, 3.0, 4.0]);
         let out = t.apply_activation(&Activation::Softmax);
         let sum: f32 = out.cpu_data().iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "softmax sum = {sum}");
     }
 
-    #[test] fn test_tensor_mse_loss() {
+    #[test]
+    fn test_tensor_mse_loss() {
         let pred = Tensor::from_data(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
-        let tgt  = Tensor::from_data(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
+        let tgt = Tensor::from_data(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
         let loss = pred.mse_loss(&tgt).unwrap();
         assert!(loss.abs() < 1e-6);
     }
 
-    #[test] fn test_tensor_grad_attach() {
+    #[test]
+    fn test_tensor_grad_attach() {
         let mut t = Tensor::zeros(vec![3, 3]);
         assert!(t.grad.is_none());
         t.enable_grad();
         assert!(t.grad.is_some());
     }
 
-    #[test] fn test_tensor_transpose() {
-        let t = Tensor::from_data(vec![2, 3], vec![1.0,2.0,3.0,4.0,5.0,6.0]);
+    #[test]
+    fn test_tensor_transpose() {
+        let t = Tensor::from_data(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let t2 = t.transpose().unwrap();
         assert_eq!(t2.shape, vec![3, 2]);
         assert_eq!(t2.cpu_data()[0], 1.0);
@@ -3769,7 +4795,8 @@ mod tests {
 
     // ── ECS World ─────────────────────────────────────────────────────────────
 
-    #[test] fn test_ecs_spawn_despawn() {
+    #[test]
+    fn test_ecs_spawn_despawn() {
         let mut world = EcsWorld::default();
         let e1 = world.spawn();
         let e2 = world.spawn();
@@ -3779,7 +4806,8 @@ mod tests {
         assert!(world.is_alive(e2));
     }
 
-    #[test] fn test_ecs_component_insert_get() {
+    #[test]
+    fn test_ecs_component_insert_get() {
         let mut world = EcsWorld::default();
         let e = world.spawn();
         world.insert_component(e, "health", Value::F32(100.0));
@@ -3787,7 +4815,8 @@ mod tests {
         assert!(matches!(val, Value::F32(v) if (v - 100.0).abs() < 1e-5));
     }
 
-    #[test] fn test_ecs_query_with_filter() {
+    #[test]
+    fn test_ecs_query_with_filter() {
         let mut world = EcsWorld::default();
         let e1 = world.spawn();
         let e2 = world.spawn();
@@ -3800,18 +4829,20 @@ mod tests {
         assert_eq!(with_vel[0], e1);
     }
 
-    #[test] fn test_ecs_query_without() {
+    #[test]
+    fn test_ecs_query_without() {
         let mut world = EcsWorld::default();
         let alive = world.spawn();
-        let dead  = world.spawn();
+        let dead = world.spawn();
         world.insert_component(alive, "Health", Value::F32(100.0));
-        world.insert_component(dead,  "Health", Value::F32(0.0));
-        world.insert_component(dead,  "Dead",   Value::Unit);
+        world.insert_component(dead, "Health", Value::F32(0.0));
+        world.insert_component(dead, "Dead", Value::Unit);
         let result = world.query(&["Health".into()], &["Dead".into()]);
         assert_eq!(result, vec![alive]);
     }
 
-    #[test] fn test_ecs_events() {
+    #[test]
+    fn test_ecs_events() {
         let mut world = EcsWorld::default();
         let e = world.spawn();
         world.emit_event("killed", e);
@@ -3824,7 +4855,9 @@ mod tests {
 
     // ── Interpreter ───────────────────────────────────────────────────────────
 
-    fn mk_interp() -> Interpreter { Interpreter::new() }
+    fn mk_interp() -> Interpreter {
+        Interpreter::new()
+    }
 
     fn eval(expr: &Expr) -> Value {
         let mut i = mk_interp();
@@ -3832,109 +4865,211 @@ mod tests {
         i.eval_expr(expr, &mut env).unwrap()
     }
 
-    #[test] fn test_interp_int_lit() {
-        assert!(matches!(eval(&Expr::IntLit { span: sp(), value: 42 }), Value::I32(42)));
+    #[test]
+    fn test_interp_int_lit() {
+        assert!(matches!(
+            eval(&Expr::IntLit {
+                span: sp(),
+                value: 42
+            }),
+            Value::I32(42)
+        ));
     }
 
-    #[test] fn test_interp_float_lit() {
-        assert!(matches!(eval(&Expr::FloatLit { span: sp(), value: 3.14 }), Value::F32(_)));
+    #[test]
+    fn test_interp_float_lit() {
+        assert!(matches!(
+            eval(&Expr::FloatLit {
+                span: sp(),
+                value: 3.14
+            }),
+            Value::F32(_)
+        ));
     }
 
-    #[test] fn test_interp_bool_lit() {
-        assert!(matches!(eval(&Expr::BoolLit { span: sp(), value: true }), Value::Bool(true)));
+    #[test]
+    fn test_interp_bool_lit() {
+        assert!(matches!(
+            eval(&Expr::BoolLit {
+                span: sp(),
+                value: true
+            }),
+            Value::Bool(true)
+        ));
     }
 
-    #[test] fn test_interp_binop_add() {
+    #[test]
+    fn test_interp_binop_add() {
         let e = Expr::BinOp {
-            span: sp(), op: BinOpKind::Add,
-            lhs: Box::new(Expr::IntLit { span: sp(), value: 3 }),
-            rhs: Box::new(Expr::IntLit { span: sp(), value: 4 }),
+            span: sp(),
+            op: BinOpKind::Add,
+            lhs: Box::new(Expr::IntLit {
+                span: sp(),
+                value: 3,
+            }),
+            rhs: Box::new(Expr::IntLit {
+                span: sp(),
+                value: 4,
+            }),
         };
         assert!(matches!(eval(&e), Value::I32(7)));
     }
 
-    #[test] fn test_interp_binop_compare() {
+    #[test]
+    fn test_interp_binop_compare() {
         let e = Expr::BinOp {
-            span: sp(), op: BinOpKind::Lt,
-            lhs: Box::new(Expr::IntLit { span: sp(), value: 3 }),
-            rhs: Box::new(Expr::IntLit { span: sp(), value: 5 }),
+            span: sp(),
+            op: BinOpKind::Lt,
+            lhs: Box::new(Expr::IntLit {
+                span: sp(),
+                value: 3,
+            }),
+            rhs: Box::new(Expr::IntLit {
+                span: sp(),
+                value: 5,
+            }),
         };
         assert!(matches!(eval(&e), Value::Bool(true)));
     }
 
-    #[test] fn test_interp_binop_div_zero() {
+    #[test]
+    fn test_interp_binop_div_zero() {
         let e = Expr::BinOp {
-            span: sp(), op: BinOpKind::Div,
-            lhs: Box::new(Expr::IntLit { span: sp(), value: 10 }),
-            rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+            span: sp(),
+            op: BinOpKind::Div,
+            lhs: Box::new(Expr::IntLit {
+                span: sp(),
+                value: 10,
+            }),
+            rhs: Box::new(Expr::IntLit {
+                span: sp(),
+                value: 0,
+            }),
         };
         let mut i = mk_interp();
         let mut env = Env::new();
         assert!(i.eval_expr(&e, &mut env).is_err());
     }
 
-    #[test] fn test_interp_vec3_ctor() {
+    #[test]
+    fn test_interp_vec3_ctor() {
         let e = Expr::VecCtor {
-            span: sp(), size: VecSize::N3,
+            span: sp(),
+            size: VecSize::N3,
             elems: vec![
-                Expr::FloatLit { span: sp(), value: 1.0 },
-                Expr::FloatLit { span: sp(), value: 2.0 },
-                Expr::FloatLit { span: sp(), value: 3.0 },
+                Expr::FloatLit {
+                    span: sp(),
+                    value: 1.0,
+                },
+                Expr::FloatLit {
+                    span: sp(),
+                    value: 2.0,
+                },
+                Expr::FloatLit {
+                    span: sp(),
+                    value: 3.0,
+                },
             ],
         };
         assert!(matches!(eval(&e), Value::Vec3([1.0, 2.0, 3.0])));
     }
 
-    #[test] fn test_interp_unop_neg() {
+    #[test]
+    fn test_interp_unop_neg() {
         let e = Expr::UnOp {
-            span: sp(), op: UnOpKind::Neg,
-            expr: Box::new(Expr::FloatLit { span: sp(), value: 5.0 }),
+            span: sp(),
+            op: UnOpKind::Neg,
+            expr: Box::new(Expr::FloatLit {
+                span: sp(),
+                value: 5.0,
+            }),
         };
         assert!(matches!(eval(&e), Value::F32(v) if (v + 5.0).abs() < 1e-6));
     }
 
-    #[test] fn test_interp_let_and_ident() {
+    #[test]
+    fn test_interp_let_and_ident() {
         let mut i = mk_interp();
         let mut env = Env::new();
         let stmt = Stmt::Let {
-            span:    sp(),
-            pattern: Pattern::Ident { span: sp(), name: "x".into(), mutable: false },
-            ty:      None,
-            init:    Some(Expr::IntLit { span: sp(), value: 99 }),
+            span: sp(),
+            pattern: Pattern::Ident {
+                span: sp(),
+                name: "x".into(),
+                mutable: false,
+            },
+            ty: None,
+            init: Some(Expr::IntLit {
+                span: sp(),
+                value: 99,
+            }),
             mutable: false,
         };
         i.eval_stmt(&stmt, &mut env).unwrap();
-        let v = i.eval_expr(&Expr::Ident { span: sp(), name: "x".into() }, &mut env).unwrap();
+        let v = i
+            .eval_expr(
+                &Expr::Ident {
+                    span: sp(),
+                    name: "x".into(),
+                },
+                &mut env,
+            )
+            .unwrap();
         assert!(matches!(v, Value::I32(99)));
     }
 
-    #[test] fn test_interp_if_expr() {
+    #[test]
+    fn test_interp_if_expr() {
         let mut i = mk_interp();
         let mut env = Env::new();
         let e = Expr::IfExpr {
             span: sp(),
-            cond: Box::new(Expr::BoolLit { span: sp(), value: true }),
+            cond: Box::new(Expr::BoolLit {
+                span: sp(),
+                value: true,
+            }),
             then: Box::new(Block {
-                span: sp(), stmts: vec![],
-                tail: Some(Box::new(Expr::IntLit { span: sp(), value: 1 })),
+                span: sp(),
+                stmts: vec![],
+                tail: Some(Box::new(Expr::IntLit {
+                    span: sp(),
+                    value: 1,
+                })),
             }),
             else_: Some(Box::new(Block {
-                span: sp(), stmts: vec![],
-                tail: Some(Box::new(Expr::IntLit { span: sp(), value: 2 })),
+                span: sp(),
+                stmts: vec![],
+                tail: Some(Box::new(Expr::IntLit {
+                    span: sp(),
+                    value: 2,
+                })),
             })),
         };
         assert!(matches!(i.eval_expr(&e, &mut env).unwrap(), Value::I32(1)));
     }
 
-    #[test] fn test_interp_return_propagation() {
+    #[test]
+    fn test_interp_return_propagation() {
         let mut i = mk_interp();
         let mut env = Env::new();
         let block = Block {
             span: sp(),
             stmts: vec![
-                Stmt::Return { span: sp(), value: Some(Expr::IntLit { span: sp(), value: 42 }) },
-                Stmt::Expr   { span: sp(), has_semi: true,
-                               expr: Expr::IntLit { span: sp(), value: 0 } },
+                Stmt::Return {
+                    span: sp(),
+                    value: Some(Expr::IntLit {
+                        span: sp(),
+                        value: 42,
+                    }),
+                },
+                Stmt::Expr {
+                    span: sp(),
+                    has_semi: true,
+                    expr: Expr::IntLit {
+                        span: sp(),
+                        value: 0,
+                    },
+                },
             ],
             tail: None,
         };
@@ -3942,7 +5077,8 @@ mod tests {
         assert!(matches!(r, Value::Return(v) if matches!(*v, Value::I32(42))));
     }
 
-    #[test] fn test_interp_matmul_tensors() {
+    #[test]
+    fn test_interp_matmul_tensors() {
         let mut i = mk_interp();
         let mut env = Env::new();
         let a = Tensor::from_data(vec![2, 3], vec![1.0; 6]);
@@ -3951,16 +5087,25 @@ mod tests {
         env.set_local("B", Value::Tensor(Arc::new(RwLock::new(b))));
         let e = Expr::MatMul {
             span: sp(),
-            lhs: Box::new(Expr::Ident { span: sp(), name: "A".into() }),
-            rhs: Box::new(Expr::Ident { span: sp(), name: "B".into() }),
+            lhs: Box::new(Expr::Ident {
+                span: sp(),
+                name: "A".into(),
+            }),
+            rhs: Box::new(Expr::Ident {
+                span: sp(),
+                name: "B".into(),
+            }),
         };
         let result = i.eval_expr(&e, &mut env).unwrap();
         if let Value::Tensor(t) = result {
             assert_eq!(t.read().unwrap().shape, vec![2, 2]);
-        } else { panic!("expected tensor"); }
+        } else {
+            panic!("expected tensor");
+        }
     }
 
-    #[test] fn test_interp_range_for_loop() {
+    #[test]
+    fn test_interp_range_for_loop() {
         let mut i = mk_interp();
         let mut env = Env::new();
         // Accumulate sum of 0..5 into `acc`.
@@ -3969,29 +5114,53 @@ mod tests {
             stmts: vec![
                 Stmt::Let {
                     span: sp(),
-                    pattern: Pattern::Ident { span: sp(), name: "acc".into(), mutable: true },
+                    pattern: Pattern::Ident {
+                        span: sp(),
+                        name: "acc".into(),
+                        mutable: true,
+                    },
                     ty: None,
-                    init: Some(Expr::IntLit { span: sp(), value: 0 }),
+                    init: Some(Expr::IntLit {
+                        span: sp(),
+                        value: 0,
+                    }),
                     mutable: true,
                 },
                 Stmt::ForIn {
                     span: sp(),
-                    pattern: Pattern::Ident { span: sp(), name: "i".into(), mutable: false },
+                    pattern: Pattern::Ident {
+                        span: sp(),
+                        name: "i".into(),
+                        mutable: false,
+                    },
                     iter: Expr::Range {
                         span: sp(),
-                        lo: Some(Box::new(Expr::IntLit { span: sp(), value: 0 })),
-                        hi: Some(Box::new(Expr::IntLit { span: sp(), value: 5 })),
+                        lo: Some(Box::new(Expr::IntLit {
+                            span: sp(),
+                            value: 0,
+                        })),
+                        hi: Some(Box::new(Expr::IntLit {
+                            span: sp(),
+                            value: 5,
+                        })),
                         inclusive: false,
                     },
                     body: Block {
                         span: sp(),
                         stmts: vec![Stmt::Expr {
-                            span: sp(), has_semi: true,
+                            span: sp(),
+                            has_semi: true,
                             expr: Expr::Assign {
                                 span: sp(),
                                 op: AssignOpKind::AddAssign,
-                                target: Box::new(Expr::Ident { span: sp(), name: "acc".into() }),
-                                value:  Box::new(Expr::Ident { span: sp(), name: "i".into() }),
+                                target: Box::new(Expr::Ident {
+                                    span: sp(),
+                                    name: "acc".into(),
+                                }),
+                                value: Box::new(Expr::Ident {
+                                    span: sp(),
+                                    name: "i".into(),
+                                }),
                             },
                         }],
                         tail: None,
@@ -3999,23 +5168,45 @@ mod tests {
                     label: None,
                 },
             ],
-            tail: Some(Box::new(Expr::Ident { span: sp(), name: "acc".into() })),
+            tail: Some(Box::new(Expr::Ident {
+                span: sp(),
+                name: "acc".into(),
+            })),
         };
         let result = i.eval_block(&block, &mut env).unwrap();
-        assert!(matches!(result, Value::I32(10)), "0+1+2+3+4 = 10, got {result}");
+        assert!(
+            matches!(result, Value::I32(10)),
+            "0+1+2+3+4 = 10, got {result}"
+        );
     }
 
     // ── Neural network forward pass ───────────────────────────────────────────
 
-    #[test] fn test_nn_forward_pass() {
+    #[test]
+    fn test_nn_forward_pass() {
         let decl = ModelDecl {
-            span: sp(), attrs: vec![], name: "TestNet".into(),
+            span: sp(),
+            attrs: vec![],
+            name: "TestNet".into(),
             layers: vec![
-                ModelLayer::Input  { span: sp(), size: 4 },
-                ModelLayer::Dense  { span: sp(), units: 8, activation: Activation::Relu, bias: true },
-                ModelLayer::Output { span: sp(), units: 2, activation: Activation::Softmax },
+                ModelLayer::Input {
+                    span: sp(),
+                    size: 4,
+                },
+                ModelLayer::Dense {
+                    span: sp(),
+                    units: 8,
+                    activation: Activation::Relu,
+                    bias: true,
+                },
+                ModelLayer::Output {
+                    span: sp(),
+                    units: 2,
+                    activation: Activation::Softmax,
+                },
             ],
-            device: ModelDevice::Cpu, optimizer: None,
+            device: ModelDevice::Cpu,
+            optimizer: None,
         };
         let mut model = NnModel::from_decl(&decl);
         model.training = false;
@@ -4024,19 +5215,36 @@ mod tests {
         assert_eq!(out.shape, vec![1, 2]);
         // Softmax: outputs should sum to 1.
         let sum: f32 = out.cpu_data().iter().sum();
-        assert!((sum - 1.0).abs() < 1e-4, "output should be softmax, sum={sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-4,
+            "output should be softmax, sum={sum}"
+        );
     }
 
-    #[test] fn test_nn_dropout_training_mode() {
+    #[test]
+    fn test_nn_dropout_training_mode() {
         // In inference mode, dropout should be a no-op.
         let decl = ModelDecl {
-            span: sp(), attrs: vec![], name: "DropNet".into(),
+            span: sp(),
+            attrs: vec![],
+            name: "DropNet".into(),
             layers: vec![
-                ModelLayer::Input   { span: sp(), size: 4 },
-                ModelLayer::Dropout { span: sp(), rate: 0.0 },  // rate=0 → no drop
-                ModelLayer::Output  { span: sp(), units: 2, activation: Activation::Linear },
+                ModelLayer::Input {
+                    span: sp(),
+                    size: 4,
+                },
+                ModelLayer::Dropout {
+                    span: sp(),
+                    rate: 0.0,
+                }, // rate=0 → no drop
+                ModelLayer::Output {
+                    span: sp(),
+                    units: 2,
+                    activation: Activation::Linear,
+                },
             ],
-            device: ModelDevice::Cpu, optimizer: None,
+            device: ModelDevice::Cpu,
+            optimizer: None,
         };
         let mut model = NnModel::from_decl(&decl);
         let input = Tensor::from_data(vec![1, 4], vec![1.0; 4]);
@@ -4046,21 +5254,31 @@ mod tests {
 
     // ── Vec swizzle ───────────────────────────────────────────────────────────
 
-    #[test] fn test_swizzle_x() {
-        assert!(matches!(swizzle_vec(&[1.0, 2.0, 3.0], "x"), Ok(Value::F32(1.0))));
+    #[test]
+    fn test_swizzle_x() {
+        assert!(matches!(
+            swizzle_vec(&[1.0, 2.0, 3.0], "x"),
+            Ok(Value::F32(1.0))
+        ));
     }
 
-    #[test] fn test_swizzle_xyz() {
-        assert!(matches!(swizzle_vec(&[1.0, 2.0, 3.0], "xyz"), Ok(Value::Vec3(_))));
+    #[test]
+    fn test_swizzle_xyz() {
+        assert!(matches!(
+            swizzle_vec(&[1.0, 2.0, 3.0], "xyz"),
+            Ok(Value::Vec3(_))
+        ));
     }
 
-    #[test] fn test_swizzle_invalid() {
+    #[test]
+    fn test_swizzle_invalid() {
         assert!(swizzle_vec(&[1.0, 2.0], "q").is_err());
     }
 
     // ── Scope / environment ───────────────────────────────────────────────────
 
-    #[test] fn test_env_scoping() {
+    #[test]
+    fn test_env_scoping() {
         let mut env = Env::new();
         env.set_local("x", Value::I32(1));
         env.push();
@@ -4072,22 +5290,25 @@ mod tests {
 
     // ── Matrix multiply ───────────────────────────────────────────────────────
 
-    #[test] fn test_mat3_identity_mul() {
-        let id = [[1.0_f32,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]];
-        let a  = [[1.0_f32,2.0,3.0],[4.0,5.0,6.0],[7.0,8.0,9.0]];
-        let r  = mat3_mul(a, id);
+    #[test]
+    fn test_mat3_identity_mul() {
+        let id = [[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let a = [[1.0_f32, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]];
+        let r = mat3_mul(a, id);
         assert_eq!(r, a);
     }
 
-    #[test] fn test_mat3_vec3_mul() {
-        let id = [[1.0_f32,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]];
-        let v  = [3.0_f32, 5.0, 7.0];
+    #[test]
+    fn test_mat3_vec3_mul() {
+        let id = [[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let v = [3.0_f32, 5.0, 7.0];
         assert_eq!(mat3_vec3_mul(id, v), v);
     }
 
     // ── Training stats ────────────────────────────────────────────────────────
 
-    #[test] fn test_training_stats_default() {
+    #[test]
+    fn test_training_stats_default() {
         let s = TrainingStats::default();
         assert_eq!(s.total_steps, 0);
         assert!(s.episode_rewards.is_empty());
@@ -4095,15 +5316,17 @@ mod tests {
 
     // ── Tensor flat index ──────────────────────────────────────────────────────
 
-    #[test] fn test_tensor_flat_index_2d() {
+    #[test]
+    fn test_tensor_flat_index_2d() {
         let shape = vec![3, 4];
-        let idx   = vec![Value::I32(1), Value::I32(2)];
+        let idx = vec![Value::I32(1), Value::I32(2)];
         assert_eq!(tensor_flat_index(&shape, &idx).unwrap(), 1 * 4 + 2);
     }
 
-    #[test] fn test_tensor_flat_index_out_of_bounds() {
+    #[test]
+    fn test_tensor_flat_index_out_of_bounds() {
         let shape = vec![2, 2];
-        let idx   = vec![Value::I32(0), Value::I32(5)]; // col 5 ≥ 2
+        let idx = vec![Value::I32(0), Value::I32(5)]; // col 5 ≥ 2
         assert!(tensor_flat_index(&shape, &idx).is_err());
     }
 }

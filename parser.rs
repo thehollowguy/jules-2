@@ -109,7 +109,16 @@ impl Parser {
         if self.is(kind) {
             Ok(self.advance().span)
         } else {
-            Err(self.unexpected(&format!("expected `{kind:?}`")))
+            let found = self.peek();
+            let expected = token_label(kind);
+            let mut err = ParseError::new(
+                found.span,
+                format!("expected {expected}, but found `{}`", found.kind),
+            );
+            if let Some(hint) = expected_token_hint(kind, &found.kind) {
+                err = err.with_hint(hint);
+            }
+            Err(err)
         }
     }
 
@@ -129,8 +138,10 @@ impl Parser {
             }
             // Allow any keyword-as-identifier if the grammar position is
             // unambiguous (e.g. field names that happen to be keywords).
-            _ => Err(ParseError::new(tok.span,
-                format!("expected identifier, found `{}`", tok.kind))),
+            _ => Err(
+                ParseError::new(tok.span, format!("expected an identifier name, found `{}`", tok.kind))
+                    .with_hint("use a valid name like `player`, `health`, or `main`"),
+            ),
         }
     }
 
@@ -145,8 +156,8 @@ impl Parser {
             self.advance();
             Ok((tok.span, s.clone()))
         } else {
-            Err(ParseError::new(tok.span,
-                format!("expected name, found `{}`", tok.kind)))
+            Err(ParseError::new(tok.span, format!("expected a name, found `{}`", tok.kind))
+                .with_hint("expected a declaration name here, for example `fn main`"))
         }
     }
 
@@ -182,6 +193,39 @@ impl Parser {
             }
         }
         self.eat(&TokenKind::Semicolon);
+    }
+}
+
+fn token_label(kind: &TokenKind) -> String {
+    match kind {
+        TokenKind::Semicolon => "`;` (statement terminator)".into(),
+        TokenKind::Comma => "`,` (separator)".into(),
+        TokenKind::Colon => "`:`".into(),
+        TokenKind::LParen => "`(`".into(),
+        TokenKind::RParen => "`)`".into(),
+        TokenKind::LBrace => "`{`".into(),
+        TokenKind::RBrace => "`}`".into(),
+        TokenKind::LBracket => "`[`".into(),
+        TokenKind::RBracket => "`]`".into(),
+        TokenKind::Arrow => "`->`".into(),
+        TokenKind::FatArrow => "`=>`".into(),
+        TokenKind::Eq => "`=`".into(),
+        _ => format!("`{kind}`"),
+    }
+}
+
+fn expected_token_hint(expected: &TokenKind, found: &TokenKind) -> Option<&'static str> {
+    match expected {
+        TokenKind::Semicolon => Some("add `;` to end this statement"),
+        TokenKind::RParen => Some("close this expression with `)`"),
+        TokenKind::RBrace => Some("close this block with `}`"),
+        TokenKind::RBracket => Some("close this index/type with `]`"),
+        TokenKind::LBrace => Some("start a block with `{ ... }`"),
+        TokenKind::Comma => Some("separate items with `,`"),
+        TokenKind::Arrow => Some("use `->` before a return type"),
+        TokenKind::Eq => Some("use `=` to assign a value"),
+        _ if matches!(found, TokenKind::Eof) => Some("you may be missing code at the end of the file"),
+        _ => None,
     }
 }
 
@@ -283,11 +327,70 @@ impl Parser {
                     } else { vec![] };
                     Attribute::Named { name, args }
                 }
+                TokenKind::AtCustom(custom_name) => {
+                    let name = custom_name.to_lowercase();
+                    self.advance();
+                    let args = if self.is(&TokenKind::LParen) {
+                        self.parse_named_attr_args().unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    Attribute::Named { name, args }
+                }
                 _ => break,
             };
             attrs.push(attr);
         }
         attrs
+    }
+
+    fn parse_named_attr_args(&mut self) -> ParseResult<Vec<Expr>> {
+        // Support architecture shorthand: @PPO(124->62->32)
+        if let Some(expr) = self.try_parse_architecture_shorthand()? {
+            return Ok(vec![expr]);
+        }
+        self.parse_call_args()
+    }
+
+    fn try_parse_architecture_shorthand(&mut self) -> ParseResult<Option<Expr>> {
+        let save = self.pos;
+        if !self.eat(&TokenKind::LParen) {
+            return Ok(None);
+        }
+
+        let mut parts = Vec::new();
+        loop {
+            match &self.peek().kind {
+                TokenKind::IntLit { value, .. } => {
+                    parts.push(value.to_string());
+                    self.advance();
+                }
+                TokenKind::Ident(name) => {
+                    parts.push(name.clone());
+                    self.advance();
+                }
+                _ => {
+                    self.pos = save;
+                    return Ok(None);
+                }
+            }
+            if self.eat(&TokenKind::Arrow) {
+                parts.push("->".to_string());
+                continue;
+            }
+            break;
+        }
+
+        if !self.eat(&TokenKind::RParen) {
+            self.pos = save;
+            return Ok(None);
+        }
+
+        let span = self.tokens[save].span.merge(self.tokens[self.pos.saturating_sub(1)].span);
+        Ok(Some(Expr::StrLit {
+            span,
+            value: parts.join(""),
+        }))
     }
 }
 

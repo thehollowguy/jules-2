@@ -21,6 +21,7 @@ numpy = { version = "0.21", optional = true }
 libc = "0.2"
 lazy_static = "1.4"
 parking_lot = "0.12"
+matrixmultiply = "0.3"
 
 [features]
 default = ["ffi-c"]

@@ -339,6 +339,7 @@ pub enum TokenKind {
     AtBenchmark,   // @benchmark   — mark function as a microbenchmark
     AtDeprecated,  // @deprecated  — emit deprecation warning at call sites
     AtAi,          // @ai          — neural network injection into agent
+    AtCustom(String), // @PPO, @DQN, @SAC, etc.
 
     // ── Operators ─────────────────────────────────────────────────────────
 
@@ -1062,12 +1063,7 @@ impl<'src> Lexer<'src> {
             "ai"          => TokenKind::AtAi,
             // Plain `@` with no recognised name is the MatMul operator.
             "" => TokenKind::MatMul,
-            _ => {
-                return Err(LexError::new(
-                    format!("unknown device attribute `@{}`", name),
-                    span,
-                ))
-            }
+            _ => TokenKind::AtCustom(name.clone()),
         };
         let raw = format!("@{}", name);
         Ok(Token::new(kind, span, raw))

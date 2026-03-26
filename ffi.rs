@@ -246,10 +246,13 @@ pub extern "C" fn jules_tensor_create(shape: *const usize, shape_len: usize) -> 
 
         storage.insert(id, data);
         shapes.insert(id, shape_vec.clone());
+        let mut shape_box = shape_vec.into_boxed_slice();
+        let shape_ptr = shape_box.as_mut_ptr();
+        std::mem::forget(shape_box);
 
         Box::into_raw(Box::new(JulesTensor {
             ptr: id,
-            shape_ptr: Box::into_raw(Box::new(shape_vec)),
+            shape_ptr,
             shape_len,
             dtype: 0,
         }))
@@ -266,7 +269,7 @@ pub extern "C" fn jules_tensor_destroy(tensor: *mut JulesTensor) {
             storage.remove(&t.ptr);
             shapes.remove(&t.ptr);
             if !t.shape_ptr.is_null() {
-                let _ = Box::from_raw(t.shape_ptr);
+                let _ = Vec::from_raw_parts(t.shape_ptr, t.shape_len, t.shape_len);
             }
         }
     }
@@ -398,6 +401,38 @@ pub extern "C" fn jules_error_string(code: JulesError) -> *const c_char {
         JulesError::UnknownError => c"Unknown error",
     };
     msg.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn jules_run_file_ffi(path: *const c_char) -> JulesError {
+    if path.is_null() {
+        return JulesError::InvalidArg;
+    }
+    let path_str = unsafe { CStr::from_ptr(path) };
+    let Ok(path) = path_str.to_str() else {
+        return JulesError::InvalidArg;
+    };
+    match crate::jules_run_file(path, "main") {
+        Ok(()) => JulesError::Success,
+        Err(_) => JulesError::RuntimeError,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn jules_check_code_ffi(source: *const c_char) -> JulesError {
+    if source.is_null() {
+        return JulesError::InvalidArg;
+    }
+    let source = unsafe { CStr::from_ptr(source) };
+    let Ok(source) = source.to_str() else {
+        return JulesError::InvalidArg;
+    };
+    let diags = crate::jules_check("<ffi>", source);
+    if diags.iter().any(|d| d.is_error()) {
+        JulesError::RuntimeError
+    } else {
+        JulesError::Success
+    }
 }
 
 #[no_mangle]
