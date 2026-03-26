@@ -2833,6 +2833,8 @@ mod tests {
                     },
                 ),
             ],
+            algorithm: None,
+            value_model: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_train(&t);

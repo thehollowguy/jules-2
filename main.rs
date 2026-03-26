@@ -578,6 +578,9 @@ pub struct CliArgs {
     pub tab_width:     usize,
     pub entry:         String,    // --entry <fn>  for jules run
     pub train:         bool,      // jules train
+    pub fix_dry_run:   bool,
+    pub fix_diff:      bool,
+    pub fix_aggressive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -653,6 +656,9 @@ impl CliArgs {
                         .ok_or("--entry requires a function name")?
                         .clone();
                 }
+                "--dry-run" => { out.fix_dry_run = true; }
+                "--diff" => { out.fix_diff = true; }
+                "--aggressive" => { out.fix_aggressive = true; }
                 s if s.starts_with('-') => {
                     return Err(format!("unknown flag `{s}`; try `jules help`"));
                 }
@@ -711,6 +717,9 @@ fn cmd_help() {
     println!("    --quiet  / -q      Suppress warnings and notes");
     println!("    --tab-width <N>    Tab stop width (default: 4)");
     println!("    --entry <fn>       Entry-point function (default: main)");
+    println!("    --dry-run          (fix) show changes without writing");
+    println!("    --diff             (fix) print changed lines");
+    println!("    --aggressive       (fix) allow riskier fixer rules");
     println!("\nEXAMPLES:");
     println!("    jules run examples/physics.jules");
     println!("    jules check src/agent.jules -W");

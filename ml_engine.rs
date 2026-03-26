@@ -532,6 +532,11 @@ fn matmul_blocked_rows(
                 out_row[col] = acc;
             }
         }
+
+        Ok(Tensor {
+            shape: vec![batch, weights.out_dim],
+            data: out,
+        })
     }
 }
 

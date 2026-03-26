@@ -2819,10 +2819,13 @@ impl Interpreter {
                     rt_err!("graphics::set_camera requires (x, y, z)")
                 }
             }
-            "graphics::create_mesh" => {
-                if let (Some(Value::Str(mesh_type)), Some(scale)) =
-                    (args.get(0), args.get(1).and_then(|v| v.as_f64()))
-                {
+            "graphics::set_chunked_grid_cell" => {
+                if let (Some(map_id), Some(x), Some(y), Some(object_id)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                    args.get(2).and_then(|v| v.as_i64()),
+                    args.get(3).and_then(|v| v.as_i64()),
+                ) {
                     let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
                     let s = scale as f32;
                     let vertices = vec![[-s, -s, 0.0], [s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0]];

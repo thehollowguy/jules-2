@@ -2752,6 +2752,8 @@ impl TypeCk {
                         .error(*span, format!("@{}: {}", decorator_name.to_uppercase(), e));
                     return;
                 }
+            }
+        }
 
                 // Parse layers from architecture (without full parsing yet, just validate format)
                 if let Ok(layers) = self.extract_layers_from_arch(value) {
@@ -2787,6 +2789,42 @@ impl TypeCk {
             } else {
                 self.diag.error(a.span, "@AI decorator requires a string literal argument (e.g., @AI(\"256->512->10\"))");
             }
+        }
+
+        let Some(network) = network else {
+            self.diag.error(
+                a.span,
+                format!(
+                    "@{} requires a network. Use @{}(\"128->64->10\") or @{}(network=\"128->64->10\", lr=0.0003, input=128, output=10)",
+                    decorator_name.to_uppercase(),
+                    decorator_name.to_uppercase(),
+                    decorator_name.to_uppercase()
+                ),
+            );
+            return None;
+        };
+
+        Some(AiDecoratorConfig {
+            span,
+            network,
+            learning_rate,
+            input,
+            output,
+        })
+    }
+
+    fn ai_number_literal(&self, e: &crate::ast::Expr) -> Option<f64> {
+        match e {
+            crate::ast::Expr::FloatLit { value, .. } => Some(*value),
+            crate::ast::Expr::IntLit { value, .. } => Some(*value as f64),
+            _ => None,
+        }
+    }
+
+    fn ai_u64_literal(&self, e: &crate::ast::Expr) -> Option<u64> {
+        match e {
+            crate::ast::Expr::IntLit { value, .. } => Some(*value as u64),
+            _ => None,
         }
     }
 
@@ -3518,6 +3556,110 @@ mod tests {
             field: "z".into(), // does not exist
         };
         ck.check_expr(&expr, &mut env);
+        assert!(ck.diag.has_errors());
+    }
+
+    #[test]
+    fn test_ai_decorator_named_options_valid() {
+        let ai_attr = Attribute::Named {
+            name: "ai".into(),
+            args: vec![
+                Expr::Assign {
+                    span: dummy(),
+                    op: AssignOpKind::Assign,
+                    target: Box::new(Expr::Ident {
+                        span: dummy(),
+                        name: "network".into(),
+                    }),
+                    value: Box::new(Expr::StrLit {
+                        span: dummy(),
+                        value: "128->64->32".into(),
+                    }),
+                },
+                Expr::Assign {
+                    span: dummy(),
+                    op: AssignOpKind::Assign,
+                    target: Box::new(Expr::Ident {
+                        span: dummy(),
+                        name: "lr".into(),
+                    }),
+                    value: Box::new(Expr::FloatLit {
+                        span: dummy(),
+                        value: 0.0003,
+                    }),
+                },
+                Expr::Assign {
+                    span: dummy(),
+                    op: AssignOpKind::Assign,
+                    target: Box::new(Expr::Ident {
+                        span: dummy(),
+                        name: "input".into(),
+                    }),
+                    value: Box::new(Expr::IntLit {
+                        span: dummy(),
+                        value: 128,
+                    }),
+                },
+                Expr::Assign {
+                    span: dummy(),
+                    op: AssignOpKind::Assign,
+                    target: Box::new(Expr::Ident {
+                        span: dummy(),
+                        name: "output".into(),
+                    }),
+                    value: Box::new(Expr::IntLit {
+                        span: dummy(),
+                        value: 32,
+                    }),
+                },
+            ],
+        };
+
+        let program = Program {
+            span: dummy(),
+            items: vec![Item::Agent(mk_agent_with_attrs(vec![ai_attr]))],
+        };
+
+        let mut ck = make_checker();
+        ck.check_program(&program);
+        assert!(
+            !ck.diag.has_errors(),
+            "unexpected errors for valid @ai options: {:?}",
+            ck.diag.items
+        );
+    }
+
+    #[test]
+    fn test_ai_decorator_invalid_lr_error() {
+        let ai_attr = Attribute::Named {
+            name: "ai".into(),
+            args: vec![
+                Expr::StrLit {
+                    span: dummy(),
+                    value: "128->64->32".into(),
+                },
+                Expr::Assign {
+                    span: dummy(),
+                    op: AssignOpKind::Assign,
+                    target: Box::new(Expr::Ident {
+                        span: dummy(),
+                        name: "lr".into(),
+                    }),
+                    value: Box::new(Expr::FloatLit {
+                        span: dummy(),
+                        value: -0.5,
+                    }),
+                },
+            ],
+        };
+
+        let program = Program {
+            span: dummy(),
+            items: vec![Item::Agent(mk_agent_with_attrs(vec![ai_attr]))],
+        };
+
+        let mut ck = make_checker();
+        ck.check_program(&program);
         assert!(ck.diag.has_errors());
     }
 

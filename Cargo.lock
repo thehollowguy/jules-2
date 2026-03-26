@@ -41,6 +41,7 @@ version = "0.1.0"
 dependencies = [
  "lazy_static",
  "libc",
+ "matrixmultiply",
  "numpy",
  "parking_lot",
  "pyo3",
