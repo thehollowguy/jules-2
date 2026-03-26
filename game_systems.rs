@@ -15,7 +15,7 @@ pub struct PhysicsBody {
     pub velocity: [f32; 3],
     pub angular_velocity: [f32; 3],
     pub position: [f32; 3],
-    pub rotation: [f32; 4],  // Quaternion
+    pub rotation: [f32; 4], // Quaternion
 }
 
 #[derive(Debug, Clone)]
@@ -55,12 +55,7 @@ impl PhysicsWorld {
         }
     }
 
-    pub fn create_rigid_body(
-        &mut self,
-        mass: f32,
-        shape: PhysicsShape,
-        position: [f32; 3],
-    ) -> u32 {
+    pub fn create_rigid_body(&mut self, mass: f32, shape: PhysicsShape, position: [f32; 3]) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -71,7 +66,7 @@ impl PhysicsWorld {
             velocity: [0.0, 0.0, 0.0],
             angular_velocity: [0.0, 0.0, 0.0],
             position,
-            rotation: [0.0, 0.0, 0.0, 1.0],  // Identity quaternion
+            rotation: [0.0, 0.0, 0.0, 1.0], // Identity quaternion
         };
 
         self.bodies.insert(id, body);
@@ -133,9 +128,7 @@ impl PhysicsWorld {
                 let id1 = bodies[i];
                 let id2 = bodies[j];
 
-                if let (Some(body1), Some(body2)) =
-                    (self.bodies.get(&id1), self.bodies.get(&id2))
-                {
+                if let (Some(body1), Some(body2)) = (self.bodies.get(&id1), self.bodies.get(&id2)) {
                     if self.bodies_colliding(body1, body2) {
                         self.resolve_collision(id1, id2);
                     }
@@ -178,7 +171,9 @@ impl PhysicsWorld {
         let dz = pos2[2] - pos1[2];
         let dist = (dx * dx + dy * dy + dz * dz).sqrt();
 
-        if dist < 0.001 { return; }
+        if dist < 0.001 {
+            return;
+        }
 
         let nx = dx / dist;
         let ny = dy / dist;
@@ -190,7 +185,9 @@ impl PhysicsWorld {
 
         let dvn = dvx * nx + dvy * ny + dvz * nz;
 
-        if dvn >= 0.0 { return; }  // Already separating
+        if dvn >= 0.0 {
+            return;
+        } // Already separating
 
         let inv_mass_sum = 1.0 / (mass1 + mass2);
         let impulse = -dvn / inv_mass_sum;
@@ -277,6 +274,8 @@ impl RenderState {
             meshes: HashMap::new(),
             materials: HashMap::new(),
             next_id: 1,
+            width: 1920,
+            height: 1080,
         }
     }
 
@@ -321,31 +320,44 @@ pub fn create_cube_mesh(size: f32) -> Mesh {
     let s = size / 2.0;
     let vertices = vec![
         // Front
-        [-s, -s,  s], [ s, -s,  s], [ s,  s,  s], [-s,  s,  s],
+        [-s, -s, s],
+        [s, -s, s],
+        [s, s, s],
+        [-s, s, s],
         // Back
-        [-s, -s, -s], [ s, -s, -s], [ s,  s, -s], [-s,  s, -s],
+        [-s, -s, -s],
+        [s, -s, -s],
+        [s, s, -s],
+        [-s, s, -s],
         // Right
-        [ s, -s,  s], [ s, -s, -s], [ s,  s, -s], [ s,  s,  s],
+        [s, -s, s],
+        [s, -s, -s],
+        [s, s, -s],
+        [s, s, s],
         // Left
-        [-s, -s,  s], [-s, -s, -s], [-s,  s, -s], [-s,  s,  s],
+        [-s, -s, s],
+        [-s, -s, -s],
+        [-s, s, -s],
+        [-s, s, s],
         // Top
-        [-s,  s,  s], [ s,  s,  s], [ s,  s, -s], [-s,  s, -s],
+        [-s, s, s],
+        [s, s, s],
+        [s, s, -s],
+        [-s, s, -s],
         // Bottom
-        [-s, -s,  s], [ s, -s,  s], [ s, -s, -s], [-s, -s, -s],
+        [-s, -s, s],
+        [s, -s, s],
+        [s, -s, -s],
+        [-s, -s, -s],
     ];
 
     let indices = vec![
         // Front
-        0, 1, 2, 2, 3, 0,
-        // Back
-        6, 5, 4, 4, 7, 6,
-        // Right
-        8, 9, 10, 10, 11, 8,
-        // Left
-        14, 13, 12, 12, 15, 14,
-        // Top
-        16, 17, 18, 18, 19, 16,
-        // Bottom
+        0, 1, 2, 2, 3, 0, // Back
+        6, 5, 4, 4, 7, 6, // Right
+        8, 9, 10, 10, 11, 8, // Left
+        14, 13, 12, 12, 15, 14, // Top
+        16, 17, 18, 18, 19, 16, // Bottom
         22, 21, 20, 20, 23, 22,
     ];
 
@@ -383,11 +395,7 @@ pub fn create_sphere_mesh(radius: f32, segments: u32) -> Mesh {
             vertices.push([x, y, z]);
 
             // Normal for sphere is simply the normalized position (points outward)
-            let normal = [
-                (sin_lat * cos_lon),
-                (cos_lat),
-                (sin_lat * sin_lon),
-            ];
+            let normal = [(sin_lat * cos_lon), (cos_lat), (sin_lat * sin_lon)];
             normals.push(normal);
         }
     }
@@ -420,9 +428,17 @@ pub fn create_sphere_mesh(radius: f32, segments: u32) -> Mesh {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum KeyCode {
-    W, A, S, D,
-    Left, Right, Up, Down,
-    Space, Enter, Escape,
+    W,
+    A,
+    S,
+    D,
+    Left,
+    Right,
+    Up,
+    Down,
+    Space,
+    Enter,
+    Escape,
 }
 
 #[derive(Debug, Clone)]
@@ -431,7 +447,7 @@ pub struct InputState {
     pub mouse_x: f32,
     pub mouse_y: f32,
     pub mouse_scroll: f32,
-    pub gamepad_axes: [f32; 6],  // [LX, LY, RX, RY, LT, RT]
+    pub gamepad_axes: [f32; 6], // [LX, LY, RX, RY, LT, RT]
     pub gamepad_buttons: std::collections::HashSet<u8>,
 }
 
@@ -468,16 +484,28 @@ impl InputState {
         match axis {
             "horizontal" => {
                 let mut val = 0.0;
-                if self.is_key_pressed(KeyCode::D) { val += 1.0; }
-                if self.is_key_pressed(KeyCode::A) { val -= 1.0; }
-                if self.gamepad_axes[0].abs() > 0.1 { val = self.gamepad_axes[0]; }
+                if self.is_key_pressed(KeyCode::D) {
+                    val += 1.0;
+                }
+                if self.is_key_pressed(KeyCode::A) {
+                    val -= 1.0;
+                }
+                if self.gamepad_axes[0].abs() > 0.1 {
+                    val = self.gamepad_axes[0];
+                }
                 val.clamp(-1.0, 1.0)
             }
             "vertical" => {
                 let mut val = 0.0;
-                if self.is_key_pressed(KeyCode::W) { val += 1.0; }
-                if self.is_key_pressed(KeyCode::S) { val -= 1.0; }
-                if self.gamepad_axes[1].abs() > 0.1 { val = self.gamepad_axes[1]; }
+                if self.is_key_pressed(KeyCode::W) {
+                    val += 1.0;
+                }
+                if self.is_key_pressed(KeyCode::S) {
+                    val -= 1.0;
+                }
+                if self.gamepad_axes[1].abs() > 0.1 {
+                    val = self.gamepad_axes[1];
+                }
                 val.clamp(-1.0, 1.0)
             }
             _ => 0.0,

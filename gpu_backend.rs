@@ -1,9 +1,7 @@
-
-
 #![allow(dead_code)]
 
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 // GPU buffer handle (opaque to users)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -147,17 +145,9 @@ impl GpuBackendImpl for CpuBackend {
         b: &GpuBufferHandle,
         out: &GpuBufferHandle,
     ) -> Result<(), String> {
-        let buffers = self.buffers.lock().unwrap();
-
-        let buf_a = buffers
-            .get(&a.id)
-            .ok_or("Buffer A not found")?;
-        let buf_b = buffers
-            .get(&b.id)
-            .ok_or("Buffer B not found")?;
-        let buf_out = buffers
-            .get(&out.id)
-            .ok_or("Output buffer not found")?;
+        let mut buffers = self.buffers.lock().unwrap();
+        let buf_a = buffers.get(&a.id).cloned().ok_or("Buffer A not found")?;
+        let buf_b = buffers.get(&b.id).cloned().ok_or("Buffer B not found")?;
 
         // Simple CPU matmul
         if buf_a.shape.len() < 2 || buf_b.shape.len() < 2 {
@@ -172,7 +162,20 @@ impl GpuBackendImpl for CpuBackend {
             return Err("Dimension mismatch in matmul".into());
         }
 
-        // CPU computation (simplified)
+        let mut out_data = vec![0.0f32; m * n];
+        for i in 0..m {
+            for p in 0..k {
+                let a_val = buf_a.data[i * k + p];
+                for j in 0..n {
+                    out_data[i * n + j] += a_val * buf_b.data[p * n + j];
+                }
+            }
+        }
+
+        let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
+        out_buf.data = out_data;
+        out_buf.shape = vec![m, n];
+
         Ok(())
     }
 
@@ -421,25 +424,110 @@ impl GpuBackend {
 pub struct GpuMemoryManager {
     backend: GpuBackend,
     allocated: Arc<Mutex<HashMap<u64, GpuBuffer>>>,
+    current_bytes: Arc<Mutex<usize>>,
+    config: Arc<Mutex<GpuMemoryConfig>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GpuMemoryConfig {
+    /// Memory reserved for runtime + model base footprint.
+    pub base_reserved_bytes: usize,
+    /// Additional bytes allowed above `base_reserved_bytes`.
+    pub max_extra_bytes: usize,
+}
+
+impl GpuMemoryConfig {
+    pub fn total_budget_bytes(self) -> usize {
+        self.base_reserved_bytes
+            .saturating_add(self.max_extra_bytes)
+    }
 }
 
 impl GpuMemoryManager {
     pub fn new(backend: GpuBackend) -> Self {
+        Self::new_with_config(
+            backend,
+            GpuMemoryConfig {
+                base_reserved_bytes: 0,
+                max_extra_bytes: usize::MAX / 2,
+            },
+        )
+    }
+
+    pub fn new_with_config(backend: GpuBackend, config: GpuMemoryConfig) -> Self {
         GpuMemoryManager {
             backend,
             allocated: Arc::new(Mutex::new(HashMap::new())),
+            current_bytes: Arc::new(Mutex::new(0)),
+            config: Arc::new(Mutex::new(config)),
         }
     }
 
-    pub fn allocate(&self, shape: Vec<usize>, init_val: f32) -> GpuBufferHandle {
+    pub fn set_base_reserved_bytes(&self, bytes: usize) {
+        let mut cfg = self.config.lock().unwrap();
+        cfg.base_reserved_bytes = bytes;
+    }
+
+    pub fn set_max_extra_bytes(&self, bytes: usize) {
+        let mut cfg = self.config.lock().unwrap();
+        cfg.max_extra_bytes = bytes;
+    }
+
+    pub fn memory_budget_bytes(&self) -> usize {
+        self.config.lock().unwrap().total_budget_bytes()
+    }
+
+    pub fn used_bytes(&self) -> usize {
+        *self.current_bytes.lock().unwrap()
+    }
+
+    pub fn allocate(&self, shape: Vec<usize>, init_val: f32) -> Result<GpuBufferHandle, String> {
         let numel: usize = shape.iter().product();
         let data = vec![init_val; numel];
-        self.backend.upload(&data, shape)
+        self.allocate_from_data(shape, data)
+    }
+
+    pub fn allocate_from_data(
+        &self,
+        shape: Vec<usize>,
+        data: Vec<f32>,
+    ) -> Result<GpuBufferHandle, String> {
+        let numel: usize = shape.iter().product();
+        if data.len() != numel {
+            return Err("Data length does not match shape".into());
+        }
+        let requested_bytes = numel.saturating_mul(std::mem::size_of::<f32>());
+        let budget_bytes = self.memory_budget_bytes();
+        let mut used = self.current_bytes.lock().unwrap();
+        if used.saturating_add(requested_bytes) > budget_bytes {
+            return Err(format!(
+                "GPU memory budget exceeded: requested={} used={} budget={}",
+                requested_bytes, *used, budget_bytes
+            ));
+        }
+
+        let shape_clone = shape.clone();
+        let handle = self.backend.upload(&data, shape);
+        self.allocated.lock().unwrap().insert(
+            handle.id,
+            GpuBuffer {
+                id: handle.id,
+                data,
+                shape: shape_clone,
+                device: self.backend.backend_name().to_string(),
+            },
+        );
+        *used += requested_bytes;
+        Ok(handle)
     }
 
     pub fn free(&self, handle: &GpuBufferHandle) {
-        let mut allocated = self.allocated.lock().unwrap();
-        allocated.remove(&handle.id);
+        let removed = self.allocated.lock().unwrap().remove(&handle.id);
+        if let Some(buffer) = removed {
+            let mut used = self.current_bytes.lock().unwrap();
+            let bytes = buffer.data.len().saturating_mul(std::mem::size_of::<f32>());
+            *used = used.saturating_sub(bytes);
+        }
     }
 
     pub fn get_stats(&self) -> (usize, usize) {
@@ -447,6 +535,23 @@ impl GpuMemoryManager {
         let count = allocated.len();
         let total_elements: usize = allocated.values().map(|b| b.data.len()).sum();
         (count, total_elements)
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        self.backend.backend_name()
+    }
+
+    pub fn matmul(
+        &self,
+        a: &GpuBufferHandle,
+        b: &GpuBufferHandle,
+        out: &GpuBufferHandle,
+    ) -> Result<(), String> {
+        self.backend.matmul(a, b, out)
+    }
+
+    pub fn download(&self, handle: &GpuBufferHandle) -> Vec<f32> {
+        self.backend.download(handle)
     }
 }
 
@@ -527,10 +632,25 @@ mod tests {
     fn test_memory_manager() {
         let backend = GpuBackend::cpu();
         let manager = GpuMemoryManager::new(backend);
-        let handle = manager.allocate(vec![10, 10], 0.0);
+        let handle = manager.allocate(vec![10, 10], 0.0).unwrap();
         let (count, total) = manager.get_stats();
         assert!(count > 0);
         assert_eq!(total, 100);
+        assert!(manager.used_bytes() >= 400);
         manager.free(&handle);
+    }
+
+    #[test]
+    fn test_memory_budget_limit() {
+        let backend = GpuBackend::cpu();
+        let manager = GpuMemoryManager::new_with_config(
+            backend,
+            GpuMemoryConfig {
+                base_reserved_bytes: 128,
+                max_extra_bytes: 128,
+            },
+        );
+        let too_large = manager.allocate(vec![100], 0.0);
+        assert!(too_large.is_err());
     }
 }

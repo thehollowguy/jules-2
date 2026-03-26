@@ -246,10 +246,13 @@ pub extern "C" fn jules_tensor_create(shape: *const usize, shape_len: usize) -> 
 
         storage.insert(id, data);
         shapes.insert(id, shape_vec.clone());
+        let mut shape_box = shape_vec.into_boxed_slice();
+        let shape_ptr = shape_box.as_mut_ptr();
+        std::mem::forget(shape_box);
 
         Box::into_raw(Box::new(JulesTensor {
             ptr: id,
-            shape_ptr: Box::into_raw(Box::new(shape_vec)),
+            shape_ptr,
             shape_len,
             dtype: 0,
         }))
@@ -266,7 +269,7 @@ pub extern "C" fn jules_tensor_destroy(tensor: *mut JulesTensor) {
             storage.remove(&t.ptr);
             shapes.remove(&t.ptr);
             if !t.shape_ptr.is_null() {
-                let _ = Box::from_raw(t.shape_ptr);
+                let _ = Vec::from_raw_parts(t.shape_ptr, t.shape_len, t.shape_len);
             }
         }
     }
