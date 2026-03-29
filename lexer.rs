@@ -3,10 +3,6 @@
 //
 // Lexer for the Jules programming language.
 //
-// Jules treats tensors as first-class citizens with built-in GPU support.
-// This lexer tokenizes Jules source text into a flat stream of Tokens,
-// preserving span information for error reporting.
-//
 // Tensor syntax handled here:
 //   tensor<float>[128, 128]   — shaped tensor type
 //   A @ B                     — matrix-multiply operator

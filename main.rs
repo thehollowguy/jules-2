@@ -23,6 +23,15 @@ mod phase5_cow;
 #[cfg(feature = "phase6-simd")]
 pub mod phase6_simd;
 
+// Game-dev tooling scaffolds (non-functional stubs; implement per roadmap)
+pub mod frame_debugger;
+pub mod scene_editor;
+pub mod asset_importer;
+pub mod shader_tooling;
+pub mod networking;
+pub mod profiling_tools;
+pub mod hot_reload;
+
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, BufRead, Write};

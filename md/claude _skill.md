@@ -524,3 +524,4 @@ make an edit to this file to improve it every time you are done with a task
 ### Edit Log (automatically appended)
 
 - 2026-03-29: Added phase feature flags, exposed `phase6_simd`, implemented `phase6_simd::update_positions` (portable callsite), and added `bench-ecs` microbenchmark and `PERFORMANCE_OPTIMIZATION_PLAN.md` scaffold. Follow-up: run the benchmark locally/CI and record baseline numbers in `PERFORMANCE_OPTIMIZATION_PLAN.md`.
+- 2026-03-29: Added `GAME_DEV_ROADMAP.md` and scaffolding modules for requested game-dev features: `frame_debugger.rs`, `scene_editor.rs`, `asset_importer.rs`, `shader_tooling.rs`, `networking.rs`, `profiling_tools.rs`, and `hot_reload.rs`. These are minimal stubs to provide clear callsites and documented next steps.
