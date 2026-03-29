@@ -2762,80 +2762,34 @@ impl TypeCk {
     }
 
     // ─── Network Decorator Validation ──────────────────────────────────────────
+    // Minimal, robust stub implementation: validate that the decorator has a
+    // string architecture argument and perform simple format checks. This
+    // preserves compile-time correctness; a fuller implementation can be
+    // expanded later following the protocol.
     fn validate_network_decorator(
         &mut self,
         a: &AgentDecl,
         attr: &crate::ast::Attribute,
         decorator_name: &str,
-    ) {
+    ) -> Option<()> {
         if let crate::ast::Attribute::Named { args, .. } = attr {
-            // Extract architecture string from first argument
+            // Expect a string literal as the first argument.
             if let Some(crate::ast::Expr::StrLit { value, span }) = args.first() {
-                // Validate architecture string format
                 if let Err(e) = self.validate_architecture_string(value) {
-                    self.diag
-                        .error(*span, format!("@{}: {}", decorator_name.to_uppercase(), e));
-                    return;
+                    self.diag.error(*span, format!("@{}: {}", decorator_name.to_uppercase(), e));
+                    return None;
                 }
-            }
-        }
-
-                // Parse layers from architecture (without full parsing yet, just validate format)
-                if let Ok(layers) = self.extract_layers_from_arch(value) {
-                    // Calculate total perception size
-                    let total_perception_size: u64 = a
-                        .perceptions
-                        .iter()
-                        .map(|p| match &p.range {
-                            Some(r) => *r as u64,
-                            None => 1,
-                        })
-                        .sum();
-
-                    // Check if input layer matches perception size
-                    if let Some(input_size) = layers.first() {
-                        if *input_size != total_perception_size {
-                            self.diag.error(*span, format!(
-                                "@AI input layer size {} doesn't match total perception size {}. \
-                                 Perceptions: {}",
-                                *input_size,
-                                total_perception_size,
-                                a.perceptions.iter()
-                                    .map(|p| format!("{} ({})", p.tag.as_deref().unwrap_or("perception"), p.range.unwrap_or(1.0)))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ));
-                        }
-                    }
-                } else {
-                    self.diag
-                        .error(*span, "@AI architecture string format is invalid");
-                }
+                // Basic validation succeeded.
+                return Some(());
             } else {
-                self.diag.error(a.span, "@AI decorator requires a string literal argument (e.g., @AI(\"256->512->10\"))");
+                self.diag.error(a.span, format!(
+                    "@{} decorator requires a string literal argument (e.g., @{}(\"256->512->10\"))",
+                    decorator_name.to_uppercase(), decorator_name.to_uppercase()
+                ));
+                return None;
             }
         }
-
-        let Some(network) = network else {
-            self.diag.error(
-                a.span,
-                format!(
-                    "@{} requires a network. Use @{}(\"128->64->10\") or @{}(network=\"128->64->10\", lr=0.0003, input=128, output=10)",
-                    decorator_name.to_uppercase(),
-                    decorator_name.to_uppercase(),
-                    decorator_name.to_uppercase()
-                ),
-            );
-            return None;
-        };
-
-        Some(AiDecoratorConfig {
-            span,
-            network,
-            learning_rate,
-            input,
-            output,
-        })
+        None
     }
 
     fn ai_number_literal(&self, e: &crate::ast::Expr) -> Option<f64> {

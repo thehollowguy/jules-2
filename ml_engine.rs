@@ -738,11 +738,6 @@ fn matmul_blocked_rows(
                 out_row[col] = acc;
             }
         }
-
-        Ok(Tensor {
-            shape: vec![batch, weights.out_dim],
-            data: out,
-        })
     }
 }
 
@@ -780,49 +775,6 @@ fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
     s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + tail
 }
 
-fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    let mut out = vec![0.0; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            out[c * rows + r] = data[r * cols + c];
-        }
-    }
-    out
-}
-
-fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
-    let len = lhs.len();
-    let chunks = len / 8;
-    let mut i = 0;
-    let mut s0 = 0.0f32;
-    let mut s1 = 0.0f32;
-    let mut s2 = 0.0f32;
-    let mut s3 = 0.0f32;
-    let mut s4 = 0.0f32;
-    let mut s5 = 0.0f32;
-    let mut s6 = 0.0f32;
-    let mut s7 = 0.0f32;
-
-    for _ in 0..chunks {
-        s0 += lhs[i] * rhs[i];
-        s1 += lhs[i + 1] * rhs[i + 1];
-        s2 += lhs[i + 2] * rhs[i + 2];
-        s3 += lhs[i + 3] * rhs[i + 3];
-        s4 += lhs[i + 4] * rhs[i + 4];
-        s5 += lhs[i + 5] * rhs[i + 5];
-        s6 += lhs[i + 6] * rhs[i + 6];
-        s7 += lhs[i + 7] * rhs[i + 7];
-        i += 8;
-    }
-
-    let mut tail = 0.0f32;
-    while i < len {
-        tail += lhs[i] * rhs[i];
-        i += 1;
-    }
-
-    s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + tail
-}
 
 impl ComputationGraph {
     pub fn new() -> Self {

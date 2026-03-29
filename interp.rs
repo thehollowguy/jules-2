@@ -769,6 +769,53 @@ impl EcsWorld {
     }
 }
 
+// Lightweight snapshot of the ECS world used by the frame debugger and scene
+// editor. This captures the set of live entities and their components.
+pub type ComponentMap = std::collections::HashMap<String, Value>;
+
+#[derive(Debug, Clone)]
+pub struct WorldSnapshot {
+    pub entities: Vec<(EntityId, ComponentMap)>,
+}
+
+impl EcsWorld {
+    /// Return a list of component type names currently registered in the world.
+    pub fn component_types(&self) -> Vec<String> {
+        self.components.keys().cloned().collect()
+    }
+
+    /// Capture a serializable snapshot of the current world state.
+    pub fn snapshot(&self) -> WorldSnapshot {
+        let mut entities: Vec<(EntityId, ComponentMap)> = Vec::new();
+        for &id in self.alive.iter() {
+            let mut comps: ComponentMap = HashMap::new();
+            for c in self.component_types() {
+                if let Some(v) = self.get_component(id, &c) {
+                    comps.insert(c.clone(), v.clone());
+                }
+            }
+            entities.push((id, comps));
+        }
+        WorldSnapshot { entities }
+    }
+
+    /// Restore a snapshot into this world, replacing its current contents.
+    pub fn restore_snapshot(&mut self, snap: &WorldSnapshot) {
+        self.next_id = 1;
+        self.alive.clear();
+        self.components.clear();
+        for (id, comps) in &snap.entities {
+            if *id >= self.next_id {
+                self.next_id = *id + 1;
+            }
+            self.alive.insert(*id);
+            for (comp_name, val) in comps {
+                self.insert_component(*id, comp_name, val.clone());
+            }
+        }
+    }
+}
+
 // =============================================================================
 // §4  NEURAL NETWORK MODEL RUNTIME  (Unique Feature 1)
 // =============================================================================

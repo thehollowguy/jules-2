@@ -7,7 +7,7 @@ mod lexer;
 mod parser;
 mod typeck;
 mod sema;
-mod interp;
+pub mod interp;
 mod game_systems;
 mod ml_engine;
 mod optimizer;

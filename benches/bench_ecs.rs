@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use jules::{EcsWorld, Value};
+use jules::interp::{EcsWorld, Value};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
