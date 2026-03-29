@@ -15,6 +15,10 @@ crate-type = ["cdylib", "rlib"]
 name = "jules"
 path = "main.rs"
 
+[[bin]]
+name = "bench-ecs"
+path = "benches/bench_ecs.rs"
+
 [dependencies]
 pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 numpy = { version = "0.21", optional = true }
@@ -24,7 +28,13 @@ parking_lot = "0.12"
 matrixmultiply = "0.3"
 
 [features]
-default = ["ffi-c"]
+default = ["ffi-c", "phase1", "phase2"]
 python = ["pyo3", "numpy"]
 ffi-c = []
-full = ["python", "ffi-c"]
+phase1 = []
+phase2 = []
+phase3-jit = []
+phase4-llvm = []
+phase5-cow = []
+phase6-simd = []
+full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "phase4-llvm", "phase5-cow", "phase6-simd"]

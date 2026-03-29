@@ -354,4 +354,3 @@ cargo check --offline
 /usr/bin/time -p cargo run --offline -- run my_example.jules
 ```
 
-If you want, I can generate these 36 snippets as actual `.jules` files in an `examples/` folder next.
