@@ -59,6 +59,10 @@ struct BorrowChecker {
     ref_binding_to_target: HashMap<String, (String, bool)>, // ref_var -> (target, mut?)
     var_state: HashMap<String, VarState>,
     scope_bindings: Vec<Vec<String>>, // variable names declared in lexical scopes
+    /// Depth counter for parallel constructs (ParallelFor, Spawn).
+    /// Any value > 0 means we are inside a concurrent body where moves and
+    /// `&mut` borrows of outer variables are forbidden.
+    parallel_depth: usize,
 }
 
 impl Default for BorrowChecker {
@@ -69,6 +73,7 @@ impl Default for BorrowChecker {
             ref_binding_to_target: HashMap::new(),
             var_state: HashMap::new(),
             scope_bindings: vec![],
+            parallel_depth: 0,
         }
     }
 }
@@ -89,6 +94,9 @@ impl BorrowChecker {
     }
 
     fn bind_var(&mut self, name: &str) {
+        // If this name already holds a reference, drop that loan before rebinding.
+        // Without this, shadowing a ref variable leaks its loan forever.
+        self.release_ref_binding(name);
         self.var_state.entry(name.to_string()).or_default().moved = false;
         if let Some(scope) = self.scope_bindings.last_mut() {
             scope.push(name.to_string());
@@ -128,6 +136,17 @@ impl BorrowChecker {
             self.diag.error(
                 span,
                 format!("cannot borrow `{target}` because it has been moved"),
+            );
+            return false;
+        }
+        // Mutable borrows inside parallel/spawned bodies are forbidden: they
+        // could alias with borrows in other concurrent threads.
+        if is_mut && self.parallel_depth > 0 {
+            self.diag.error(
+                span,
+                format!(
+                    "cannot mutably borrow `{target}` inside a parallel or spawned block"
+                ),
             );
             return false;
         }
@@ -173,6 +192,12 @@ impl BorrowChecker {
     }
 
     fn check_write(&mut self, name: &str, span: Span) {
+        // Writing to a moved value is always an error: the storage no longer
+        // belongs to this binding (it may have been transferred elsewhere).
+        if self.var_state.get(name).map(|v| v.moved).unwrap_or(false) {
+            self.diag
+                .error(span, format!("cannot assign to `{name}`: value has been moved"));
+        }
         if let Some(st) = self.loans_by_target.get(name) {
             if st.mut_ > 0 || st.imm > 0 {
                 self.diag
@@ -182,6 +207,15 @@ impl BorrowChecker {
     }
 
     fn move_ident(&mut self, name: &str, span: Span) {
+        // Moving out of a variable inside a parallel body is unsafe: another
+        // concurrent thread may still hold a reference to the same value.
+        if self.parallel_depth > 0 {
+            self.diag.error(
+                span,
+                format!("cannot move `{name}` inside a parallel or spawned block"),
+            );
+            return;
+        }
         if let Some(st) = self.loans_by_target.get(name) {
             if st.mut_ > 0 || st.imm > 0 {
                 self.diag.error(
@@ -193,6 +227,47 @@ impl BorrowChecker {
         }
         self.check_read(name, span);
         self.mark_moved(name);
+    }
+
+    /// Validate that a borrow is legal *without* mutating loan state.
+    /// This is used by `check_expr` for inline borrow expressions (&x, &mut x)
+    /// where the enclosing statement handler is responsible for the actual
+    /// loan-state update.  Splitting validation from mutation prevents the
+    /// double-borrow bug that previously caused loans to never be released.
+    fn validate_borrow(&mut self, target: &str, is_mut: bool, span: Span) {
+        if self.var_state.get(target).map(|v| v.moved).unwrap_or(false) {
+            self.diag.error(
+                span,
+                format!("cannot borrow `{target}` because it has been moved"),
+            );
+            return;
+        }
+        if is_mut && self.parallel_depth > 0 {
+            self.diag.error(
+                span,
+                format!(
+                    "cannot mutably borrow `{target}` inside a parallel or spawned block"
+                ),
+            );
+            return;
+        }
+        if let Some(st) = self.loans_by_target.get(target) {
+            if is_mut && (st.mut_ > 0 || st.imm > 0) {
+                self.diag.error(
+                    span,
+                    format!(
+                        "cannot mutably borrow `{target}` because it is already borrowed"
+                    ),
+                );
+            } else if !is_mut && st.mut_ > 0 {
+                self.diag.error(
+                    span,
+                    format!(
+                        "cannot immutably borrow `{target}` because it is already mutably borrowed"
+                    ),
+                );
+            }
+        }
     }
 
     fn bind_reference_var(&mut self, ref_var: &str, target: &str, is_mut: bool) {
@@ -269,18 +344,24 @@ impl BorrowChecker {
         match expr {
             Expr::Ident { name, span } => self.check_read(name, *span),
             Expr::UnOp { op, expr, span } => {
-                if let Expr::Ident { name, .. } = &**expr {
-                    match op {
-                        UnOpKind::Ref => {
-                            let _ = self.try_borrow(name, false, *span);
+                match op {
+                    UnOpKind::Ref | UnOpKind::RefMut => {
+                        let is_mut = matches!(op, UnOpKind::RefMut);
+                        if let Expr::Ident { name, .. } = &**expr {
+                            // SAFETY: Only *validate* here — do not call try_borrow.
+                            // try_borrow (which mutates loan state) is called by the
+                            // enclosing statement handler (Stmt::Let / Expr::Assign)
+                            // after it receives the binding name.  Calling try_borrow
+                            // here too would double-count the loan, leaving it
+                            // permanently non-zero even after the ref goes out of scope.
+                            self.validate_borrow(name, is_mut, *span);
+                        } else {
+                            // Complex operand (&obj.field, etc.) — recurse normally.
+                            self.check_expr(expr);
                         }
-                        UnOpKind::RefMut => {
-                            let _ = self.try_borrow(name, true, *span);
-                        }
-                        _ => {}
                     }
+                    _ => self.check_expr(expr),
                 }
-                self.check_expr(expr);
             }
             Expr::Assign { op, target, value, span } => {
                 match &**target {
@@ -439,6 +520,11 @@ impl BorrowChecker {
             Stmt::Continue { .. } => {}
             Stmt::ForIn { pattern, iter, body, .. } => {
                 self.check_expr(iter);
+                // The for-in loop consumes the iterator by value.  Mark it moved
+                // so any subsequent use is caught as use-after-move.
+                if let Some((name, span)) = Self::expr_as_simple_move(iter) {
+                    self.move_ident(name, span);
+                }
                 self.push_scope();
                 self.bind_pattern_vars(pattern);
                 self.check_block(body);
@@ -460,18 +546,32 @@ impl BorrowChecker {
             Stmt::Match { expr, arms, .. } => {
                 self.check_expr(expr);
                 for arm in arms {
+                    // Each arm gets its own scope so pattern bindings from one
+                    // arm cannot leak into sibling arms or code after the match.
+                    self.push_scope();
+                    self.bind_pattern_vars(&arm.pattern);
                     if let Some(g) = &arm.guard {
                         self.check_expr(g);
                     }
                     self.check_expr(&arm.body);
+                    self.pop_scope();
                 }
             }
             Stmt::Item(_) => {}
             Stmt::ParallelFor(pf) => {
                 self.check_expr(&pf.iter);
+                // Entering a parallel body: increment depth so that move_ident
+                // and try_borrow(mut) will reject any unsafe access inside.
+                self.parallel_depth += 1;
                 self.check_block(&pf.body);
+                self.parallel_depth -= 1;
             }
-            Stmt::Spawn(b) => self.check_block(&b.body),
+            Stmt::Spawn(b) => {
+                // Spawned blocks run concurrently; treat them like parallel bodies.
+                self.parallel_depth += 1;
+                self.check_block(&b.body);
+                self.parallel_depth -= 1;
+            }
             Stmt::Sync(b) => self.check_block(&b.body),
             Stmt::Atomic(b) => self.check_block(&b.body),
         }
