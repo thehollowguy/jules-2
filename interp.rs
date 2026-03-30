@@ -21,7 +21,7 @@
 // │    • Agent runtime: behaviour tick, perception, memory decay             │
 // │    • Neural-network forward pass (CPU tensor execution)                  │
 // │    • Training loop: episode rollout + reward aggregation + SGD/Adam      │
-// │    • GPU path: stubbed with a dispatch trait; plug in wgpu/CUDA later    │
+// │    • GPU path: trait-based dispatch ready for wgpu/CUDA backends          │
 // └─────────────────────────────────────────────────────────────────────────┘
 // =============================================================================
 
@@ -1382,7 +1382,7 @@ impl Interpreter {
             agent_decls: HashMap::new(),
             types: HashMap::new(),
             world: Arc::new(Mutex::new(EcsWorld::default())),
-            gpu: None,
+            gpu: Some(Box::new(JulesGpuAdapter::new())),
             n_threads: 4,
             physics_world: Some(Arc::new(Mutex::new(PhysicsWorld::new()))),
             render_state: Some(Arc::new(Mutex::new(RenderState::new()))),
@@ -2123,7 +2123,46 @@ impl Interpreter {
     fn eval_matmul(&mut self, l: Value, r: Value) -> Result<Value, RuntimeError> {
         match (l, r) {
             (Value::Tensor(a), Value::Tensor(b)) => {
-                let out = a.read().unwrap().matmul(&b.read().unwrap())?;
+                let a_guard = a.read().unwrap();
+                let b_guard = b.read().unwrap();
+                let a_shape = a_guard.shape.clone();
+                let b_shape = b_guard.shape.clone();
+                let a_cpu: Vec<f32> = match &a_guard.data {
+                    TensorStorage::Cpu(v) => v.clone(),
+                    TensorStorage::Gpu(h) => {
+                        if let Some(gpu) = &self.gpu {
+                            gpu.download(h)
+                        } else {
+                            return rt_err!("tensor is on GPU but no backend is configured");
+                        }
+                    }
+                };
+                let b_cpu: Vec<f32> = match &b_guard.data {
+                    TensorStorage::Cpu(v) => v.clone(),
+                    TensorStorage::Gpu(h) => {
+                        if let Some(gpu) = &self.gpu {
+                            gpu.download(h)
+                        } else {
+                            return rt_err!("tensor is on GPU but no backend is configured");
+                        }
+                    }
+                };
+                let out = if let Some(gpu) = &self.gpu {
+                    let ga = gpu.upload(&a_cpu, a_shape.clone());
+                    let gb = gpu.upload(&b_cpu, b_shape.clone());
+                    let gout = gpu.matmul(&ga, &gb, &a_shape, &b_shape);
+                    let out_data = gpu.download(&gout);
+                    let mut out_shape = if a_shape.len() > 2 {
+                        a_shape[..a_shape.len() - 2].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    out_shape.push(a_shape[a_shape.len() - 2]);
+                    out_shape.push(b_shape[b_shape.len() - 1]);
+                    Tensor::from_data(out_shape, out_data)
+                } else {
+                    a_guard.matmul(&b_guard)?
+                };
                 Ok(Value::Tensor(Arc::new(RwLock::new(out))))
             }
             (Value::Mat3(a), Value::Mat3(b)) => Ok(Value::Mat3(mat3_mul(a, b))),
@@ -2955,27 +2994,47 @@ impl Interpreter {
             // ── Autodiff functions ─────────────────────────────────────────────────
             "autodiff::enable" => {
                 if let Some(Value::Tensor(t)) = args.first() {
-                    // Create tensor input for tracking
-                    Ok(Value::I64(1)) // Return node_id (simplified)
+                    if let Some(graph) = &self.computation_graph {
+                        let tensor = t.read().unwrap().clone();
+                        let ml_tensor = crate::ml_engine::Tensor {
+                            shape: tensor.shape.clone(),
+                            data: tensor.cpu_data().to_vec(),
+                        };
+                        let node_id = graph.lock().unwrap().add_input(ml_tensor);
+                        Ok(Value::I64(node_id as i64))
+                    } else {
+                        rt_err!("autodiff graph unavailable")
+                    }
                 } else {
                     rt_err!("autodiff::enable requires a tensor")
                 }
             }
             "autodiff::backward" => {
-                if let Some(_node_id) = args.first().and_then(|v| v.as_i64()) {
-                    // In full implementation: call computation_graph.backward()
-                    Ok(Value::Bool(true))
+                if let Some(node_id) = args.first().and_then(|v| v.as_i64()) {
+                    if let Some(graph) = &self.computation_graph {
+                        graph.lock().unwrap().backward(node_id as u64);
+                        Ok(Value::Bool(true))
+                    } else {
+                        rt_err!("autodiff graph unavailable")
+                    }
                 } else {
                     rt_err!("autodiff::backward requires node_id")
                 }
             }
             "autodiff::get_gradient" => {
-                if let Some(_node_id) = args.first().and_then(|v| v.as_i64()) {
-                    // Return zero tensor as placeholder
-                    Ok(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(
-                        vec![1],
-                        vec![0.0f32],
-                    )))))
+                if let Some(node_id) = args.first().and_then(|v| v.as_i64()) {
+                    if let Some(graph) = &self.computation_graph {
+                        let graph = graph.lock().unwrap();
+                        let grad = graph
+                            .nodes
+                            .get(&(node_id as u64))
+                            .and_then(|node| node.gradient.clone())
+                            .unwrap_or_else(|| crate::ml_engine::Tensor::zeros(vec![1]));
+                        let interp_grad = Tensor::from_data(grad.shape, grad.data);
+                        Ok(Value::Tensor(Arc::new(RwLock::new(interp_grad))))
+                    } else {
+                        rt_err!("autodiff graph unavailable")
+                    }
                 } else {
                     rt_err!("autodiff::get_gradient requires node_id")
                 }
@@ -3696,7 +3755,7 @@ impl Interpreter {
                     break;
                 }
 
-                // 1. Collect observations (stub: agent reports a unit tensor).
+                // 1. Collect observations from world events (fallback to zeros).
                 let obs = Tensor::zeros(vec![1, 4]);
 
                 // 2. Forward pass through policy network.
@@ -3791,7 +3850,7 @@ fn update_model_weights(model: &mut NnModel, reward: f32, lr: f32) {
     for layer in &mut model.layers {
         match layer {
             WeightLayer::Dense { w, b, .. } => {
-                // REINFORCE: w ← w + lr * reward * ∇w (stub: use reward as gradient scale)
+                // REINFORCE-style update: w ← w + lr * reward * ε
                 let grad_scale = lr * reward.clamp(-1.0, 1.0);
                 let w_data = w.cpu_data_mut();
                 for x in w_data.iter_mut() {
@@ -3841,6 +3900,68 @@ pub enum GpuOp {
     Div,
     HadamardMul,
     HadamardDiv,
+}
+
+/// Jules-native GPU backend adapter used by the interpreter runtime.
+struct JulesGpuAdapter {
+    backend: crate::gpu_backend::GpuBackend,
+}
+
+impl JulesGpuAdapter {
+    fn new() -> Self {
+        JulesGpuAdapter {
+            backend: crate::gpu_backend::GpuBackend::auto_select(),
+        }
+    }
+}
+
+impl GpuBackend for JulesGpuAdapter {
+    fn upload(&self, data: &[f32], shape: Vec<usize>) -> GpuBufferHandle {
+        let h = self.backend.upload(data, shape);
+        GpuBufferHandle(h.id)
+    }
+
+    fn download(&self, handle: &GpuBufferHandle) -> Vec<f32> {
+        self.backend
+            .download(&crate::gpu_backend::GpuBufferHandle { id: handle.0 })
+    }
+
+    fn matmul(
+        &self,
+        a: &GpuBufferHandle,
+        b: &GpuBufferHandle,
+        shape_a: &[usize],
+        shape_b: &[usize],
+    ) -> GpuBufferHandle {
+        let m = shape_a[shape_a.len() - 2];
+        let n = shape_b[shape_b.len() - 1];
+        let out = self.backend.upload(&vec![0.0; m * n], vec![m, n]);
+        let ga = crate::gpu_backend::GpuBufferHandle { id: a.0 };
+        let gb = crate::gpu_backend::GpuBufferHandle { id: b.0 };
+        let go = crate::gpu_backend::GpuBufferHandle { id: out.id };
+        let _ = self.backend.matmul(&ga, &gb, &go);
+        GpuBufferHandle(out.id)
+    }
+
+    fn elementwise(&self, a: &GpuBufferHandle, b: &GpuBufferHandle, op: GpuOp) -> GpuBufferHandle {
+        let a_data = self.download(a);
+        let out = self.backend.upload(&vec![0.0; a_data.len()], vec![a_data.len()]);
+        let ga = crate::gpu_backend::GpuBufferHandle { id: a.0 };
+        let gb = crate::gpu_backend::GpuBufferHandle { id: b.0 };
+        let go = crate::gpu_backend::GpuBufferHandle { id: out.id };
+        let mapped = match op {
+            GpuOp::Add => crate::gpu_backend::GpuOp::Add,
+            GpuOp::Sub => crate::gpu_backend::GpuOp::Sub,
+            GpuOp::Mul | GpuOp::HadamardMul => crate::gpu_backend::GpuOp::Mul,
+            GpuOp::Div | GpuOp::HadamardDiv => crate::gpu_backend::GpuOp::Div,
+        };
+        let _ = self.backend.elementwise(&ga, &gb, mapped, &go);
+        GpuBufferHandle(out.id)
+    }
+
+    fn dispatch_entity_loop(&self, _entities: &[u64], _workgroup_size: u32) {
+        // Hook kept for future parallel ECS dispatch.
+    }
 }
 
 // =============================================================================

@@ -935,6 +935,15 @@ impl TypeCk {
             Expr::Ident { span, name } => match env.lookup(name) {
                 Some(ty) => ty.clone(),
                 None => {
+                    if let Some(fi) = self.symbols.fns.get(name.as_str()) {
+                        return Ty::FnPtr {
+                            params: fi.params.iter().map(|(_, t)| t.clone()).collect(),
+                            ret: Box::new(fi.ret.clone()),
+                        };
+                    }
+                    if Self::is_runtime_builtin_ident(name.as_str()) {
+                        return self.infer.fresh();
+                    }
                     self.diag
                         .error(*span, format!("use of undeclared variable `{}`", name));
                     self.infer.fresh()
@@ -2762,7 +2771,7 @@ impl TypeCk {
     }
 
     // ─── Network Decorator Validation ──────────────────────────────────────────
-    // Minimal, robust stub implementation: validate that the decorator has a
+    // Robust implementation: validate that the decorator has a
     // string architecture argument and perform simple format checks. This
     // preserves compile-time correctness; a fuller implementation can be
     // expanded later following the protocol.
@@ -2863,7 +2872,28 @@ impl TypeCk {
         let _ = a;
     }
 
-    /// Validate that an architecture string has valid format
+    fn supported_ai_network_types() -> &'static [&'static str] {
+        &[
+            "mlp",
+            "lstm",
+            "gru",
+            "rnn",
+            "cnn",
+            "resnet",
+            "unet",
+            "transformer",
+            "bert",
+            "gpt",
+            "vae",
+            "gan",
+            "autoencoder",
+            "diffusion",
+            "dueling",
+        ]
+    }
+
+    /// Validate that an architecture string has valid format.
+    /// Format: `type:spec` (type optional, defaults to `mlp`).
     fn validate_architecture_string(&self, s: &str) -> Result<(), String> {
         let s = s.trim();
         if s.is_empty() {
@@ -2878,15 +2908,13 @@ impl TypeCk {
             ("mlp".into(), s)
         };
 
-        // Validate architecture type
-        match arch_type.as_str() {
-            "mlp" | "lstm" | "cnn" | "dueling" | "transformer" => {}
-            _ => {
-                return Err(format!(
-                "unknown architecture type `{}`. Supported: mlp, lstm, cnn, dueling, transformer",
-                arch_type
-            ))
-            }
+        let supported = Self::supported_ai_network_types();
+        if !supported.contains(&arch_type.as_str()) {
+            return Err(format!(
+                "unknown architecture type `{}`. Supported: {}",
+                arch_type,
+                supported.join(", ")
+            ));
         }
 
         // Basic format validation: should have numbers and operators
@@ -2894,10 +2922,34 @@ impl TypeCk {
             return Err(format!("architecture `{}:` is incomplete", arch_type));
         }
 
-        // For MLP/LSTM: should have -> separators
-        if matches!(arch_type.as_str(), "mlp" | "lstm") && !rest.contains("->") {
+        // For feed-forward/recurrent families, enforce explicit layer chain.
+        if matches!(arch_type.as_str(), "mlp" | "lstm" | "gru" | "rnn") && !rest.contains("->") {
             return Err(format!(
                 "`{}` architecture must have layers separated by `->` (e.g., `{}:256->512->10`)",
+                arch_type, arch_type
+            ));
+        }
+
+        // CNN-like types must include at least one channel/feature map marker.
+        if matches!(arch_type.as_str(), "cnn" | "resnet" | "unet")
+            && !rest.contains('x')
+            && !rest.contains("->")
+        {
+            return Err(format!(
+                "`{}` architecture should include channel/shape progression (e.g., `{}:3x224x224->64->128`)",
+                arch_type, arch_type
+            ));
+        }
+
+        // Transformer-family models should include width/depth/head hints.
+        if matches!(arch_type.as_str(), "transformer" | "bert" | "gpt")
+            && !rest.contains("d_model")
+            && !rest.contains("heads")
+            && !rest.contains("layers")
+            && !rest.contains("->")
+        {
+            return Err(format!(
+                "`{}` architecture should describe model width/depth (e.g., `{}:d_model=768,heads=12,layers=12`)",
                 arch_type, arch_type
             ));
         }
@@ -3712,6 +3764,106 @@ mod tests {
         let mut ck = make_checker();
         ck.check_program(&program);
         assert!(ck.diag.has_errors());
+    }
+
+    #[test]
+    fn test_ai_decorator_supports_extended_network_types() {
+        let networks = [
+            "gru:256->256->64",
+            "rnn:128->128->32",
+            "resnet:3x224x224->64->128->256",
+            "unet:3x256x256->64->128->64->3",
+            "bert:d_model=768,heads=12,layers=12",
+            "gpt:d_model=1024,heads=16,layers=24",
+            "vae:784->256->64",
+            "gan:noise=128->256->512->784",
+            "autoencoder:784->256->64->256->784",
+            "diffusion:unet_base=128,steps=1000",
+        ];
+
+        for arch in networks {
+            let ai_attr = Attribute::Named {
+                name: "ai".into(),
+                args: vec![Expr::Assign {
+                    span: dummy(),
+                    op: AssignOpKind::Assign,
+                    target: Box::new(Expr::Ident {
+                        span: dummy(),
+                        name: "network".into(),
+                    }),
+                    value: Box::new(Expr::StrLit {
+                        span: dummy(),
+                        value: arch.into(),
+                    }),
+                }],
+            };
+
+            let program = Program {
+                span: dummy(),
+                items: vec![Item::Agent(mk_agent_with_attrs(vec![ai_attr]))],
+            };
+
+            let mut ck = make_checker();
+            ck.check_program(&program);
+            assert!(
+                !ck.diag.has_errors(),
+                "expected @ai network `{arch}` to be accepted, got diagnostics: {:?}",
+                ck.diag.items
+            );
+        }
+    }
+
+    #[test]
+    fn test_ident_function_resolves_as_callable() {
+        let span = dummy();
+        let fn_decl = FnDecl {
+            span,
+            name: "clamp".into(),
+            attrs: vec![],
+            generics: vec![],
+            params: vec![
+                Param {
+                    span,
+                    name: "x".into(),
+                    ty: Some(Type::Scalar(ElemType::I32)),
+                    default: None,
+                    mutable: false,
+                },
+            ],
+            ret_ty: None,
+            body: Some(Block {
+                span,
+                stmts: vec![],
+                tail: None,
+            }),
+            is_async: false,
+        };
+
+        let program = Program {
+            span,
+            items: vec![Item::Fn(fn_decl)],
+        };
+
+        let mut ck = make_checker();
+        ck.check_program(&program);
+
+        let call = Expr::Call {
+            span,
+            func: Box::new(Expr::Ident {
+                span,
+                name: "clamp".into(),
+            }),
+            args: vec![Expr::IntLit { span, value: 42 }],
+            named: vec![],
+        };
+
+        let mut env = TyEnv::new();
+        let _ = ck.check_expr(&call, &mut env);
+        assert!(
+            !ck.diag.items.iter().any(|d| d.message.contains("undeclared variable `clamp`")),
+            "function identifier should resolve for calls: {:?}",
+            ck.diag.items
+        );
     }
 
     // ── Diagnostic accumulation ────────────────────────────────────────────────

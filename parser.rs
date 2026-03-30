@@ -214,18 +214,33 @@ fn token_label(kind: &TokenKind) -> String {
     }
 }
 
-fn expected_token_hint(expected: &TokenKind, found: &TokenKind) -> Option<&'static str> {
+fn expected_token_hint(expected: &TokenKind, found: &TokenKind) -> Option<String> {
     match expected {
-        TokenKind::Semicolon => Some("add `;` to end this statement"),
-        TokenKind::RParen => Some("close this expression with `)`"),
-        TokenKind::RBrace => Some("close this block with `}`"),
-        TokenKind::RBracket => Some("close this index/type with `]`"),
-        TokenKind::LBrace => Some("start a block with `{ ... }`"),
-        TokenKind::Comma => Some("separate items with `,`"),
-        TokenKind::Arrow => Some("use `->` before a return type"),
-        TokenKind::Eq => Some("use `=` to assign a value"),
-        _ if matches!(found, TokenKind::Eof) => Some("you may be missing code at the end of the file"),
-        _ => None,
+        TokenKind::Semicolon => Some(match found {
+            TokenKind::KwLet
+            | TokenKind::KwFn
+            | TokenKind::KwIf
+            | TokenKind::KwFor
+            | TokenKind::KwWhile
+            | TokenKind::KwReturn => {
+                "missing `;` before the next statement; add `;` to end this statement".into()
+            }
+            _ => "add `;` to end this statement".into(),
+        }),
+        TokenKind::RParen => Some("close this expression with `)`".into()),
+        TokenKind::RBrace => Some("close this block with `}`".into()),
+        TokenKind::RBracket => Some("close this index/type with `]`".into()),
+        TokenKind::LBrace => Some("start a block with `{ ... }` after this declaration".into()),
+        TokenKind::Comma => Some("separate items with `,`".into()),
+        TokenKind::Arrow => Some("use `->` before a return type".into()),
+        TokenKind::Eq => Some(match found {
+            TokenKind::EqEq => "use `=` to assign a value (not `==`)".into(),
+            _ => "use `=` to assign a value".into(),
+        }),
+        _ if matches!(found, TokenKind::Eof) => {
+            Some("you may be missing code at the end of the file".into())
+        }
+        _ => None
     }
 }
 

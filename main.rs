@@ -23,7 +23,7 @@ mod phase5_cow;
 #[cfg(feature = "phase6-simd")]
 pub mod phase6_simd;
 
-// Game-dev tooling scaffolds (non-functional stubs; implement per roadmap)
+// Game-dev tooling modules used by the runtime and editor workflows.
 pub mod frame_debugger;
 pub mod scene_editor;
 pub mod asset_importer;
@@ -78,7 +78,7 @@ pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
 
 // Pull in the compiler passes.  In a real crate these would be separate modules.
 use crate::lexer::{Lexer, LexError, Span};
-// use crate::parser::Parser;   // ← not yet wired; placeholder below
+// use crate::parser::Parser;   // parser wired through `Pipeline`
 // use crate::typeck::TypeCk;
 // use crate::sema::SemaCtx;
 // use crate::interp::Interpreter;
@@ -752,6 +752,12 @@ fn insert_char_at_byte(source: &mut String, byte_idx: usize, ch: char) {
     }
 }
 
+fn replace_byte_range(source: &mut String, start: usize, end: usize, replacement: &str) {
+    if start <= end && end <= source.len() {
+        source.replace_range(start..end, replacement);
+    }
+}
+
 fn apply_safe_syntax_fixes(source: &str, diags: &[Diag]) -> Option<String> {
     let mut out = source.to_string();
     let mut changed = false;
@@ -764,6 +770,9 @@ fn apply_safe_syntax_fixes(source: &str, diags: &[Diag]) -> Option<String> {
 
     let mut semicolon_lines = std::collections::BTreeSet::<u32>::new();
     let mut insertions: Vec<(usize, char)> = Vec::new();
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let mut block_open_insertions: Vec<usize> = Vec::new();
+    let mut comma_insertions: Vec<usize> = Vec::new();
 
     for d in diags {
         let Some(span) = d.span else { continue };
@@ -776,7 +785,34 @@ fn apply_safe_syntax_fixes(source: &str, diags: &[Diag]) -> Option<String> {
             insertions.push((span.start, ']'));
         } else if hint.contains("close this block with `}`") {
             insertions.push((span.start, '}'));
+        } else if hint.contains("start a block with `{ ... }`") {
+            block_open_insertions.push(span.start);
+        } else if hint.contains("separate items with `,`") {
+            comma_insertions.push(span.start);
+        } else if hint.contains("use `=` to assign a value") {
+            replacements.push((span.start, span.end, "=".into()));
+        } else if hint.contains("use `->` before a return type") {
+            replacements.push((span.start, span.end, "->".into()));
         }
+    }
+
+    replacements.sort_by(|a, b| b.0.cmp(&a.0));
+    for (start, end, rep) in replacements {
+        replace_byte_range(&mut out, start, end, &rep);
+        changed = true;
+    }
+
+    block_open_insertions.sort_by(|a, b| b.cmp(a));
+    for idx in block_open_insertions {
+        insert_char_at_byte(&mut out, idx, '{');
+        insert_char_at_byte(&mut out, idx + 1, ' ');
+        changed = true;
+    }
+
+    comma_insertions.sort_by(|a, b| b.cmp(a));
+    for idx in comma_insertions {
+        insert_char_at_byte(&mut out, idx, ',');
+        changed = true;
     }
 
     insertions.sort_by(|a, b| b.0.cmp(&a.0));
@@ -1400,6 +1436,22 @@ mod tests {
     fn test_apply_safe_syntax_fixes_keyword_typo() {
         let fixed = apply_safe_syntax_fixes("fun main() {}", &[]).unwrap();
         assert_eq!(fixed, "fn main() {}");
+    }
+
+    #[test]
+    fn test_apply_safe_syntax_fixes_assignment_operator() {
+        let diags = vec![Diag::error(sp(1, 7, 6, 8), "bad assignment")
+            .with_hint("use `=` to assign a value (not `==`)")];
+        let fixed = apply_safe_syntax_fixes("let x == 1;", &diags).unwrap();
+        assert_eq!(fixed, "let x = 1;");
+    }
+
+    #[test]
+    fn test_apply_safe_syntax_fixes_missing_comma() {
+        let diags = vec![Diag::error(sp(1, 6, 5, 5), "missing comma")
+            .with_hint("separate items with `,`")];
+        let fixed = apply_safe_syntax_fixes("foo(a b)", &diags).unwrap();
+        assert_eq!(fixed, "foo(a, b)");
     }
 
     // ── Diagnostic construction ────────────────────────────────────────────────

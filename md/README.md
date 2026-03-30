@@ -53,11 +53,21 @@ jules fix path/to/file.jules
 ```
 
 `jules fix` applies safe automatic syntax fixes from parser diagnostics
-(e.g. missing `;`, missing `)`, `]`, `}`, and common `fun`/`func` → `fn`
-keyword typo recovery).
+(e.g. missing `;`, missing `)`, `]`, `}`, missing `,`, assignment/operator
+replacement like `==`→`=`, return arrow insertion, block opener insertion,
+and common `fun`/`func` → `fn` keyword typo recovery).
 
 ## Run a sample game script
 
 ```bash
 cargo run --offline -- run small_game.jules
+```
+
+## Arcade game example
+
+The repository also includes `game_arcade_showcase.jules`, a compact arcade
+loop example (player/enemy movement, collisions, waves, scoring, HP).
+
+```bash
+cargo run --bin jules -- check game_arcade_showcase.jules
 ```
