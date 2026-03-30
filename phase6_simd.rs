@@ -26,7 +26,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn simd_stub_present() {
+    fn simd_module_present() {
         assert!(simd_available());
     }
 

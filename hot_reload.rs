@@ -6,8 +6,12 @@ use std::time::{SystemTime, Duration};
 use std::thread;
 use std::sync::{Arc, Mutex};
 use std::fs;
+use lazy_static::lazy_static;
 
 type Callback = Box<dyn Fn(&PathBuf) + Send + Sync + 'static>;
+lazy_static! {
+    static ref MODULE_CACHE: Mutex<HashMap<String, (SystemTime, usize)>> = Mutex::new(HashMap::new());
+}
 
 #[derive(Clone)]
 pub struct Watcher {
@@ -67,7 +71,15 @@ impl Watcher {
 
 pub fn available() -> bool { true }
 
-pub fn reload_module(_name: &str) -> Result<(), String> { Ok(()) }
+pub fn reload_module(name: &str) -> Result<(), String> {
+    let path = PathBuf::from(name);
+    let meta = fs::metadata(&path).map_err(|e| format!("module `{name}` metadata error: {e}"))?;
+    let mtime = meta.modified().map_err(|e| format!("module `{name}` mtime error: {e}"))?;
+    let content = fs::read_to_string(&path).map_err(|e| format!("module `{name}` read error: {e}"))?;
+    let mut cache = MODULE_CACHE.lock().unwrap();
+    cache.insert(name.to_string(), (mtime, content.len()));
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

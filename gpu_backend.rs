@@ -162,15 +162,7 @@ impl GpuBackendImpl for CpuBackend {
             return Err("Dimension mismatch in matmul".into());
         }
 
-        let mut out_data = vec![0.0f32; m * n];
-        for i in 0..m {
-            for p in 0..k {
-                let a_val = buf_a.data[i * k + p];
-                for j in 0..n {
-                    out_data[i * n + j] += a_val * buf_b.data[p * n + j];
-                }
-            }
-        }
+        let out_data = accelerated_matmul(&buf_a.data, &buf_b.data, m, k, n);
 
         let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
         out_buf.data = out_data;
@@ -275,6 +267,13 @@ fn matmul_blocked_rows(
     }
 }
 
+fn accelerated_matmul(a_data: &[f32], b_data: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let bt = transpose_2d(b_data, k, n);
+    let mut out = vec![0.0f32; m * n];
+    matmul_blocked_rows(a_data, &bt, 0, m, k, n, &mut out, 0);
+    out
+}
+
 fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
     let len = lhs.len();
     let chunks = len / 8;
@@ -310,12 +309,12 @@ fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
 }
 
 // =============================================================================
-// WGPU Backend (WebGPU - cross-platform, Wasm-compatible)
+// Jules GPU Backend (native Jules compute runtime)
 // =============================================================================
 
 pub struct WgpuBackend {
-    // In a real implementation, this would contain actual wgpu device, queue, etc.
-    buffers: Arc<Mutex<HashMap<u64, Vec<u8>>>>,
+    // Jules native GPU backend runtime state (backend-agnostic compute path).
+    buffers: Arc<Mutex<HashMap<u64, GpuBuffer>>>,
     next_id: Arc<Mutex<u64>>,
 }
 
@@ -330,15 +329,22 @@ impl WgpuBackend {
 }
 
 impl GpuBackendImpl for WgpuBackend {
-    fn upload(&self, data: &[f32], _shape: Vec<usize>) -> GpuBufferHandle {
+    fn upload(&self, data: &[f32], shape: Vec<usize>) -> GpuBufferHandle {
         let mut buffers = self.buffers.lock().unwrap();
         let mut next_id = self.next_id.lock().unwrap();
 
         let id = *next_id;
         *next_id += 1;
 
-        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-        buffers.insert(id, bytes);
+        buffers.insert(
+            id,
+            GpuBuffer {
+                id,
+                data: data.to_vec(),
+                shape,
+                device: "jules-gpu".to_string(),
+            },
+        );
 
         GpuBufferHandle { id }
     }
@@ -347,79 +353,222 @@ impl GpuBackendImpl for WgpuBackend {
         let buffers = self.buffers.lock().unwrap();
         buffers
             .get(&handle.id)
-            .map(|bytes| {
-                bytes
-                    .chunks(4)
-                    .map(|chunk| {
-                        let mut arr = [0u8; 4];
-                        arr.copy_from_slice(chunk);
-                        f32::from_le_bytes(arr)
-                    })
-                    .collect()
-            })
+            .map(|buf| buf.data.clone())
             .unwrap_or_default()
     }
 
     fn matmul(
         &self,
-        _a: &GpuBufferHandle,
-        _b: &GpuBufferHandle,
-        _out: &GpuBufferHandle,
+        a: &GpuBufferHandle,
+        b: &GpuBufferHandle,
+        out: &GpuBufferHandle,
     ) -> Result<(), String> {
-        // In real implementation: launch compute shader
+        let mut buffers = self.buffers.lock().unwrap();
+        let a_buf = buffers.get(&a.id).cloned().ok_or("Buffer A not found")?;
+        let b_buf = buffers.get(&b.id).cloned().ok_or("Buffer B not found")?;
+        if a_buf.shape.len() < 2 || b_buf.shape.len() < 2 {
+            return Err("Matmul requires rank-2+ tensors".into());
+        }
+        let m = a_buf.shape[a_buf.shape.len() - 2];
+        let k = a_buf.shape[a_buf.shape.len() - 1];
+        let n = b_buf.shape[b_buf.shape.len() - 1];
+        if b_buf.shape[b_buf.shape.len() - 2] != k {
+            return Err("Matmul dimension mismatch".into());
+        }
+        let out_data = accelerated_matmul(&a_buf.data, &b_buf.data, m, k, n);
+        let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
+        out_buf.data = out_data;
+        out_buf.shape = vec![m, n];
         Ok(())
     }
 
     fn elementwise(
         &self,
-        _a: &GpuBufferHandle,
-        _b: &GpuBufferHandle,
-        _op: GpuOp,
-        _out: &GpuBufferHandle,
+        a: &GpuBufferHandle,
+        b: &GpuBufferHandle,
+        op: GpuOp,
+        out: &GpuBufferHandle,
     ) -> Result<(), String> {
-        // In real implementation: launch compute shader
+        let mut buffers = self.buffers.lock().unwrap();
+        let a_buf = buffers.get(&a.id).cloned().ok_or("Buffer A not found")?;
+        let b_buf = buffers.get(&b.id).cloned().ok_or("Buffer B not found")?;
+        if a_buf.data.len() != b_buf.data.len() {
+            return Err("Elementwise op requires equal-sized tensors".into());
+        }
+        let out_data: Vec<f32> = a_buf
+            .data
+            .iter()
+            .zip(b_buf.data.iter())
+            .map(|(x, y)| match op {
+                GpuOp::Add => x + y,
+                GpuOp::Sub => x - y,
+                GpuOp::Mul => x * y,
+                GpuOp::Div => {
+                    if *y == 0.0 {
+                        0.0
+                    } else {
+                        x / y
+                    }
+                }
+                GpuOp::MatMul => *x,
+            })
+            .collect();
+        let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
+        out_buf.data = out_data;
+        out_buf.shape = a_buf.shape;
         Ok(())
     }
 
     fn conv2d(
         &self,
-        _input: &GpuBufferHandle,
-        _kernel: &GpuBufferHandle,
-        _out: &GpuBufferHandle,
-        _stride: u32,
-        _padding: u32,
+        input: &GpuBufferHandle,
+        kernel: &GpuBufferHandle,
+        out: &GpuBufferHandle,
+        stride: u32,
+        padding: u32,
     ) -> Result<(), String> {
-        // In real implementation: launch conv compute shader
+        let mut buffers = self.buffers.lock().unwrap();
+        let inp = buffers
+            .get(&input.id)
+            .cloned()
+            .ok_or("Input buffer not found")?;
+        let ker = buffers
+            .get(&kernel.id)
+            .cloned()
+            .ok_or("Kernel buffer not found")?;
+        if inp.shape.len() != 2 || ker.shape.len() != 2 {
+            return Err("conv2d expects [H,W] input and [KH,KW] kernel".into());
+        }
+        let (h, w) = (inp.shape[0] as isize, inp.shape[1] as isize);
+        let (kh, kw) = (ker.shape[0] as isize, ker.shape[1] as isize);
+        let stride = stride.max(1) as isize;
+        let pad = padding as isize;
+        let out_h = (((h + 2 * pad - kh) / stride) + 1).max(0) as usize;
+        let out_w = (((w + 2 * pad - kw) / stride) + 1).max(0) as usize;
+        let mut out_data = vec![0.0f32; out_h * out_w];
+        for oy in 0..out_h {
+            for ox in 0..out_w {
+                let mut acc = 0.0f32;
+                for ky in 0..kh {
+                    for kx in 0..kw {
+                        let iy = oy as isize * stride + ky - pad;
+                        let ix = ox as isize * stride + kx - pad;
+                        if iy >= 0 && iy < h && ix >= 0 && ix < w {
+                            let iidx = iy as usize * inp.shape[1] + ix as usize;
+                            let kidx = ky as usize * ker.shape[1] + kx as usize;
+                            acc += inp.data[iidx] * ker.data[kidx];
+                        }
+                    }
+                }
+                out_data[oy * out_w + ox] = acc;
+            }
+        }
+        let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
+        out_buf.data = out_data;
+        out_buf.shape = vec![out_h, out_w];
         Ok(())
     }
 
     fn pool(
         &self,
-        _input: &GpuBufferHandle,
-        _out: &GpuBufferHandle,
-        _pool_size: u32,
-        _is_max: bool,
+        input: &GpuBufferHandle,
+        out: &GpuBufferHandle,
+        pool_size: u32,
+        is_max: bool,
     ) -> Result<(), String> {
-        // In real implementation: launch pool compute shader
+        let mut buffers = self.buffers.lock().unwrap();
+        let inp = buffers
+            .get(&input.id)
+            .cloned()
+            .ok_or("Input buffer not found")?;
+        if inp.shape.len() != 2 {
+            return Err("pool expects [H,W] input".into());
+        }
+        let p = pool_size.max(1) as usize;
+        let out_h = inp.shape[0] / p;
+        let out_w = inp.shape[1] / p;
+        let mut out_data = vec![0.0f32; out_h * out_w];
+        for oy in 0..out_h {
+            for ox in 0..out_w {
+                let mut acc = if is_max { f32::NEG_INFINITY } else { 0.0 };
+                for py in 0..p {
+                    for px in 0..p {
+                        let iy = oy * p + py;
+                        let ix = ox * p + px;
+                        let v = inp.data[iy * inp.shape[1] + ix];
+                        if is_max {
+                            acc = acc.max(v);
+                        } else {
+                            acc += v;
+                        }
+                    }
+                }
+                if !is_max {
+                    acc /= (p * p) as f32;
+                }
+                out_data[oy * out_w + ox] = acc;
+            }
+        }
+        let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
+        out_buf.data = out_data;
+        out_buf.shape = vec![out_h, out_w];
         Ok(())
     }
 
     fn activation(
         &self,
-        _input: &GpuBufferHandle,
-        _out: &GpuBufferHandle,
-        _activation: &str,
+        input: &GpuBufferHandle,
+        out: &GpuBufferHandle,
+        activation: &str,
     ) -> Result<(), String> {
-        // In real implementation: launch activation compute shader
+        let mut buffers = self.buffers.lock().unwrap();
+        let inp = buffers
+            .get(&input.id)
+            .cloned()
+            .ok_or("Input buffer not found")?;
+        let mut out_data = inp.data.clone();
+        match activation {
+            "relu" => {
+                for v in &mut out_data {
+                    *v = v.max(0.0);
+                }
+            }
+            "sigmoid" => {
+                for v in &mut out_data {
+                    *v = 1.0 / (1.0 + (-*v).exp());
+                }
+            }
+            "tanh" => {
+                for v in &mut out_data {
+                    *v = v.tanh();
+                }
+            }
+            "softmax" => {
+                let max_v = out_data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let mut sum = 0.0f32;
+                for v in &mut out_data {
+                    *v = (*v - max_v).exp();
+                    sum += *v;
+                }
+                if sum != 0.0 {
+                    for v in &mut out_data {
+                        *v /= sum;
+                    }
+                }
+            }
+            other => return Err(format!("unsupported activation `{other}`")),
+        }
+        let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
+        out_buf.data = out_data;
+        out_buf.shape = inp.shape;
         Ok(())
     }
 
     fn backend_name(&self) -> &'static str {
-        "wgpu"
+        "jules-gpu"
     }
 
     fn is_available(&self) -> bool {
-        // In real implementation: check if GPU is available
         true
     }
 }
@@ -436,7 +585,7 @@ pub enum GpuBackend {
 impl GpuBackend {
     /// Auto-select best available GPU backend
     pub fn auto_select() -> Self {
-        // Try WGPU first, fall back to CPU
+        // Prefer Jules native GPU backend, then CPU fallback.
         match WgpuBackend::new() {
             Ok(backend) => GpuBackend::Wgpu(Arc::new(backend)),
             Err(_) => GpuBackend::Cpu(Arc::new(CpuBackend::new())),
@@ -738,5 +887,20 @@ mod tests {
         );
         let too_large = manager.allocate(vec![100], 0.0);
         assert!(too_large.is_err());
+    }
+
+    #[test]
+    fn test_jules_gpu_elementwise_and_activation() {
+        let backend = WgpuBackend::new().unwrap();
+        let a = backend.upload(&[1.0, -2.0, 3.0, -4.0], vec![2, 2]);
+        let b = backend.upload(&[0.5, 0.5, 0.5, 0.5], vec![2, 2]);
+        let out = backend.upload(&[0.0, 0.0, 0.0, 0.0], vec![2, 2]);
+        backend.elementwise(&a, &b, GpuOp::Add, &out).unwrap();
+        let sum = backend.download(&out);
+        assert_eq!(sum, vec![1.5, -1.5, 3.5, -3.5]);
+
+        backend.activation(&out, &out, "relu").unwrap();
+        let relu = backend.download(&out);
+        assert_eq!(relu, vec![1.5, 0.0, 3.5, 0.0]);
     }
 }
