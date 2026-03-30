@@ -516,7 +516,10 @@ impl TypeCk {
     }
 
     fn is_runtime_builtin_ident(name: &str) -> bool {
-        matches!(name, "println" | "print")
+        matches!(
+            name,
+            "println" | "print" | "dataloader" | "pipeline" | "range" | "arange" | "zeros" | "ones"
+        )
     }
 
     pub fn new() -> Self {
@@ -662,7 +665,16 @@ impl TypeCk {
                             }
                         } else {
                             // Not yet declared — emit an error, return infer.
-                            self.diag.error(span, format!("unknown type `{}`", name));
+                            self.diag.error(
+                                span,
+                                format!(
+                                    "unknown type `{}` — no struct, component, or enum with \
+                                     this name has been declared. Declare it before use with \
+                                     `struct {} {{ ... }}` or `component {} {{ ... }}`, \
+                                     or check for a spelling mistake.",
+                                    name, name, name
+                                ),
+                            );
                             self.infer.fresh()
                         }
                     }
@@ -679,8 +691,14 @@ impl TypeCk {
                         len: n,
                     }
                 } else {
-                    self.diag
-                        .error(span, "array length must be a compile-time constant");
+                    self.diag.error(
+                            span,
+                            "array length must be a compile-time constant — use a literal \
+                             integer (e.g. `[f32; 16]`) or a `const` declaration \
+                             (e.g. `const N: usize = 16; let a: [f32; N] = ...`). \
+                             Dynamic lengths are not allowed in array types; \
+                             use a `Slice` or `Vec` if the length is runtime-determined."
+                        );
                     self.infer.fresh()
                 }
             }
@@ -789,7 +807,11 @@ impl TypeCk {
                     self.diag.warning(
                         param.span,
                         format!(
-                            "parameter `{}` has no type annotation; inferred as `_`",
+                            "parameter `{}` has no type annotation — add an explicit type \
+                             like `{}: f32`, or use `_` as a wildcard placeholder if the \
+                             type is fully inferred from call sites. Unannotated function \
+                             parameters make overload resolution and documentation harder.",
+                            param.name,
                             param.name
                         ),
                     );
@@ -812,10 +834,18 @@ impl TypeCk {
                 self.diag.error(
                     f.span,
                     format!(
-                        "function `{}` declared to return `{}` but body returns `{}`",
+                        "function `{}` is declared to return `{}` but its body produces `{}`. \
+                         Fix this by either:\n  \
+                         (a) changing the return type annotation to `-> {}`, or\n  \
+                         (b) ensuring the final expression in the body has type `{}`.\n  \
+                         If the function should not return a value, remove the `-> {}` \
+                         annotation and add a `;` after the last statement.",
                         f.name,
                         self.infer.resolve(&ret_ty).display(),
                         self.infer.resolve(&body_ty).display(),
+                        self.infer.resolve(&body_ty).display(),
+                        self.infer.resolve(&ret_ty).display(),
+                        self.infer.resolve(&ret_ty).display(),
                     ),
                 );
             }
@@ -852,8 +882,12 @@ impl TypeCk {
                 self.diag.error(
                     param.span,
                     format!(
-                        "system parameter `{}` must have an explicit type annotation \
-                     (system parameters become GPU uniforms / push constants)",
+                        "system parameter `{}` must have an explicit type annotation — \
+                         system parameters are lowered to GPU uniforms or push constants \
+                         and must have a concrete type at compile time. \
+                         Add a type annotation: `{}: f32` (or the appropriate type). \
+                         Example: `system update(dt: f32, gravity: vec3) {{ ... }}`",
+                        param.name,
                         param.name
                     ),
                 );
@@ -878,7 +912,14 @@ impl TypeCk {
                 if !self.symbols.structs.contains_key(comp.as_str()) {
                     self.diag.error(
                         q.span,
-                        format!("query references unknown component `{}`", comp),
+                        format!(
+                            "query references unknown component `{}` — \
+                             declare it first with `component {} {{ ... }}` \
+                             above the system, or check for a spelling mistake. \
+                             All components used in `with` / `without` clauses \
+                             must be declared at the top level.",
+                            comp, comp
+                        ),
                     );
                 }
             }
@@ -945,7 +986,13 @@ impl TypeCk {
                         return self.infer.fresh();
                     }
                     self.diag
-                        .error(*span, format!("use of undeclared variable `{}`", name));
+                        .error(*span, format!(
+                            "use of undeclared variable `{}` — \
+                             declare it before use with `let {} = ...;`, \
+                             add it as a function parameter, or check for \
+                             a spelling mistake. Variable names are case-sensitive.",
+                            name, name
+                        ));
                     self.infer.fresh()
                 }
             },
@@ -969,7 +1016,16 @@ impl TypeCk {
                                 ret: Box::new(fi.ret.clone()),
                             }
                         } else {
-                            self.diag.error(*span, format!("unknown path `{}`", name));
+                            self.diag.error(
+                            *span,
+                            format!(
+                                "unknown path `{}` — check that every segment is declared \
+                                 and that any required `use` imports are present. \
+                                 Built-in runtime paths begin with `game::`, `graphics::`, \
+                                 `audio::`, `input::`, `physics::`, `ml::`, etc.",
+                                name
+                            ),
+                        );
                             self.infer.fresh()
                         }
                     }
@@ -983,10 +1039,12 @@ impl TypeCk {
                     self.diag.error(
                         *span,
                         format!(
-                            "vec{} constructor expects {} elements, got {}",
-                            n,
-                            n,
-                            elems.len()
+                            "vec{n} constructor expects exactly {n} elements but {got} \
+                             were provided — provide exactly {n} f32 values, \
+                             e.g. `vec{n}({args})`",
+                            n = n,
+                            got = elems.len(),
+                            args = (0..n).map(|_| "0.0").collect::<Vec<_>>().join(", ")
                         ),
                     );
                 }
@@ -996,7 +1054,10 @@ impl TypeCk {
                         self.diag.warning(
                             e.span(),
                             format!(
-                                "vec constructor element should be f32; got `{}`",
+                                "vec constructor element should be `f32` but got `{}` — \
+                                 cast to f32 with `{} as f32` if needed, or use a float \
+                                 literal (e.g. `1.0` instead of `1`)",
+                                ty.display(),
                                 ty.display()
                             ),
                         );
@@ -1023,9 +1084,14 @@ impl TypeCk {
                         self.diag.error(
                             *span,
                             format!(
-                                "array literal has inconsistent element types: `{}` vs `{}`",
+                                "array literal has inconsistent element types: first element \
+                                 is `{}` but a later element is `{}` — all elements of an \
+                                 array literal must share the same type. \
+                                 Use an explicit cast (e.g. `x as {}`) to coerce mismatched \
+                                 elements, or split into separate arrays.",
                                 first_ty.display(),
-                                ty.display()
+                                ty.display(),
+                                first_ty.display()
                             ),
                         );
                     }
@@ -1103,8 +1169,12 @@ impl TypeCk {
                     self.diag.error(
                         *span,
                         format!(
-                            "type mismatch in assignment: cannot assign `{}` to `{}`",
+                            "type mismatch in assignment: cannot assign `{}` to a \
+                             binding of type `{}` — the value type must exactly match \
+                             the target type. Use an explicit cast (`value as {}`) \
+                             or change the binding's declared type.",
                             v_ty.display(),
+                            t_ty.display(),
                             t_ty.display()
                         ),
                     );
@@ -1450,17 +1520,29 @@ impl TypeCk {
                                 self.diag.error(
                                     fexpr.span(),
                                     format!(
-                                        "field `{}` of `{}` expects `{}`, got `{}`",
-                                        fname,
-                                        name,
-                                        expected.display(),
-                                        expr_ty.display()
+                                        "mismatched type for field `{fname}` of `{name}`: \
+                                         expected `{exp}` but the expression has type `{got}`. \
+                                         Either change the field value to produce a `{exp}`, \
+                                         or use an explicit cast (`value as {exp}`) if the \
+                                         types are compatible.",
+                                        fname = fname,
+                                        name = name,
+                                        exp = expected.display(),
+                                        got = expr_ty.display()
                                     ),
                                 );
                             }
                         } else {
-                            self.diag
-                                .error(*span, format!("`{}` has no field `{}`", name, fname));
+                            self.diag.error(
+                                *span,
+                                format!(
+                                    "`{name}` has no field named `{fname}`. \
+                                     Check the struct definition for the correct field names, \
+                                     or remove this field from the literal.",
+                                    name = name,
+                                    fname = fname
+                                ),
+                            );
                         }
                     }
                     if is_component {
@@ -1469,7 +1551,15 @@ impl TypeCk {
                         Ty::Struct(name.clone())
                     }
                 } else {
-                    self.diag.error(*span, format!("unknown struct `{}`", name));
+                    self.diag.error(
+                        *span,
+                        format!(
+                            "cannot construct unknown struct `{name}`. \
+                             Declare it first with `struct {name} {{ ... }}` or \
+                             `component {name} {{ ... }}`, or check for a spelling mistake.",
+                            name = name
+                        ),
+                    );
                     self.infer.fresh()
                 }
             }
@@ -1503,9 +1593,12 @@ impl TypeCk {
                     self.diag.error(
                         span,
                         format!(
-                            "comparison of incompatible types `{}` and `{}`",
-                            l.display(),
-                            r.display()
+                            "cannot compare `{lty}` with `{rty}` — both sides of a \
+                             comparison operator must have the same type. \
+                             Cast one side to match the other (e.g. `x as {rty}`) \
+                             or ensure both operands are produced by the same type.",
+                            lty = l.display(),
+                            rty = r.display()
                         ),
                     );
                 }
@@ -1519,8 +1612,12 @@ impl TypeCk {
                         self.diag.error(
                             span,
                             format!(
-                                "logical operator requires `bool` operands, got `{}`",
-                                ty.display()
+                                "logical `&&`/`||` operator requires `bool` on both sides, \
+                                 but found `{got}`. \
+                                 If you intended a bitwise operation use `&` / `|` instead. \
+                                 To convert a numeric value to bool, write an explicit comparison: \
+                                 `{got} != 0`.",
+                                got = ty.display()
                             ),
                         );
                     }
@@ -1576,18 +1673,26 @@ impl TypeCk {
                         self.diag.error(
                             span,
                             format!(
-                                "tensor element type mismatch: `{}` vs `{}`",
-                                l.display(),
-                                r.display()
+                                "element-type mismatch in tensor arithmetic: \
+                                 left is `{lt}` but right is `{rt}`. \
+                                 Tensor operands must have the same element type. \
+                                 Cast one tensor: `tensor.cast::<{lelem}>()` \
+                                 or ensure both are constructed with matching element types.",
+                                lt = l.display(),
+                                rt = r.display(),
+                                lelem = format!("{:?}", ea).to_lowercase()
                             ),
                         );
                     } else if sa.len() != sb.len() {
                         self.diag.error(
                             span,
                             format!(
-                                "tensor rank mismatch: rank {} vs rank {}",
-                                sa.len(),
-                                sb.len()
+                                "rank mismatch in tensor arithmetic: \
+                                 left operand is rank-{la} (`{lt}`) but right is rank-{rb} (`{rt}`). \
+                                 Both tensors must have the same number of dimensions. \
+                                 Use `.reshape(...)` or `.unsqueeze(...)` to align ranks.",
+                                la = sa.len(), lt = l.display(),
+                                rb = sb.len(), rt = r.display()
                             ),
                         );
                     }
@@ -1609,10 +1714,13 @@ impl TypeCk {
                     self.diag.error(
                         span,
                         format!(
-                            "type mismatch in arithmetic: `{}` {} `{}`",
-                            l.display(),
-                            format!("{:?}", op).to_lowercase(),
-                            r.display()
+                            "type mismatch in arithmetic: \
+                             cannot apply `{op}` to `{lt}` and `{rt}`. \
+                             Both operands must have the same numeric type. \
+                             Use an explicit cast: `lhs as {rt}` or `rhs as {lt}`.",
+                            op = format!("{:?}", op).to_lowercase(),
+                            lt = l.display(),
+                            rt = r.display()
                         ),
                     );
                 }
@@ -1626,8 +1734,19 @@ impl TypeCk {
             | BinOpKind::Shl
             | BinOpKind::Shr => {
                 if !l.is_numeric() || !r.is_numeric() {
-                    self.diag
-                        .error(span, "bitwise operators require integer operands");
+                    self.diag.error(
+                        span,
+                        format!(
+                            "bitwise operator requires integer operands, \
+                             but got `{lt}` and `{rt}`. \
+                             Bitwise operations (`&`, `|`, `^`, `<<`, `>>`) are only \
+                             defined for integer types such as `i32`, `u32`, `i64`, `u64`. \
+                             If you want element-wise boolean logic, use `&&` / `||` on \
+                             `bool` values instead.",
+                            lt = l.display(),
+                            rt = r.display()
+                        ),
+                    );
                 }
                 l
             }
@@ -1653,9 +1772,12 @@ impl TypeCk {
                 self.diag.error(
                     span,
                     format!(
-                        "matrix multiply: size mismatch `{}` @ `{}`",
-                        l.display(),
-                        r.display()
+                        "matrix multiply: size mismatch — `{lt}` @ `{rt}`. \
+                         Square matrix multiplication requires both matrices to have \
+                         the same size (e.g. `mat3 @ mat3`). \
+                         Did you mean to use a `mat{r}` on the left?",
+                        lt = l.display(), rt = r.display(),
+                        r = rs.lanes()
                     ),
                 );
             }
@@ -1668,9 +1790,11 @@ impl TypeCk {
                 self.diag.error(
                     span,
                     format!(
-                        "matrix–vector multiply: size mismatch `{}` @ `{}`",
-                        l.display(),
-                        r.display()
+                        "matrix–vector multiply: size mismatch — `{lt}` @ `{rt}`. \
+                         An N×N matrix can only multiply an N-component vector. \
+                         Use `mat{mv}` with a `vec{mv}` (or vice versa).",
+                        lt = l.display(), rt = r.display(),
+                        mv = ms.lanes()
                     ),
                 );
             }
@@ -1696,16 +1820,26 @@ impl TypeCk {
                 self.diag.error(
                     span,
                     format!(
-                        "matrix multiply: element type mismatch \
-                     (`tensor<{:?}>` @ `tensor<{:?}>`)",
-                        ea, eb
+                        "matrix multiply (`@`) requires both tensors to have the same element type, \
+                         but left is `tensor<{lelem}>` and right is `tensor<{relem}>`. \
+                         Cast one operand: e.g. `A.cast::<{relem}>() @ B`.",
+                        lelem = format!("{:?}", ea).to_lowercase(),
+                        relem = format!("{:?}", eb).to_lowercase()
                     ),
                 );
             }
             // Require at least 2-D tensors.
             if sa.len() < 2 || sb.len() < 2 {
-                self.diag
-                    .error(span, "matrix multiply (`@`) requires at least 2-D tensors");
+                self.diag.error(
+                    span,
+                    format!(
+                        "matrix multiply (`@`) requires at least 2-D tensors, \
+                         but got rank-{la} `{lt}` and rank-{rb} `{rt}`. \
+                         Use `.unsqueeze(0)` to promote a 1-D tensor to 2-D before multiplying.",
+                        la = sa.len(), lt = l.display(),
+                        rb = sb.len(), rt = r.display()
+                    ),
+                );
                 return self.infer.fresh();
             }
             // Inner dimensions must agree.
@@ -1717,12 +1851,30 @@ impl TypeCk {
                         span,
                         format!(
                             "matrix multiply shape mismatch: \
-                         inner dim {} (lhs) ≠ {} (rhs)",
-                            kl, kr
+                             the inner (contracting) dimension of the left operand is {kl} \
+                             but the corresponding dimension of the right operand is {kr}. \
+                             For `A[M, K] @ B[K, N]` the K dimensions must be equal. \
+                             Transpose one operand (`.transpose()`) if the shapes are swapped.",
+                            kl = kl, kr = kr
                         ),
                     );
                 }
             }
+
+            // Batch dimensions must also agree.
+            let batch_a = &sa[..sa.len() - 2];
+            let batch_b = &sb[..sb.len() - 2];
+            if batch_a != batch_b {
+                self.diag.error(
+                    span,
+                    format!(
+                        "matrix multiply batch shape mismatch: `{}` @ `{}`. \
+                         Left batch dims {:?} do not match right batch dims {:?}.",
+                        l.display(), r.display(), batch_a, batch_b
+                    ),
+                );
+            }
+
             // Result shape: all but last dim of lhs ++ all but second-to-last of rhs.
             let mut result_shape: Vec<Dim> = sa[..sa.len() - 1].to_vec();
             result_shape.push(sb[sb.len() - 1].clone());
@@ -1735,10 +1887,11 @@ impl TypeCk {
         self.diag.error(
             span,
             format!(
-                "`@` (matrix multiply) requires tensor or matrix operands; \
-             got `{}` and `{}`",
-                l.display(),
-                r.display()
+                "`@` (matrix multiply) requires tensor or matrix operands, \
+                 but got `{lt}` and `{rt}`. \
+                 Valid forms: `tensor<E>[M,K] @ tensor<E>[K,N]`, `mat3 @ mat3`, `mat3 @ vec3`. \
+                 If you want element-wise multiplication use `.*` instead.",
+                lt = l.display(), rt = r.display()
             ),
         );
         self.infer.fresh()
@@ -1754,10 +1907,11 @@ impl TypeCk {
             self.diag.error(
                 span,
                 format!(
-                    "Hadamard operator (`.*`/`./`) requires tensor or vector operands; \
-                 got `{}` and `{}`",
-                    l.display(),
-                    r.display()
+                    "Hadamard operator (`.*` / `./`) requires tensor or vector operands on both sides, \
+                     but got `{lt}` and `{rt}`. \
+                     If you want element-wise scalar arithmetic, use the plain `*` operator. \
+                     Wrap scalars in a tensor or broadcast them explicitly if needed.",
+                    lt = l.display(), rt = r.display()
                 ),
             );
             return self.infer.fresh();
@@ -1779,9 +1933,11 @@ impl TypeCk {
                 self.diag.error(
                     span,
                     format!(
-                        "Hadamard operator: element type mismatch `{}` vs `{}`",
-                        l.display(),
-                        r.display()
+                        "Hadamard `.*`/`./` element type mismatch: left is `{lt}` but right is `{rt}`. \
+                         Both tensors must share the same element type. \
+                         Use `.cast::<{lelem}>()` to convert the right operand.",
+                        lt = l.display(), rt = r.display(),
+                        lelem = format!("{:?}", ea).to_lowercase()
                     ),
                 );
                 return self.infer.fresh();
@@ -1798,7 +1954,15 @@ impl TypeCk {
                 None => {
                     self.diag.error(
                         span,
-                        format!("cannot broadcast tensor shapes {:?} and {:?}", sa, sb),
+                        format!(
+                            "cannot broadcast tensor shapes `{lt}` and `{rt}` for `.*`/`./`. \
+                             NumPy-style broadcasting requires each dimension pair (aligned from \
+                             the right) to be equal, or one of them to be exactly 1. \
+                             For example, `[3, 1]` broadcasts with `[1, 4]` → `[3, 4]`, \
+                             but `[3, 2]` and `[2, 3]` are incompatible. \
+                             Reshape one operand to make the shapes broadcastable.",
+                            lt = l.display(), rt = r.display()
+                        ),
                     );
                     return self.infer.fresh();
                 }
@@ -1809,9 +1973,9 @@ impl TypeCk {
             self.diag.error(
                 span,
                 format!(
-                    "Hadamard operator: operand type mismatch `{}` vs `{}`",
-                    l.display(),
-                    r.display()
+                    "Hadamard `.*`/`./` operand mismatch: left is `{lt}` and right is `{rt}`. \
+                     Both operands must be the same type or broadcastable tensor shapes.",
+                    lt = l.display(), rt = r.display()
                 ),
             );
         }
@@ -2086,8 +2250,23 @@ impl TypeCk {
                         return fi.ret.clone();
                     }
                     if Self::is_runtime_builtin_ident(name.as_str()) {
-                        return self.infer.fresh();
+                        if name == "dataloader" || name == "pipeline" {
+                        return Ty::Struct("DataLoader".into());
                     }
+                    if name == "range" || name == "arange" {
+                        return Ty::Array {
+                            elem: Box::new(Ty::Scalar(ElemType::I32)),
+                            len: 0,
+                        };
+                    }
+                    if name == "zeros" || name == "ones" {
+                        return Ty::Array {
+                            elem: Box::new(Ty::Scalar(ElemType::F32)),
+                            len: 0,
+                        };
+                    }
+                    return self.infer.fresh();
+                }
                     // Unknown function — emit error, return fresh var.
                     self.diag
                         .error(span, format!("call to undeclared function `{}`", name));
@@ -2152,6 +2331,20 @@ impl TypeCk {
             (Ty::Quat, "normalize" | "conjugate" | "inverse") => Ty::Quat,
             (Ty::Quat, "to_mat3") => Ty::Mat { size: VecSize::N3 },
             (Ty::Quat, "to_mat4") => Ty::Mat { size: VecSize::N4 },
+            (Ty::Struct(name), "next") if name == "DataLoader" => {
+                Ty::Option(Box::new(self.infer.fresh()))
+            }
+            (Ty::Struct(name), "has_next") if name == "DataLoader" => Ty::Bool,
+            (Ty::Struct(name), "reset") if name == "DataLoader" => Ty::Unit,
+            (Ty::Struct(name), "shuffle") if name == "DataLoader" => Ty::Unit,
+            (Ty::Struct(name), "batch") if name == "DataLoader" => Ty::Struct("DataLoader".into()),
+            (Ty::Struct(name), "repeat") if name == "DataLoader" => Ty::Struct("DataLoader".into()),
+            (Ty::Struct(name), "collect") if name == "DataLoader" => Ty::Array {
+                elem: Box::new(self.infer.fresh()),
+                len: 0,
+            },
+            (Ty::Struct(name), "map") if name == "DataLoader" => Ty::Struct("DataLoader".into()),
+            (Ty::Struct(name), "filter") if name == "DataLoader" => Ty::Struct("DataLoader".into()),
 
             _ => {
                 // Unknown method — defer gracefully.

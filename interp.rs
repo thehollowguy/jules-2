@@ -78,6 +78,9 @@ pub enum Value {
     Mat4([[f32; 4]; 4]),
     Quat([f32; 4]), // [x, y, z, w]
 
+    // ── Data pipelines / data loaders (Feature 8) ─────────────────────────────
+    DataLoader(Arc<Mutex<DataLoader>>),
+
     // ── Tensors (Feature 1) ───────────────────────────────────────────────────
     Tensor(Arc<RwLock<Tensor>>),
 
@@ -117,6 +120,43 @@ pub enum Value {
     Continue,
 }
 
+#[derive(Debug, Clone)]
+pub struct DataLoader {
+    pub samples: Vec<Value>,
+    pub batch_size: usize,
+    pub index: usize,
+    pub shuffle: bool,
+}
+
+impl DataLoader {
+    pub fn next_batch(&mut self) -> Option<Value> {
+        if self.index >= self.samples.len() {
+            return None;
+        }
+        let end = (self.index + self.batch_size).min(self.samples.len());
+        let chunk = self.samples[self.index..end].to_vec();
+        self.index = end;
+        Some(Value::Array(Arc::new(Mutex::new(chunk))))
+    }
+
+    pub fn has_next(&self) -> bool {
+        self.index < self.samples.len()
+    }
+
+    pub fn reset(&mut self) {
+        self.index = 0;
+        if self.shuffle {
+            // deterministic shuffle so tests remain stable
+            let mut seed = 4211_u64;
+            for i in (1..self.samples.len()).rev() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let j = (seed % (i as u64 + 1)) as usize;
+                self.samples.swap(i, j);
+            }
+        }
+    }
+}
+
 impl Value {
     pub fn type_name(&self) -> &str {
         match self {
@@ -144,6 +184,7 @@ impl Value {
             Value::Mat4(_) => "mat4",
             Value::Quat(_) => "quat",
             Value::Tensor(_) => "tensor",
+            Value::DataLoader(_) => "dataloader",
             Value::Tuple(_) => "tuple",
             Value::Array(_) => "array",
             Value::HashMap(_) => "map",
@@ -245,6 +286,10 @@ impl fmt::Display for Value {
                 write!(f, "({})", inner.join(", "))
             }
             Value::Struct { name, .. } => write!(f, "{name} {{ … }}"),
+            Value::DataLoader(d) => {
+                let d = d.lock().unwrap();
+                write!(f, "dataloader(batch_size={}, index={}, total={})", d.batch_size, d.index, d.samples.len())
+            }
             Value::Some(v) => write!(f, "Some({})", v),
             Value::None => write!(f, "None"),
             Value::Ok(v) => write!(f, "Ok({})", v),
@@ -307,6 +352,16 @@ impl Tensor {
     }
 
     pub fn from_data(shape: Vec<usize>, data: Vec<f32>) -> Self {
+        let expected = shape.iter().product::<usize>().max(1);
+        debug_assert_eq!(
+            data.len(),
+            expected,
+            "Tensor::from_data: shape {:?} expects {} elements, got {}",
+            shape,
+            expected,
+            data.len()
+        );
+
         Tensor {
             elem: ElemType::F32,
             shape,
@@ -340,6 +395,11 @@ impl Tensor {
         if self.shape.len() < 2 || rhs.shape.len() < 2 {
             return Err(RuntimeError::new("matmul requires ≥2-D tensors"));
         }
+
+        if self.shape.len() != rhs.shape.len() {
+            return Err(RuntimeError::new("matmul requires matching tensor rank"));
+        }
+
         let (m, k) = (
             self.shape[self.shape.len() - 2],
             self.shape[self.shape.len() - 1],
@@ -353,23 +413,41 @@ impl Tensor {
                 "matmul shape mismatch: [{m}, {k}] @ [{k2}, {n}]"
             )));
         }
+
+        let batch_shape = &self.shape[..self.shape.len() - 2];
+        let rhs_batch_shape = &rhs.shape[..rhs.shape.len() - 2];
+        if batch_shape != rhs_batch_shape {
+            return Err(RuntimeError::new(format!(
+                "matmul batch shape mismatch: {:?} vs {:?}",
+                batch_shape, rhs_batch_shape
+            )));
+        }
+
+        let batch_count = batch_shape.iter().product::<usize>().max(1);
         let a = self.cpu_data();
         let b = rhs.cpu_data();
-        let mut c = vec![0.0_f32; m * n];
+        let mut c = vec![0.0_f32; batch_count * m * n];
 
-        // Cache-tiled GEMM: 32×32 tiles fit in L1 cache.
+        // Cache-tiled GEMM within each batch element.
         const TILE: usize = 32;
-        for ii in (0..m).step_by(TILE) {
-            for jj in (0..n).step_by(TILE) {
-                for kk in (0..k).step_by(TILE) {
-                    let i_end = (ii + TILE).min(m);
-                    let j_end = (jj + TILE).min(n);
-                    let k_end = (kk + TILE).min(k);
-                    for i in ii..i_end {
-                        for l in kk..k_end {
-                            let a_il = a[i * k + l];
-                            for j in jj..j_end {
-                                c[i * n + j] += a_il * b[l * n + j];
+        for batch in 0..batch_count {
+            let a_offset = batch * m * k;
+            let b_offset = batch * k * n;
+            let c_offset = batch * m * n;
+
+            for ii in (0..m).step_by(TILE) {
+                for jj in (0..n).step_by(TILE) {
+                    for kk in (0..k).step_by(TILE) {
+                        let i_end = (ii + TILE).min(m);
+                        let j_end = (jj + TILE).min(n);
+                        let k_end = (kk + TILE).min(k);
+                        for i in ii..i_end {
+                            for t in kk..k_end {
+                                let a_it = a[a_offset + i * k + t];
+                                for j in jj..j_end {
+                                    c[c_offset + i * n + j] +=
+                                        a_it * b[b_offset + t * n + j];
+                                }
                             }
                         }
                     }
@@ -377,7 +455,7 @@ impl Tensor {
             }
         }
 
-        let mut out_shape = self.shape[..self.shape.len() - 2].to_vec();
+        let mut out_shape = batch_shape.to_vec();
         out_shape.push(m);
         out_shape.push(n);
         Ok(Tensor::from_data(out_shape, c))
@@ -1904,7 +1982,7 @@ impl Interpreter {
                     .iter()
                     .map(|a| self.eval_expr(a, env))
                     .collect::<Result<_, _>>()?;
-                self.eval_method(recv, method, args_v)
+                self.eval_method(recv, method, args_v, env)
                     .map_err(|e| e.at(*span))
             }
 
@@ -2616,6 +2694,108 @@ impl Interpreter {
                 }
             }
 
+            "range" => {
+                let start = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+                let end = args.get(1).and_then(|v| v.as_i64()).unwrap_or(start);
+                let step = args.get(2).and_then(|v| v.as_i64()).unwrap_or(1);
+                if step == 0 {
+                    return rt_err!("range() step must be nonzero");
+                }
+                let mut items = Vec::new();
+                if step > 0 {
+                    let mut i = start;
+                    while i < end {
+                        items.push(Value::I32(i as i32));
+                        i += step;
+                    }
+                } else {
+                    let mut i = start;
+                    while i > end {
+                        items.push(Value::I32(i as i32));
+                        i += step;
+                    }
+                }
+                Ok(Value::Array(Arc::new(Mutex::new(items))))
+            }
+            "arange" => {
+                let start = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+                let end = args.get(1).and_then(|v| v.as_i64()).unwrap_or(start);
+                let step = args.get(2).and_then(|v| v.as_i64()).unwrap_or(1);
+                if step == 0 {
+                    return rt_err!("arange() step must be nonzero");
+                }
+                let mut items = Vec::new();
+                if step > 0 {
+                    let mut i = start;
+                    while i < end {
+                        items.push(Value::I32(i as i32));
+                        i += step;
+                    }
+                } else {
+                    let mut i = start;
+                    while i > end {
+                        items.push(Value::I32(i as i32));
+                        i += step;
+                    }
+                }
+                Ok(Value::Array(Arc::new(Mutex::new(items))))
+            }
+            "zeros" => {
+                let len = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0).max(0) as usize;
+                let v = vec![Value::F32(0.0); len];
+                Ok(Value::Array(Arc::new(Mutex::new(v))))
+            }
+            "ones" => {
+                let len = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0).max(0) as usize;
+                let v = vec![Value::F32(1.0); len];
+                Ok(Value::Array(Arc::new(Mutex::new(v))))
+            }
+            "dataloader" | "pipeline" => {
+                let source = args.get(0).ok_or_else(|| RuntimeError::new("dataloader() requires a source array or tensor"))?;
+                let batch_size = args
+                    .get(1)
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v.max(1) as usize)
+                    .unwrap_or(1);
+                let shuffle = args.get(2).and_then(|v| v.as_bool()).unwrap_or(false);
+
+                let mut samples: Vec<Value> = Vec::new();
+                match source {
+                    Value::Array(a) => samples = a.lock().unwrap().clone(),
+                    Value::Tensor(t) => {
+                        let t = t.read().unwrap();
+                        if t.shape.is_empty() {
+                            return rt_err!("dataloader() requires tensor with rank >=1");
+                        }
+                        let rows = t.shape[0];
+                        let single = t.shape.iter().skip(1).product::<usize>();
+                        if rows * single != t.numel() {
+                            return rt_err!("dataloader(): invalid tensor shape");
+                        }
+                        for i in 0..rows {
+                            let start = i * single;
+                            let end = start + single;
+                            let chunk = t.cpu_data()[start..end].to_vec();
+                            let mut row_shape = t.shape.clone();
+                            row_shape.remove(0);
+                            samples.push(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(row_shape, chunk)))));
+                        }
+                    }
+                    _ => return rt_err!("dataloader() source must be Array or Tensor"),
+                }
+
+                let mut loader = DataLoader {
+                    samples,
+                    batch_size,
+                    index: 0,
+                    shuffle,
+                };
+                if shuffle {
+                    loader.reset();
+                }
+                Ok(Value::DataLoader(Arc::new(Mutex::new(loader))))
+            }
+
             // ── I/O functions ─────────────────────────────────────────────────
             "print" => {
                 for (i, arg) in args.iter().enumerate() {
@@ -3259,6 +3439,7 @@ impl Interpreter {
         recv: Value,
         method: &str,
         args: Vec<Value>,
+        env: &mut Env,
     ) -> Result<Value, RuntimeError> {
         match (&recv, method) {
             // ── Tensor methods ─────────────────────────────────────────────────
@@ -3364,6 +3545,153 @@ impl Interpreter {
                     unreachable!()
                 }
             }
+            // ── DataLoader / data pipeline methods ─────────────────────────────
+            (Value::DataLoader(_), "next") => {
+                if let Value::DataLoader(dl) = recv {
+                    let mut dl = dl.lock().unwrap();
+                    if let Some(batch) = dl.next_batch() {
+                        Ok(Value::Some(Box::new(batch)))
+                    } else {
+                        Ok(Value::None)
+                    }
+                } else {
+                    unreachable!()
+                }
+            }
+            (Value::DataLoader(_), "has_next") => {
+                if let Value::DataLoader(dl) = recv {
+                    Ok(Value::Bool(dl.lock().unwrap().has_next()))
+                } else {
+                    unreachable!()
+                }
+            }
+            (Value::DataLoader(_), "reset") => {
+                if let Value::DataLoader(dl) = recv {
+                    dl.lock().unwrap().reset();
+                    Ok(Value::Unit)
+                } else {
+                    unreachable!()
+                }
+            }
+            (Value::DataLoader(_), "shuffle") => {
+                if let Value::DataLoader(dl) = recv {
+                    let mut d = dl.lock().unwrap();
+                    d.shuffle = true;
+                    d.reset();
+                    Ok(Value::Unit)
+                } else {
+                    unreachable!()
+                }
+            }
+            (Value::DataLoader(_), "batch") => {
+                if let Value::DataLoader(dl) = recv {
+                    let size = args
+                        .get(0)
+                        .and_then(|v| v.as_i64())
+                        .map(|i| i.max(1) as usize)
+                        .unwrap_or(1);
+                    let (samples, shuffle) = {
+                        let dl = dl.lock().unwrap();
+                        (dl.samples.clone(), dl.shuffle)
+                    };
+                    Ok(Value::DataLoader(Arc::new(Mutex::new(DataLoader {
+                        samples,
+                        batch_size: size,
+                        index: 0,
+                        shuffle,
+                    }))))
+                } else {
+                    unreachable!()
+                }
+            }
+            (Value::DataLoader(_), "repeat") => {
+                if let Value::DataLoader(dl) = recv {
+                    let times = args
+                        .get(0)
+                        .and_then(|v| v.as_i64())
+                        .map(|i| i.max(0) as usize)
+                        .unwrap_or(1);
+                    let (samples, batch_size, shuffle) = {
+                        let dl = dl.lock().unwrap();
+                        (dl.samples.clone(), dl.batch_size, dl.shuffle)
+                    };
+                    let mut repeated = Vec::new();
+                    for _ in 0..times {
+                        repeated.extend_from_slice(&samples);
+                    }
+                    Ok(Value::DataLoader(Arc::new(Mutex::new(DataLoader {
+                        samples: repeated,
+                        batch_size,
+                        index: 0,
+                        shuffle,
+                    }))))
+                } else {
+                    unreachable!()
+                }
+            }
+            (Value::DataLoader(_), "collect") => {
+                if let Value::DataLoader(dl) = recv {
+                    let data = dl.lock().unwrap().samples.clone();
+                    Ok(Value::Array(Arc::new(Mutex::new(data))))
+                } else {
+                    unreachable!()
+                }
+            }
+            (Value::DataLoader(_), "map") => {
+                if let Value::DataLoader(dl) = recv {
+                    let func = match args.get(0) {
+                        Some(Value::Fn(f)) => f.clone(),
+                        _ => return rt_err!("map() requires a function argument"),
+                    };
+                    let (batch_size, shuffle, samples) = {
+                        let dl = dl.lock().unwrap();
+                        (dl.batch_size, dl.shuffle, dl.samples.clone())
+                    };
+                    let mut mapped = Vec::new();
+                    for sample in samples {
+                        let mut call_env = Env::new();
+                        let mapped_val = self.eval_call(Value::Fn(func.clone()), vec![sample], &mut call_env)?;
+                        mapped.push(mapped_val);
+                    }
+                    Ok(Value::DataLoader(Arc::new(Mutex::new(DataLoader {
+                        samples: mapped,
+                        batch_size,
+                        index: 0,
+                        shuffle,
+                    }))))
+                } else {
+                    unreachable!()
+                }
+            }
+            (Value::DataLoader(_), "filter") => {
+                if let Value::DataLoader(dl) = recv {
+                    let func = match args.get(0) {
+                        Some(Value::Fn(f)) => f.clone(),
+                        _ => return rt_err!("filter() requires a function argument"),
+                    };
+                    let (batch_size, shuffle, samples) = {
+                        let dl = dl.lock().unwrap();
+                        (dl.batch_size, dl.shuffle, dl.samples.clone())
+                    };
+                    let mut filtered = Vec::new();
+                    for sample in samples {
+                        let mut call_env = Env::new();
+                        let result = self.eval_call(Value::Fn(func.clone()), vec![sample.clone()], &mut call_env)?;
+                        if result.as_bool().unwrap_or(false) {
+                            filtered.push(sample);
+                        }
+                    }
+                    Ok(Value::DataLoader(Arc::new(Mutex::new(DataLoader {
+                        samples: filtered,
+                        batch_size,
+                        index: 0,
+                        shuffle,
+                    }))))
+                } else {
+                    unreachable!()
+                }
+            }
+
             // ── World methods ──────────────────────────────────────────────────
             (Value::World(_), "spawn") => {
                 if let Value::World(w) = recv {
@@ -4690,6 +5018,35 @@ mod tests {
     }
 
     #[test]
+    fn test_tensor_matmul_batched() {
+        let a = Tensor::from_data(
+            vec![2, 2, 3],
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, // batch 0
+                1.0, 0.0, 0.0, 0.0, 1.0, 0.0, // batch 1
+            ],
+        );
+        let b = Tensor::from_data(
+            vec![2, 3, 2],
+            vec![
+                1.0, 0.0, 0.0, 1.0, 1.0, 1.0, // batch 0
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, // batch 1
+            ],
+        );
+        let c = a.matmul(&b).unwrap();
+        assert_eq!(c.shape, vec![2, 2, 2]);
+        let d = c.cpu_data();
+        assert!((d[0] - 4.0).abs() < 1e-6);
+        assert!((d[1] - 5.0).abs() < 1e-6);
+        assert!((d[2] - 10.0).abs() < 1e-6);
+        assert!((d[3] - 11.0).abs() < 1e-6);
+        assert!((d[4] - 1.0).abs() < 1e-6);
+        assert!((d[5] - 2.0).abs() < 1e-6);
+        assert!((d[6] - 3.0).abs() < 1e-6);
+        assert!((d[7] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn test_tensor_hadamard_mul() {
         let a = Tensor::from_data(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
         let b = Tensor::from_data(vec![4], vec![2.0, 2.0, 2.0, 2.0]);
@@ -5014,6 +5371,107 @@ mod tests {
             })),
         };
         assert!(matches!(i.eval_expr(&e, &mut env).unwrap(), Value::I32(1)));
+    }
+
+    #[test]
+    fn test_interp_dataloader_basics() {
+        let mut interp = mk_interp();
+        let mut env = Env::new();
+        let source = Value::Array(Arc::new(Mutex::new(vec![
+            Value::I32(1),
+            Value::I32(2),
+            Value::I32(3),
+            Value::I32(4),
+        ])));
+
+        let loader = interp
+            .eval_builtin("dataloader", vec![source.clone(), Value::I32(2), Value::Bool(false)])
+            .unwrap();
+
+        let has_next = interp
+            .eval_method(loader.clone(), "has_next", vec![], &mut env)
+            .unwrap();
+        assert!(matches!(has_next, Value::Bool(true)));
+
+        let next_batch = interp
+            .eval_method(loader.clone(), "next", vec![], &mut env)
+            .unwrap();
+        match next_batch {
+            Value::Some(boxed_batch) => {
+                if let Value::Array(arr) = *boxed_batch {
+                    let v = arr.lock().unwrap();
+                    assert_eq!(v.len(), 2);
+                } else {
+                    panic!("expected array batch");
+                }
+            }
+            _ => panic!("expected Some(batch)"),
+        }
+
+        let collected = interp
+            .eval_method(loader.clone(), "collect", vec![], &mut env)
+            .unwrap();
+        match collected {
+            Value::Array(arr) => assert_eq!(arr.lock().unwrap().len(), 4),
+            _ => panic!("expected array from collect"),
+        }
+
+        let repeated = interp
+            .eval_method(loader.clone(), "repeat", vec![Value::I32(2)], &mut env)
+            .unwrap();
+        if let Value::DataLoader(dl) = repeated {
+            assert_eq!(dl.lock().unwrap().samples.len(), 8);
+        } else {
+            panic!("expected DataLoader from repeat");
+        }
+
+        let b = interp
+            .eval_method(loader, "batch", vec![Value::I32(1)], &mut env)
+            .unwrap();
+        if let Value::DataLoader(dl) = b {
+            assert_eq!(dl.lock().unwrap().batch_size, 1);
+        } else {
+            panic!("expected DataLoader from batch");
+        }
+    }
+
+    #[test]
+    fn test_interp_range_zeros_ones() {
+        let mut interp = mk_interp();
+
+        let r = interp
+            .eval_builtin("range", vec![Value::I32(0), Value::I32(5), Value::I32(2)])
+            .unwrap();
+        if let Value::Array(arr) = r {
+            let a = arr.lock().unwrap();
+            let ints: Vec<i32> = a
+                .iter()
+                .filter_map(|v| match v { Value::I32(x) => Some(*x), _ => None })
+                .collect();
+            assert_eq!(ints, vec![0, 2, 4]);
+        } else {
+            panic!("expected array from range");
+        }
+
+        let z = interp.eval_builtin("zeros", vec![Value::I32(3)]).unwrap();
+        if let Value::Array(arr) = z {
+            assert_eq!(arr.lock().unwrap().len(), 3);
+        } else {
+            panic!("expected array from zeros");
+        }
+
+        let o = interp.eval_builtin("ones", vec![Value::I32(2)]).unwrap();
+        if let Value::Array(arr) = o {
+            let values: Vec<f32> = arr
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|v| match v { Value::F32(x) => Some(*x), _ => None })
+                .collect();
+            assert_eq!(values, vec![1.0, 1.0]);
+        } else {
+            panic!("expected array from ones");
+        }
     }
 
     #[test]
