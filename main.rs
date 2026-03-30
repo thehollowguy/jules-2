@@ -7,6 +7,7 @@ mod lexer;
 mod parser;
 mod typeck;
 mod sema;
+mod borrowck;
 pub mod interp;
 mod game_systems;
 mod ml_engine;
@@ -462,6 +463,15 @@ impl Pipeline {
             return PipelineResult::HaltedAt(PassName::Sema);
         }
 
+        // ── Pass 5: Borrow-check (lexical aliasing safety) ───────────────────
+        let borrow_diags = crate::borrowck::jules_borrowck(&program);
+        for d in borrow_diags.items {
+            unit.diags.push(adapt_borrowck_diag(d));
+        }
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::BorrowCheck);
+        }
+
         // ── Promote warnings to errors if requested ───────────────────────────
         if self.warn_as_error {
             for d in &mut unit.diags {
@@ -504,7 +514,7 @@ pub enum PipelineResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PassName { Lex, Parse, TypeCheck, Sema, Interp, Optimize, Codegen }
+pub enum PassName { Lex, Parse, TypeCheck, Sema, BorrowCheck, Interp, Optimize, Codegen }
 
 // ── Diagnostic adapters (one per pass module) ──────────────────────────────
 
@@ -533,6 +543,20 @@ fn adapt_sema_diag(d: crate::sema::Diagnostic) -> Diag {
         crate::sema::Severity::Error   => DiagSeverity::Error,
         crate::sema::Severity::Warning => DiagSeverity::Warning,
         crate::sema::Severity::Note    => DiagSeverity::Note,
+    };
+    let mut out = Diag {
+        severity: sev, span: Some(d.span), code: None,
+        message: d.message, labels: vec![], hint: None,
+    };
+    for (s, m) in d.labels { out.labels.push((s, m)); }
+    out
+}
+
+fn adapt_borrowck_diag(d: crate::borrowck::Diagnostic) -> Diag {
+    let sev = match d.severity {
+        crate::borrowck::Severity::Error => DiagSeverity::Error,
+        crate::borrowck::Severity::Warning => DiagSeverity::Warning,
+        crate::borrowck::Severity::Note => DiagSeverity::Note,
     };
     let mut out = Diag {
         severity: sev, span: Some(d.span), code: None,

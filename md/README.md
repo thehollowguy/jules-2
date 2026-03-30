@@ -4,6 +4,7 @@ Jules is a game-dev + ML-oriented language/runtime with:
 - ECS + system runtime
 - ML tensor engine (CPU + GPU hooks)
 - C ABI for embedding in external engines
+- lexical borrow-checking pass for reference alias safety (`&` / `&mut`)
 
 ## Engine / Host Integrations
 
@@ -56,6 +57,16 @@ jules fix path/to/file.jules
 (e.g. missing `;`, missing `)`, `]`, `}`, missing `,`, assignment/operator
 replacement like `==`→`=`, return arrow insertion, block opener insertion,
 and common `fun`/`func` → `fn` keyword typo recovery).
+
+## System-level runtime built-ins
+
+Jules includes OS/system built-ins for low-level workflows:
+
+- File/data: `sys::read_bytes`, `sys::write_bytes`, `sys::list_dir`
+- File/path ops: `sys::copy`, `sys::rename`, `sys::metadata`, `sys::remove_path`
+- Process: `sys::process_id`, `sys::sleep_ms`, `sys::exec`, `sys::exec_argv`, `sys::exec_argv_in`
+- Environment: `sys::env_get`, `sys::env_set`, `sys::env_remove`
+- Host info/directories: `sys::os`, `sys::arch`, `sys::temp_dir`, `sys::cwd`, `sys::set_cwd`, `sys::mkdir`, `sys::rmdir`
 
 ## Run a sample game script
 

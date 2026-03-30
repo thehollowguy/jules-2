@@ -2987,6 +2987,299 @@ impl Interpreter {
                 }
                 _ => rt_err!("append_file requires (path, content) strings"),
             },
+            "sys::cwd" => match std::env::current_dir() {
+                Ok(path) => Ok(Value::Str(path.to_string_lossy().into_owned())),
+                Err(e) => rt_err!("sys::cwd failed: {}", e),
+            },
+            "sys::os" => Ok(Value::Str(std::env::consts::OS.to_string())),
+            "sys::arch" => Ok(Value::Str(std::env::consts::ARCH.to_string())),
+            "sys::temp_dir" => Ok(Value::Str(
+                std::env::temp_dir().to_string_lossy().into_owned(),
+            )),
+            "sys::set_cwd" => {
+                if let Some(Value::Str(path)) = args.first() {
+                    match std::env::set_current_dir(path) {
+                        Ok(_) => Ok(Value::Bool(true)),
+                        Err(e) => rt_err!("sys::set_cwd failed: {}", e),
+                    }
+                } else {
+                    rt_err!("sys::set_cwd requires a path string")
+                }
+            }
+            "sys::mkdir" => {
+                if let Some(Value::Str(path)) = args.first() {
+                    match std::fs::create_dir_all(path) {
+                        Ok(_) => Ok(Value::Bool(true)),
+                        Err(e) => rt_err!("sys::mkdir failed: {}", e),
+                    }
+                } else {
+                    rt_err!("sys::mkdir requires a path string")
+                }
+            }
+            "sys::rmdir" => {
+                if let Some(Value::Str(path)) = args.first() {
+                    match std::fs::remove_dir_all(path) {
+                        Ok(_) => Ok(Value::Bool(true)),
+                        Err(e) => rt_err!("sys::rmdir failed: {}", e),
+                    }
+                } else {
+                    rt_err!("sys::rmdir requires a path string")
+                }
+            }
+            "sys::remove_path" => {
+                if let Some(Value::Str(path)) = args.first() {
+                    let p = std::path::Path::new(path);
+                    if !p.exists() {
+                        Ok(Value::Bool(false))
+                    } else if p.is_dir() {
+                        match std::fs::remove_dir_all(p) {
+                            Ok(_) => Ok(Value::Bool(true)),
+                            Err(e) => rt_err!("sys::remove_path failed: {}", e),
+                        }
+                    } else {
+                        match std::fs::remove_file(p) {
+                            Ok(_) => Ok(Value::Bool(true)),
+                            Err(e) => rt_err!("sys::remove_path failed: {}", e),
+                        }
+                    }
+                } else {
+                    rt_err!("sys::remove_path requires a path string")
+                }
+            }
+            "sys::list_dir" => {
+                if let Some(Value::Str(path)) = args.first() {
+                    match std::fs::read_dir(path) {
+                        Ok(entries) => {
+                            let mut names = vec![];
+                            for entry in entries {
+                                let entry =
+                                    entry.map_err(|e| RuntimeError::new(format!("sys::list_dir failed: {}", e)))?;
+                                names.push(Value::Str(
+                                    entry.file_name().to_string_lossy().into_owned(),
+                                ));
+                            }
+                            names.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+                            Ok(Value::Array(Arc::new(Mutex::new(names))))
+                        }
+                        Err(e) => rt_err!("sys::list_dir failed: {}", e),
+                    }
+                } else {
+                    rt_err!("sys::list_dir requires a path string")
+                }
+            }
+            "sys::read_bytes" => {
+                if let Some(Value::Str(path)) = args.first() {
+                    match std::fs::read(path) {
+                        Ok(bytes) => {
+                            let values = bytes.into_iter().map(|b| Value::U8(b)).collect();
+                            Ok(Value::Array(Arc::new(Mutex::new(values))))
+                        }
+                        Err(e) => rt_err!("sys::read_bytes failed: {}", e),
+                    }
+                } else {
+                    rt_err!("sys::read_bytes requires a path string")
+                }
+            }
+            "sys::copy" => match (args.get(0), args.get(1)) {
+                (Some(Value::Str(from)), Some(Value::Str(to))) => match std::fs::copy(from, to) {
+                    Ok(n) => Ok(Value::I64(n as i64)),
+                    Err(e) => rt_err!("sys::copy failed: {}", e),
+                },
+                _ => rt_err!("sys::copy requires (from_path, to_path) strings"),
+            },
+            "sys::rename" => match (args.get(0), args.get(1)) {
+                (Some(Value::Str(from)), Some(Value::Str(to))) => {
+                    match std::fs::rename(from, to) {
+                        Ok(_) => Ok(Value::Bool(true)),
+                        Err(e) => rt_err!("sys::rename failed: {}", e),
+                    }
+                }
+                _ => rt_err!("sys::rename requires (from_path, to_path) strings"),
+            },
+            "sys::metadata" => {
+                if let Some(Value::Str(path)) = args.first() {
+                    match std::fs::metadata(path) {
+                        Ok(md) => {
+                            let mut out = HashMap::new();
+                            out.insert("is_file".into(), Value::Bool(md.is_file()));
+                            out.insert("is_dir".into(), Value::Bool(md.is_dir()));
+                            out.insert("len".into(), Value::I64(md.len() as i64));
+                            out.insert("readonly".into(), Value::Bool(md.permissions().readonly()));
+                            let modified = md
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            out.insert("modified_unix".into(), Value::I64(modified));
+                            Ok(Value::HashMap(Arc::new(Mutex::new(out))))
+                        }
+                        Err(e) => rt_err!("sys::metadata failed: {}", e),
+                    }
+                } else {
+                    rt_err!("sys::metadata requires a path string")
+                }
+            }
+            "sys::write_bytes" => match (args.get(0), args.get(1)) {
+                (Some(Value::Str(path)), Some(Value::Array(data))) => {
+                    let bytes: Vec<u8> = data
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|v| match v {
+                            Value::U8(x) => Ok(*x),
+                            Value::I32(x) if *x >= 0 && *x <= 255 => Ok(*x as u8),
+                            _ => Err(RuntimeError::new(
+                                "sys::write_bytes data must contain only byte values",
+                            )),
+                        })
+                        .collect::<Result<Vec<u8>, RuntimeError>>()?;
+                    match std::fs::write(path, bytes) {
+                        Ok(_) => Ok(Value::Bool(true)),
+                        Err(e) => rt_err!("sys::write_bytes failed: {}", e),
+                    }
+                }
+                _ => rt_err!("sys::write_bytes requires (path, byte_array)"),
+            },
+            "sys::env_get" => {
+                if let Some(Value::Str(key)) = args.first() {
+                    match std::env::var(key) {
+                        Ok(v) => Ok(Value::Some(Box::new(Value::Str(v)))),
+                        Err(std::env::VarError::NotPresent) => Ok(Value::None),
+                        Err(e) => rt_err!("sys::env_get failed: {}", e),
+                    }
+                } else {
+                    rt_err!("sys::env_get requires a key string")
+                }
+            }
+            "sys::env_set" => match (args.get(0), args.get(1)) {
+                (Some(Value::Str(key)), Some(Value::Str(val))) => {
+                    std::env::set_var(key, val);
+                    Ok(Value::Bool(true))
+                }
+                _ => rt_err!("sys::env_set requires (key, value) strings"),
+            },
+            "sys::env_remove" => {
+                if let Some(Value::Str(key)) = args.first() {
+                    std::env::remove_var(key);
+                    Ok(Value::Bool(true))
+                } else {
+                    rt_err!("sys::env_remove requires a key string")
+                }
+            }
+            "sys::process_id" => Ok(Value::I64(std::process::id() as i64)),
+            "sys::sleep_ms" => {
+                if let Some(ms) = args.first().and_then(|v| v.as_i64()) {
+                    if ms < 0 {
+                        rt_err!("sys::sleep_ms requires a non-negative integer")
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                        Ok(Value::Bool(true))
+                    }
+                } else {
+                    rt_err!("sys::sleep_ms requires an integer")
+                }
+            }
+            "sys::exec" => {
+                if let Some(Value::Str(command)) = args.first() {
+                    let output = std::process::Command::new("sh").arg("-c").arg(command).output();
+                    match output {
+                        Ok(out) => {
+                            let mut result = HashMap::new();
+                            result.insert("ok".into(), Value::Bool(out.status.success()));
+                            result.insert(
+                                "code".into(),
+                                Value::I64(out.status.code().unwrap_or(-1) as i64),
+                            );
+                            result.insert(
+                                "stdout".into(),
+                                Value::Str(String::from_utf8_lossy(&out.stdout).into_owned()),
+                            );
+                            result.insert(
+                                "stderr".into(),
+                                Value::Str(String::from_utf8_lossy(&out.stderr).into_owned()),
+                            );
+                            Ok(Value::HashMap(Arc::new(Mutex::new(result))))
+                        }
+                        Err(e) => rt_err!("sys::exec failed: {}", e),
+                    }
+                } else {
+                    rt_err!("sys::exec requires a command string")
+                }
+            }
+            "sys::exec_argv" => match (args.get(0), args.get(1)) {
+                (Some(Value::Str(program)), Some(Value::Array(argv))) => {
+                    let arg_values = argv.lock().unwrap();
+                    let mut parsed = Vec::with_capacity(arg_values.len());
+                    for v in arg_values.iter() {
+                        if let Value::Str(s) = v {
+                            parsed.push(s.clone());
+                        } else {
+                            return rt_err!("sys::exec_argv args array must contain only strings");
+                        }
+                    }
+                    let output = std::process::Command::new(program).args(&parsed).output();
+                    match output {
+                        Ok(out) => {
+                            let mut result = HashMap::new();
+                            result.insert("ok".into(), Value::Bool(out.status.success()));
+                            result.insert(
+                                "code".into(),
+                                Value::I64(out.status.code().unwrap_or(-1) as i64),
+                            );
+                            result.insert(
+                                "stdout".into(),
+                                Value::Str(String::from_utf8_lossy(&out.stdout).into_owned()),
+                            );
+                            result.insert(
+                                "stderr".into(),
+                                Value::Str(String::from_utf8_lossy(&out.stderr).into_owned()),
+                            );
+                            Ok(Value::HashMap(Arc::new(Mutex::new(result))))
+                        }
+                        Err(e) => rt_err!("sys::exec_argv failed: {}", e),
+                    }
+                }
+                _ => rt_err!("sys::exec_argv requires (program, args_array)"),
+            }
+            "sys::exec_argv_in" => match (args.get(0), args.get(1), args.get(2)) {
+                (Some(Value::Str(program)), Some(Value::Array(argv)), Some(Value::Str(cwd))) => {
+                    let arg_values = argv.lock().unwrap();
+                    let mut parsed = Vec::with_capacity(arg_values.len());
+                    for v in arg_values.iter() {
+                        if let Value::Str(s) = v {
+                            parsed.push(s.clone());
+                        } else {
+                            return rt_err!("sys::exec_argv_in args array must contain only strings");
+                        }
+                    }
+                    let output = std::process::Command::new(program)
+                        .args(&parsed)
+                        .current_dir(cwd)
+                        .output();
+                    match output {
+                        Ok(out) => {
+                            let mut result = HashMap::new();
+                            result.insert("ok".into(), Value::Bool(out.status.success()));
+                            result.insert(
+                                "code".into(),
+                                Value::I64(out.status.code().unwrap_or(-1) as i64),
+                            );
+                            result.insert(
+                                "stdout".into(),
+                                Value::Str(String::from_utf8_lossy(&out.stdout).into_owned()),
+                            );
+                            result.insert(
+                                "stderr".into(),
+                                Value::Str(String::from_utf8_lossy(&out.stderr).into_owned()),
+                            );
+                            Ok(Value::HashMap(Arc::new(Mutex::new(result))))
+                        }
+                        Err(e) => rt_err!("sys::exec_argv_in failed: {}", e),
+                    }
+                }
+                _ => rt_err!("sys::exec_argv_in requires (program, args_array, cwd)"),
+            }
 
             // ── Physics functions ──────────────────────────────────────────────
             "physics::world_new" => Ok(Value::I64(1)),
@@ -5472,6 +5765,185 @@ mod tests {
         } else {
             panic!("expected array from ones");
         }
+    }
+
+    #[test]
+    fn test_sys_level_builtins_io_env_exec() {
+        let mut interp = mk_interp();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_root = std::env::temp_dir().join(format!("jules_sys_{pid}_{nanos}"));
+        let tmp_root_s = tmp_root.to_string_lossy().to_string();
+        assert!(matches!(
+            interp.eval_builtin("sys::os", vec![]).unwrap(),
+            Value::Str(_)
+        ));
+        assert!(matches!(
+            interp.eval_builtin("sys::arch", vec![]).unwrap(),
+            Value::Str(_)
+        ));
+        assert!(matches!(
+            interp.eval_builtin("sys::temp_dir", vec![]).unwrap(),
+            Value::Str(_)
+        ));
+
+        assert!(matches!(
+            interp
+                .eval_builtin("sys::mkdir", vec![Value::Str(tmp_root_s.clone())])
+                .unwrap(),
+            Value::Bool(true)
+        ));
+
+        let bytes = Value::Array(Arc::new(Mutex::new(vec![
+            Value::U8(0),
+            Value::U8(1),
+            Value::U8(2),
+            Value::U8(255),
+        ])));
+        let bin_path = tmp_root.join("blob.bin").to_string_lossy().to_string();
+        assert!(matches!(
+            interp
+                .eval_builtin(
+                    "sys::write_bytes",
+                    vec![Value::Str(bin_path.clone()), bytes.clone()]
+                )
+                .unwrap(),
+            Value::Bool(true)
+        ));
+        let read_back = interp
+            .eval_builtin("sys::read_bytes", vec![Value::Str(bin_path)])
+            .unwrap();
+        if let Value::Array(arr) = read_back {
+            let got: Vec<u8> = arr
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|v| match v {
+                    Value::U8(b) => *b,
+                    _ => panic!("expected byte values"),
+                })
+                .collect();
+            assert_eq!(got, vec![0, 1, 2, 255]);
+        } else {
+            panic!("expected byte array");
+        }
+
+        let env_key = format!("JULES_TEST_KEY_{pid}_{nanos}");
+        interp
+            .eval_builtin(
+                "sys::env_set",
+                vec![Value::Str(env_key.clone()), Value::Str("abc".into())],
+            )
+            .unwrap();
+        let env_val = interp
+            .eval_builtin("sys::env_get", vec![Value::Str(env_key.clone())])
+            .unwrap();
+        assert!(matches!(env_val, Value::Some(v) if matches!(*v, Value::Str(ref s) if s == "abc")));
+        interp
+            .eval_builtin("sys::env_remove", vec![Value::Str(env_key.clone())])
+            .unwrap();
+        let env_missing = interp
+            .eval_builtin("sys::env_get", vec![Value::Str(env_key)])
+            .unwrap();
+        assert!(matches!(env_missing, Value::None));
+
+        let exec_result = interp
+            .eval_builtin("sys::exec", vec![Value::Str("printf jules_sys_ok".into())])
+            .unwrap();
+        if let Value::HashMap(map) = exec_result {
+            let m = map.lock().unwrap();
+            assert!(matches!(m.get("ok"), Some(Value::Bool(true))));
+            assert!(matches!(m.get("stdout"), Some(Value::Str(s)) if s == "jules_sys_ok"));
+        } else {
+            panic!("expected hashmap for exec result");
+        }
+        let exec_argv = interp
+            .eval_builtin(
+                "sys::exec_argv",
+                vec![
+                    Value::Str("printf".into()),
+                    Value::Array(Arc::new(Mutex::new(vec![Value::Str(" argv_ok".into())]))),
+                ],
+            )
+            .unwrap();
+        if let Value::HashMap(map) = exec_argv {
+            let m = map.lock().unwrap();
+            assert!(matches!(m.get("ok"), Some(Value::Bool(true))));
+            assert!(matches!(m.get("stdout"), Some(Value::Str(s)) if s == " argv_ok"));
+        } else {
+            panic!("expected hashmap for exec_argv result");
+        }
+
+        let list_result = interp
+            .eval_builtin("sys::list_dir", vec![Value::Str(tmp_root_s.clone())])
+            .unwrap();
+        if let Value::Array(arr) = list_result {
+            let names: Vec<String> = arr
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|v| match v {
+                    Value::Str(s) => s.clone(),
+                    _ => panic!("expected string entry"),
+                })
+                .collect();
+            assert!(names.iter().any(|n| n == "blob.bin"));
+        } else {
+            panic!("expected directory listing array");
+        }
+        let metadata = interp
+            .eval_builtin(
+                "sys::metadata",
+                vec![Value::Str(tmp_root.join("blob.bin").to_string_lossy().to_string())],
+            )
+            .unwrap();
+        if let Value::HashMap(map) = metadata {
+            let m = map.lock().unwrap();
+            assert!(matches!(m.get("is_file"), Some(Value::Bool(true))));
+            assert!(matches!(m.get("len"), Some(Value::I64(4))));
+        } else {
+            panic!("expected metadata hashmap");
+        }
+
+        let copied_path = tmp_root.join("copy.bin").to_string_lossy().to_string();
+        let copied_bytes = interp
+            .eval_builtin(
+                "sys::copy",
+                vec![
+                    Value::Str(tmp_root.join("blob.bin").to_string_lossy().to_string()),
+                    Value::Str(copied_path.clone()),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(copied_bytes, Value::I64(4)));
+        assert!(matches!(
+            interp
+                .eval_builtin(
+                    "sys::rename",
+                    vec![
+                        Value::Str(copied_path),
+                        Value::Str(tmp_root.join("moved.bin").to_string_lossy().to_string())
+                    ]
+                )
+                .unwrap(),
+            Value::Bool(true)
+        ));
+
+        assert!(matches!(
+            interp
+                .eval_builtin("sys::rmdir", vec![Value::Str(tmp_root_s.clone())])
+                .unwrap(),
+            Value::Bool(true)
+        ));
+        assert!(matches!(
+            interp
+                .eval_builtin("sys::remove_path", vec![Value::Str(tmp_root_s)])
+                .unwrap(),
+            Value::Bool(false)
+        ));
     }
 
     #[test]
