@@ -38,6 +38,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::Instant;
 
 // ── Public API (used by lib.rs re-exports) ────────────────────────────────────
 
@@ -1106,6 +1107,10 @@ const REPL_HELP: &str = r#"REPL commands:
   :quit / :q          Exit the REPL
   :help / :h          Show this message
   :tokens <expr>      Show token stream for an expression
+  :demo <name>        Run built-in demo (game|arcade|ml)
+  :persona <target>   Show language priorities (game|ml|all)
+  :scientist on|off   Toggle experiment timing output
+  :track <file|off>   Append REPL inputs/results to an experiment log
   :clear              Clear the screen
   :load <file>        Load and execute a file
   :reset              Reset interpreter state
@@ -1113,21 +1118,68 @@ const REPL_HELP: &str = r#"REPL commands:
   :color on|off       Toggle colour output
 
 Examples:
+  // Direct program execution
+  fn main() { println("hello from Jules playground"); }
+
+  // Statement mode (auto-wrapped in `fn main { ... }`)
   let x = 3 + 4
   let t = tensor<f32>[2, 2] { 1.0, 2.0, 3.0, 4.0 }
   let C = A @ B
 "#;
+
+const PERSONA_GAME_DEV: &str = r#"Game-dev priorities in Jules:
+  1) Fast iteration loops (REPL + hot-reload + editor tooling)
+  2) Deterministic simulation + ECS/system orchestration
+  3) Tight profiling/debug visibility in-frame
+  4) FFI-friendly embedding into existing engine stacks
+
+Try now:
+  :demo game
+  :demo arcade
+"#;
+
+const PERSONA_ML_SCI: &str = r#"ML scientist priorities in Jules:
+  1) Tensor-first ergonomics with clear math operators
+  2) Reproducible train/check loops with quick feedback
+  3) Interop with Python/C++ workflows for experiments
+  4) Efficient inference/training paths (CPU/GPU + quantized options)
+
+Try now:
+  :demo ml
+"#;
+
+const DEMO_GAME: &str = include_str!("small_game.jules");
+const DEMO_ARCADE: &str = include_str!("game_arcade_showcase.jules");
+const DEMO_ML: &str = include_str!("game_nn_demo.jules");
+
+fn demo_source(name: &str) -> Option<&'static str> {
+    match name {
+        "game" => Some(DEMO_GAME),
+        "arcade" => Some(DEMO_ARCADE),
+        "ml" => Some(DEMO_ML),
+        _ => None,
+    }
+}
 
 pub struct Repl {
     cfg:       RenderCfg,
     history:   Vec<String>,
     multiline: String,   // accumulates a multi-line block
     in_block:  bool,     // true when inside { … }
+    scientist_mode: bool,
+    experiment_log: Option<PathBuf>,
 }
 
 impl Repl {
     pub fn new(cfg: RenderCfg) -> Self {
-        Repl { cfg, history: Vec::new(), multiline: String::new(), in_block: false }
+        Repl {
+            cfg,
+            history: Vec::new(),
+            multiline: String::new(),
+            in_block: false,
+            scientist_mode: false,
+            experiment_log: None,
+        }
     }
 
     pub fn run(&mut self) {
@@ -1178,6 +1230,7 @@ impl Repl {
                     self.multiline.clear();
                     self.in_block = false;
                     self.history.clear();
+                    self.experiment_log = None;
                     println!("{}", Ansi::paint(self.cfg.color, Ansi::DIM, "State reset."));
                     continue;
                 }
@@ -1198,9 +1251,29 @@ impl Repl {
                     self.cmd_load(path);
                     continue;
                 }
+                s if s.starts_with(":scientist ") => {
+                    let mode = s.trim_start_matches(":scientist ").trim();
+                    self.cmd_scientist(mode);
+                    continue;
+                }
+                s if s.starts_with(":track ") => {
+                    let target = s.trim_start_matches(":track ").trim();
+                    self.cmd_track(target);
+                    continue;
+                }
                 s if s.starts_with(":tokens ") => {
                     let code = s.trim_start_matches(":tokens ").trim();
                     self.cmd_tokens(code);
+                    continue;
+                }
+                s if s.starts_with(":demo ") => {
+                    let name = s.trim_start_matches(":demo ").trim();
+                    self.cmd_demo(name);
+                    continue;
+                }
+                s if s.starts_with(":persona ") => {
+                    let target = s.trim_start_matches(":persona ").trim();
+                    self.cmd_persona(target);
                     continue;
                 }
                 _ => {}
@@ -1208,9 +1281,6 @@ impl Repl {
 
             // ── Multi-line block accumulation ──────────────────────────────────
             self.history.push(line.to_owned());
-            let open_braces  = line.chars().filter(|&c| c == '{').count();
-            let close_braces = line.chars().filter(|&c| c == '}').count();
-
             self.multiline.push_str(line);
             self.multiline.push('\n');
 
@@ -1230,30 +1300,87 @@ impl Repl {
         }
     }
 
-    fn eval_input(&self, input: &str) {
-        // Lex the input and show any errors.
-        let mut lexer = Lexer::new(input);
-        let (tokens, errors) = lexer.tokenize();
+    fn eval_input(&mut self, input: &str) {
+        let started = Instant::now();
+        let status: &'static str;
 
-        if !errors.is_empty() {
-            let renderer = DiagRenderer::new(input, "<repl>", self.cfg.clone());
-            let diags: Vec<Diag> = errors.into_iter().map(Diag::from).collect();
-            eprint!("{}", renderer.render_all(&diags));
-            return;
+        // First try full-program mode (expects user-provided `fn main`).
+        match self.run_repl_program(input) {
+            Ok(()) => {
+                status = "ok:program";
+            }
+            Err(ReplRunError::Runtime(msg)) if msg.contains("unknown function: main") => {
+                status = match self.run_statement_mode(input) {
+                    Ok(()) => "ok:statement",
+                    Err(ReplRunError::Compile(diags)) => {
+                        let renderer = DiagRenderer::new(input, "<repl>", self.cfg.clone());
+                        eprint!("{}", renderer.render_all(&diags));
+                        "compile-error"
+                    }
+                    Err(ReplRunError::Runtime(msg)) => {
+                        eprintln!("{}", Ansi::paint(self.cfg.color, Ansi::BRIGHT_RED, &msg));
+                        "runtime-error"
+                    }
+                };
+            }
+            Err(ReplRunError::Compile(_diags)) => {
+                status = match self.run_statement_mode(input) {
+                    Ok(()) => "ok:statement-fallback",
+                    Err(ReplRunError::Compile(diags)) => {
+                        let renderer = DiagRenderer::new(input, "<repl>", self.cfg.clone());
+                        eprint!("{}", renderer.render_all(&diags));
+                        "compile-error"
+                    }
+                    Err(ReplRunError::Runtime(msg)) => {
+                        eprintln!("{}", Ansi::paint(self.cfg.color, Ansi::BRIGHT_RED, &msg));
+                        "runtime-error"
+                    }
+                };
+            }
+            Err(ReplRunError::Runtime(msg)) => {
+                eprintln!("{}", Ansi::paint(self.cfg.color, Ansi::BRIGHT_RED, &msg));
+                status = "runtime-error";
+            }
         }
 
-        // With a real parser this would be:
-        //   let mut parser = Parser::new(tokens);
-        //   let stmt = parser.parse_stmt();
-        //   let result = interp.eval_stmt(&stmt, &mut env);
-        //   println!("=> {result}");
-        //
-        // For now just echo the token count as proof of life.
-        let token_count = tokens.len().saturating_sub(1); // exclude Eof
-        if token_count > 0 {
-            let msg = format!("[parsed {token_count} token(s) — interpreter attach pending]");
-            println!("{}", Ansi::paint(self.cfg.color, Ansi::DIM, &msg));
+        if self.scientist_mode {
+            let elapsed = started.elapsed();
+            println!(
+                "{}",
+                Ansi::paint(
+                    self.cfg.color,
+                    Ansi::DIM,
+                    &format!("[scientist] {status} in {:.2?}", elapsed),
+                )
+            );
         }
+        self.log_experiment(input, status);
+    }
+
+    fn run_statement_mode(&self, input: &str) -> Result<(), ReplRunError> {
+        let wrapped = format!("fn main() {{\n{input}\n}}\n");
+        self.run_repl_program(&wrapped)
+    }
+
+    fn run_repl_program(&self, source: &str) -> Result<(), ReplRunError> {
+        let mut unit = CompileUnit::new("<repl>", source);
+        let result = Pipeline::new().run(&mut unit);
+        if unit.has_errors() {
+            return Err(ReplRunError::Compile(unit.diags));
+        }
+
+        let PipelineResult::Ok(program) = result else {
+            return Err(ReplRunError::Runtime(
+                "pipeline did not produce a runnable program".into(),
+            ));
+        };
+
+        let mut interp = crate::interp::Interpreter::new();
+        interp.load_program(&program);
+        interp
+            .call_fn("main", vec![])
+            .map(|_| ())
+            .map_err(|e| ReplRunError::Runtime(e.message))
     }
 
     fn cmd_tokens(&self, code: &str) {
@@ -1274,7 +1401,7 @@ impl Repl {
         }
     }
 
-    fn cmd_load(&self, path: &str) {
+    fn cmd_load(&mut self, path: &str) {
         match fs::read_to_string(path) {
             Err(e) => {
                 let msg = format!("cannot load `{path}`: {e}");
@@ -1287,6 +1414,134 @@ impl Repl {
             }
         }
     }
+
+    fn cmd_demo(&mut self, name: &str) {
+        let Some(src) = demo_source(name) else {
+            eprintln!(
+                "{}",
+                Ansi::paint(
+                    self.cfg.color,
+                    Ansi::BRIGHT_RED,
+                    "unknown demo. use: :demo game | :demo arcade | :demo ml",
+                )
+            );
+            return;
+        };
+        println!(
+            "{}",
+            Ansi::paint(
+                self.cfg.color,
+                Ansi::DIM,
+                &format!("running embedded `{name}` demo"),
+            )
+        );
+        self.eval_input(src);
+    }
+
+    fn cmd_persona(&self, target: &str) {
+        match target {
+            "game" => println!("{PERSONA_GAME_DEV}"),
+            "ml" => println!("{PERSONA_ML_SCI}"),
+            "all" => {
+                println!("{PERSONA_GAME_DEV}");
+                println!("{PERSONA_ML_SCI}");
+            }
+            _ => {
+                eprintln!(
+                    "{}",
+                    Ansi::paint(
+                        self.cfg.color,
+                        Ansi::BRIGHT_RED,
+                        "unknown target. use: :persona game | :persona ml | :persona all",
+                    )
+                );
+            }
+        }
+    }
+
+    fn cmd_scientist(&mut self, mode: &str) {
+        match mode {
+            "on" => {
+                self.scientist_mode = true;
+                println!(
+                    "{}",
+                    Ansi::paint(
+                        self.cfg.color,
+                        Ansi::DIM,
+                        "[scientist] timing/report mode enabled",
+                    )
+                );
+            }
+            "off" => {
+                self.scientist_mode = false;
+                println!(
+                    "{}",
+                    Ansi::paint(
+                        self.cfg.color,
+                        Ansi::DIM,
+                        "[scientist] timing/report mode disabled",
+                    )
+                );
+            }
+            _ => eprintln!(
+                "{}",
+                Ansi::paint(
+                    self.cfg.color,
+                    Ansi::BRIGHT_RED,
+                    "unknown mode. use: :scientist on | :scientist off",
+                )
+            ),
+        }
+    }
+
+    fn cmd_track(&mut self, target: &str) {
+        if target == "off" {
+            self.experiment_log = None;
+            println!(
+                "{}",
+                Ansi::paint(self.cfg.color, Ansi::DIM, "[scientist] experiment tracking disabled")
+            );
+            return;
+        }
+
+        let path = PathBuf::from(target);
+        let header = "# Jules experiment log\n";
+        if let Err(e) = fs::write(&path, header) {
+            eprintln!(
+                "{}",
+                Ansi::paint(
+                    self.cfg.color,
+                    Ansi::BRIGHT_RED,
+                    &format!("cannot start tracking at `{}`: {e}", path.display()),
+                )
+            );
+            return;
+        }
+        self.experiment_log = Some(path.clone());
+        println!(
+            "{}",
+            Ansi::paint(
+                self.cfg.color,
+                Ansi::DIM,
+                &format!("[scientist] tracking enabled at `{}`", path.display()),
+            )
+        );
+    }
+
+    fn log_experiment(&self, input: &str, status: &str) {
+        let Some(path) = &self.experiment_log else { return };
+        let record = format!("\n## status: {status}\n```jules\n{input}```\n");
+        let _ = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(record.as_bytes()));
+    }
+}
+
+enum ReplRunError {
+    Compile(Vec<Diag>),
+    Runtime(String),
 }
 
 // =============================================================================
@@ -1390,6 +1645,37 @@ mod tests {
     fn test_cli_check_warn_error() {
         let a = parse(&["check", "bar.jules", "-W"]).unwrap();
         assert!(a.warn_as_error);
+    }
+
+    #[test]
+    fn test_repl_demo_source_mapping() {
+        assert!(demo_source("game").is_some());
+        assert!(demo_source("arcade").is_some());
+        assert!(demo_source("ml").is_some());
+        assert!(demo_source("unknown").is_none());
+    }
+
+    #[test]
+    fn test_repl_scientist_toggle() {
+        let mut repl = Repl::new(RenderCfg::default());
+        repl.cmd_scientist("on");
+        assert!(repl.scientist_mode);
+        repl.cmd_scientist("off");
+        assert!(!repl.scientist_mode);
+    }
+
+    #[test]
+    fn test_repl_experiment_log_writes() {
+        let mut repl = Repl::new(RenderCfg::default());
+        let mut path = std::env::temp_dir();
+        path.push(format!("jules_repl_test_{}_{}.md", std::process::id(), 1539));
+        let p = path.to_string_lossy().to_string();
+        repl.cmd_track(&p);
+        repl.log_experiment("let x = 1;", "ok");
+        let data = std::fs::read_to_string(&path).unwrap();
+        assert!(data.contains("status: ok"));
+        assert!(data.contains("let x = 1;"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
