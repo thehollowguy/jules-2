@@ -549,7 +549,7 @@ impl BorrowChecker {
                     // Each arm gets its own scope so pattern bindings from one
                     // arm cannot leak into sibling arms or code after the match.
                     self.push_scope();
-                    self.bind_pattern_vars(&arm.pattern);
+                    self.bind_pattern_vars(&arm.pat);
                     if let Some(g) = &arm.guard {
                         self.check_expr(g);
                     }
