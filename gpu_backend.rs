@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 // GPU buffer handle (opaque to users)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,24 +150,16 @@ impl GpuBackendImpl for CpuBackend {
         let buf_a = buffers.get(&a.id).cloned().ok_or("Buffer A not found")?;
         let buf_b = buffers.get(&b.id).cloned().ok_or("Buffer B not found")?;
 
-        // Simple CPU matmul
-        if buf_a.shape.len() < 2 || buf_b.shape.len() < 2 {
-            return Err("Matmul requires 2D+ tensors".into());
-        }
-
-        let m = buf_a.shape[buf_a.shape.len() - 2];
-        let k = buf_a.shape[buf_a.shape.len() - 1];
-        let n = buf_b.shape[buf_b.shape.len() - 1];
-
-        if buf_b.shape[buf_b.shape.len() - 2] != k {
-            return Err("Dimension mismatch in matmul".into());
-        }
-
-        let out_data = accelerated_matmul(&buf_a.data, &buf_b.data, m, k, n);
+        let (out_data, out_shape) = batched_matmul(
+            &buf_a.data,
+            &buf_a.shape,
+            &buf_b.data,
+            &buf_b.shape,
+        )?;
 
         let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
         out_buf.data = out_data;
-        out_buf.shape = vec![m, n];
+        out_buf.shape = out_shape;
 
         Ok(())
     }
@@ -404,10 +397,121 @@ fn matmul_blocked_rows(
 }
 
 fn accelerated_matmul(a_data: &[f32], b_data: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let bt = transpose_2d(b_data, k, n);
     let mut out = vec![0.0f32; m * n];
+
+    // Route larger GEMMs to the optimized `matrixmultiply` kernel.
+    let ops = m.saturating_mul(k).saturating_mul(n);
+    if ops >= 16_384 {
+        unsafe {
+            matrixmultiply::sgemm(
+                m,
+                k,
+                n,
+                1.0,
+                a_data.as_ptr(),
+                k as isize,
+                1,
+                b_data.as_ptr(),
+                n as isize,
+                1,
+                0.0,
+                out.as_mut_ptr(),
+                n as isize,
+                1,
+            );
+        }
+        return out;
+    }
+
+    // For small matrices, blocked+transpose often wins by reducing setup overhead.
+    let bt = transpose_2d(b_data, k, n);
     matmul_blocked_rows(a_data, &bt, 0, m, k, n, &mut out, 0);
     out
+}
+
+fn batched_matmul(
+    a_data: &[f32],
+    a_shape: &[usize],
+    b_data: &[f32],
+    b_shape: &[usize],
+) -> Result<(Vec<f32>, Vec<usize>), String> {
+    if a_shape.len() < 2 || b_shape.len() < 2 {
+        return Err("Matmul requires rank-2+ tensors".into());
+    }
+    if a_shape.len() != b_shape.len() {
+        return Err("Matmul requires matching tensor rank".into());
+    }
+
+    let m = a_shape[a_shape.len() - 2];
+    let k = a_shape[a_shape.len() - 1];
+    let k2 = b_shape[b_shape.len() - 2];
+    let n = b_shape[b_shape.len() - 1];
+    if k != k2 {
+        return Err("Matmul dimension mismatch".into());
+    }
+    if a_shape[..a_shape.len() - 2] != b_shape[..b_shape.len() - 2] {
+        return Err("Matmul batch shape mismatch".into());
+    }
+
+    let batch: usize = a_shape[..a_shape.len() - 2].iter().product();
+    let a_mat = m * k;
+    let b_mat = k * n;
+    let mut out_data = vec![0.0f32; batch * m * n];
+
+    let batch_mat_size = m * n;
+    let ops_per_batch = m.saturating_mul(k).saturating_mul(n);
+    let threads = thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+    let parallel_batches = threads > 1 && batch > 1 && ops_per_batch >= 65_536;
+
+    if parallel_batches {
+        let batches_per_chunk = batch.div_ceil(threads);
+        thread::scope(|scope| {
+            for (chunk_idx, out_chunk) in out_data
+                .chunks_mut(batches_per_chunk * batch_mat_size)
+                .enumerate()
+            {
+                let batch_start = chunk_idx * batches_per_chunk;
+                let batch_end = (batch_start + batches_per_chunk).min(batch);
+                scope.spawn(move || {
+                    for bi in batch_start..batch_end {
+                        let local_bi = bi - batch_start;
+                        let a_off = bi * a_mat;
+                        let b_off = bi * b_mat;
+                        let out_off = local_bi * batch_mat_size;
+                        let out = accelerated_matmul(
+                            &a_data[a_off..a_off + a_mat],
+                            &b_data[b_off..b_off + b_mat],
+                            m,
+                            k,
+                            n,
+                        );
+                        out_chunk[out_off..out_off + batch_mat_size].copy_from_slice(&out);
+                    }
+                });
+            }
+        });
+    } else {
+        for bi in 0..batch {
+            let a_off = bi * a_mat;
+            let b_off = bi * b_mat;
+            let out_off = bi * batch_mat_size;
+            let out = accelerated_matmul(
+                &a_data[a_off..a_off + a_mat],
+                &b_data[b_off..b_off + b_mat],
+                m,
+                k,
+                n,
+            );
+            out_data[out_off..out_off + batch_mat_size].copy_from_slice(&out);
+        }
+    }
+
+    let mut out_shape = a_shape[..a_shape.len() - 2].to_vec();
+    out_shape.push(m);
+    out_shape.push(n);
+    Ok((out_data, out_shape))
 }
 
 fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
@@ -502,19 +606,15 @@ impl GpuBackendImpl for WgpuBackend {
         let mut buffers = self.buffers.lock().unwrap();
         let a_buf = buffers.get(&a.id).cloned().ok_or("Buffer A not found")?;
         let b_buf = buffers.get(&b.id).cloned().ok_or("Buffer B not found")?;
-        if a_buf.shape.len() < 2 || b_buf.shape.len() < 2 {
-            return Err("Matmul requires rank-2+ tensors".into());
-        }
-        let m = a_buf.shape[a_buf.shape.len() - 2];
-        let k = a_buf.shape[a_buf.shape.len() - 1];
-        let n = b_buf.shape[b_buf.shape.len() - 1];
-        if b_buf.shape[b_buf.shape.len() - 2] != k {
-            return Err("Matmul dimension mismatch".into());
-        }
-        let out_data = accelerated_matmul(&a_buf.data, &b_buf.data, m, k, n);
+        let (out_data, out_shape) = batched_matmul(
+            &a_buf.data,
+            &a_buf.shape,
+            &b_buf.data,
+            &b_buf.shape,
+        )?;
         let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
         out_buf.data = out_data;
-        out_buf.shape = vec![m, n];
+        out_buf.shape = out_shape;
         Ok(())
     }
 
@@ -1079,5 +1179,28 @@ mod tests {
         backend.activation(&out, &out, "relu").unwrap();
         let relu = backend.download(&out);
         assert_eq!(relu, vec![1.5, 0.0, 3.5, 0.0]);
+    }
+
+    #[test]
+    fn test_jules_gpu_batched_matmul() {
+        let backend = WgpuBackend::new().unwrap();
+        let a = backend.upload(
+            &[
+                1.0, 2.0, 3.0, 4.0, // batch 0
+                2.0, 0.0, 1.0, 2.0, // batch 1
+            ],
+            vec![2, 2, 2],
+        );
+        let b = backend.upload(
+            &[
+                5.0, 6.0, 7.0, 8.0, // batch 0
+                1.0, 0.0, 0.0, 1.0, // batch 1 identity
+            ],
+            vec![2, 2, 2],
+        );
+        let out = backend.upload(&[0.0; 8], vec![2, 2, 2]);
+        backend.matmul(&a, &b, &out).unwrap();
+        let got = backend.download(&out);
+        assert_eq!(got, vec![19.0, 22.0, 43.0, 50.0, 2.0, 0.0, 1.0, 2.0]);
     }
 }

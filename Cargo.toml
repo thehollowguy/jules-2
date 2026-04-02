@@ -19,6 +19,10 @@ path = "main.rs"
 name = "bench-ecs"
 path = "benches/bench_ecs.rs"
 
+[[bin]]
+name = "micro-benchmark"
+path = "micro-benchmark.rs"
+
 [dependencies]
 pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 numpy = { version = "0.21", optional = true }
