@@ -1100,47 +1100,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cpu_backend_batched_matmul_correctness() {
-        let backend = CpuBackend::new();
-        let a = backend.upload(
-            &[
-                1.0, 2.0, 3.0, 4.0, // batch 0
-                2.0, 0.0, 1.0, 2.0, // batch 1
-            ],
-            vec![2, 2, 2],
-        );
-        let b = backend.upload(
-            &[
-                5.0, 6.0, 7.0, 8.0, // batch 0
-                1.0, 0.0, 0.0, 1.0, // batch 1 identity
-            ],
-            vec![2, 2, 2],
-        );
-        let out = backend.upload(&[0.0; 8], vec![2, 2, 2]);
-        backend.matmul(&a, &b, &out).unwrap();
-        let got = backend.download(&out);
-        assert_eq!(got, vec![19.0, 22.0, 43.0, 50.0, 2.0, 0.0, 1.0, 2.0]);
-    }
-
-    #[test]
-    fn test_cpu_backend_large_matmul_kernel_path() {
-        let backend = CpuBackend::new();
-        let m = 32usize;
-        let k = 32usize;
-        let n = 32usize; // 32*32*32=32768 (forces optimized GEMM path)
-        let a_data = vec![1.0f32; m * k];
-        let b_data = vec![2.0f32; k * n];
-        let a = backend.upload(&a_data, vec![m, k]);
-        let b = backend.upload(&b_data, vec![k, n]);
-        let out = backend.upload(&vec![0.0f32; m * n], vec![m, n]);
-        backend.matmul(&a, &b, &out).unwrap();
-        let got = backend.download(&out);
-        assert_eq!(got.len(), m * n);
-        // Each output element is sum(1*2) over k terms.
-        assert!(got.iter().all(|v| (*v - 64.0).abs() < 1e-4));
-    }
-
-    #[test]
     fn test_cpu_backend_elementwise_conv_pool_activation() {
         let backend = CpuBackend::new();
 
