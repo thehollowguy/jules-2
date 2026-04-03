@@ -196,6 +196,125 @@ impl Tensor {
         }
     }
 
+    /// Numerically stable softmax over the last dimension.
+    /// Useful for batched logits with shape `[batch, classes]` and higher-rank tensors.
+    pub fn softmax_last_dim(&self) -> Result<Tensor, String> {
+        let last_dim = *self
+            .shape
+            .last()
+            .ok_or_else(|| "softmax_last_dim expects rank >= 1".to_string())?;
+        if last_dim == 0 {
+            return Err("softmax_last_dim last dimension must be > 0".into());
+        }
+
+        let rows = self.numel() / last_dim;
+        let mut out = vec![0.0f32; self.numel()];
+
+        for r in 0..rows {
+            let base = r * last_dim;
+            let row = &self.data[base..base + last_dim];
+            let row_max = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let mut exp_sum = 0.0f32;
+            for i in 0..last_dim {
+                let e = (row[i] - row_max).exp();
+                out[base + i] = e;
+                exp_sum += e;
+            }
+            let inv_sum = 1.0 / exp_sum.max(1e-12);
+            for i in 0..last_dim {
+                out[base + i] *= inv_sum;
+            }
+        }
+
+        Ok(Tensor {
+            shape: self.shape.clone(),
+            data: out,
+        })
+    }
+
+    /// GELU activation (tanh approximation used by many Transformer models).
+    pub fn gelu(&self) -> Tensor {
+        let k = (2.0 / std::f32::consts::PI).sqrt();
+        let data = self
+            .data
+            .iter()
+            .map(|x| {
+                let cubic = 0.044715 * x * x * x;
+                0.5 * x * (1.0 + (k * (x + cubic)).tanh())
+            })
+            .collect();
+        Tensor {
+            shape: self.shape.clone(),
+            data,
+        }
+    }
+
+    /// Backward pass for GELU (tanh approximation).
+    /// Takes `upstream_grad` of the same shape as `self`.
+    pub fn gelu_backward(&self, upstream_grad: &Tensor) -> Result<Tensor, String> {
+        if self.shape != upstream_grad.shape {
+            return Err("gelu_backward shape mismatch".into());
+        }
+        let k = (2.0 / std::f32::consts::PI).sqrt();
+        let data = self
+            .data
+            .iter()
+            .zip(&upstream_grad.data)
+            .map(|(x, g)| {
+                let x2 = x * x;
+                let x3 = x2 * x;
+                let inner = k * (x + 0.044715 * x3);
+                let tanh_inner = inner.tanh();
+                let sech2 = 1.0 - tanh_inner * tanh_inner;
+                let d_inner = k * (1.0 + 3.0 * 0.044715 * x2);
+                let d_gelu = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * d_inner;
+                g * d_gelu
+            })
+            .collect();
+        Ok(Tensor {
+            shape: self.shape.clone(),
+            data,
+        })
+    }
+
+    /// SiLU / Swish activation: `x * sigmoid(x)`.
+    pub fn silu(&self) -> Tensor {
+        let data = self
+            .data
+            .iter()
+            .map(|x| {
+                let sig = 1.0 / (1.0 + (-x).exp());
+                x * sig
+            })
+            .collect();
+        Tensor {
+            shape: self.shape.clone(),
+            data,
+        }
+    }
+
+    /// Backward pass for SiLU / Swish.
+    /// Takes `upstream_grad` of the same shape as `self`.
+    pub fn silu_backward(&self, upstream_grad: &Tensor) -> Result<Tensor, String> {
+        if self.shape != upstream_grad.shape {
+            return Err("silu_backward shape mismatch".into());
+        }
+        let data = self
+            .data
+            .iter()
+            .zip(&upstream_grad.data)
+            .map(|(x, g)| {
+                let sig = 1.0 / (1.0 + (-x).exp());
+                let d_silu = sig + x * sig * (1.0 - sig);
+                g * d_silu
+            })
+            .collect();
+        Ok(Tensor {
+            shape: self.shape.clone(),
+            data,
+        })
+    }
+
     /// LayerNorm over the last dimension.
     /// `gamma`/`beta` are optional affine params of shape `[last_dim]`.
     pub fn layer_norm_last_dim(
@@ -775,7 +894,6 @@ fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
     s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + tail
 }
 
-
 impl ComputationGraph {
     pub fn new() -> Self {
         ComputationGraph {
@@ -1314,6 +1432,115 @@ impl LossFunctions {
             / predictions.numel().max(1) as f32
     }
 
+    /// Cross-entropy from logits over the last dim.
+    /// `targets` must contain class indices with the same prefix shape as `logits`.
+    ///
+    /// Example:
+    /// - logits: `[batch, classes]`
+    /// - targets: `[batch]` (each value in `[0, classes)`)
+    pub fn cross_entropy_from_logits_last_dim(
+        logits: &Tensor,
+        targets: &Tensor,
+    ) -> Result<f32, String> {
+        let classes = *logits.shape.last().ok_or_else(|| {
+            "cross_entropy_from_logits_last_dim expects logits rank >= 1".to_string()
+        })?;
+        if classes == 0 {
+            return Err("cross_entropy_from_logits_last_dim classes must be > 0".into());
+        }
+
+        let sample_count = logits.numel() / classes;
+        if targets.numel() != sample_count {
+            return Err(format!(
+                "targets numel {} must equal logits sample count {}",
+                targets.numel(),
+                sample_count
+            ));
+        }
+
+        let mut loss = 0.0f32;
+        for s in 0..sample_count {
+            let base = s * classes;
+            let row = &logits.data[base..base + classes];
+            let max_logit = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+
+            let mut sum_exp = 0.0f32;
+            for i in 0..classes {
+                sum_exp += (row[i] - max_logit).exp();
+            }
+            let log_denom = max_logit + sum_exp.max(1e-12).ln();
+
+            let target = targets.data[s];
+            let class_idx = target as usize;
+            if (class_idx as f32 - target).abs() > 1e-6 || class_idx >= classes {
+                return Err(format!(
+                    "target value {} at index {} is not a valid class index in [0, {})",
+                    target, s, classes
+                ));
+            }
+            loss += log_denom - row[class_idx];
+        }
+
+        Ok(loss / sample_count.max(1) as f32)
+    }
+
+    /// Gradient of cross-entropy with logits over the last dimension.
+    /// Returns dL/dlogits with the same shape as `logits`.
+    pub fn cross_entropy_from_logits_last_dim_gradient(
+        logits: &Tensor,
+        targets: &Tensor,
+    ) -> Result<Tensor, String> {
+        let classes = *logits.shape.last().ok_or_else(|| {
+            "cross_entropy_from_logits_last_dim_gradient expects logits rank >= 1".to_string()
+        })?;
+        if classes == 0 {
+            return Err("cross_entropy_from_logits_last_dim_gradient classes must be > 0".into());
+        }
+
+        let sample_count = logits.numel() / classes;
+        if targets.numel() != sample_count {
+            return Err(format!(
+                "targets numel {} must equal logits sample count {}",
+                targets.numel(),
+                sample_count
+            ));
+        }
+
+        let mut grad = vec![0.0f32; logits.numel()];
+        let inv_n = 1.0 / sample_count.max(1) as f32;
+
+        for s in 0..sample_count {
+            let base = s * classes;
+            let row = &logits.data[base..base + classes];
+            let row_max = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+
+            let mut sum_exp = 0.0f32;
+            for i in 0..classes {
+                sum_exp += (row[i] - row_max).exp();
+            }
+            let inv_sum = 1.0 / sum_exp.max(1e-12);
+
+            let target = targets.data[s];
+            let class_idx = target as usize;
+            if (class_idx as f32 - target).abs() > 1e-6 || class_idx >= classes {
+                return Err(format!(
+                    "target value {} at index {} is not a valid class index in [0, {})",
+                    target, s, classes
+                ));
+            }
+
+            for i in 0..classes {
+                let p = (row[i] - row_max).exp() * inv_sum;
+                grad[base + i] = if i == class_idx { (p - 1.0) * inv_n } else { p * inv_n };
+            }
+        }
+
+        Ok(Tensor {
+            shape: logits.shape.clone(),
+            data: grad,
+        })
+    }
+
     /// Compute MSE gradient
     pub fn mse_gradient(predictions: &Tensor, targets: &Tensor) -> Tensor {
         assert_eq!(predictions.shape, targets.shape);
@@ -1382,6 +1609,80 @@ impl Regularization {
             shape: weights.shape.clone(),
             data: weights.data.iter().map(|w| lambda * w.signum()).collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_ml_ext {
+    use super::{LossFunctions, Tensor};
+
+    fn approx(a: f32, b: f32, eps: f32) -> bool {
+        (a - b).abs() <= eps
+    }
+
+    #[test]
+    fn softmax_last_dim_is_row_normalized() {
+        let logits = Tensor {
+            shape: vec![2, 3],
+            data: vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0],
+        };
+        let probs = logits.softmax_last_dim().expect("softmax_last_dim should succeed");
+        assert_eq!(probs.shape, vec![2, 3]);
+
+        let row0: f32 = probs.data[0..3].iter().sum();
+        let row1: f32 = probs.data[3..6].iter().sum();
+        assert!(approx(row0, 1.0, 1e-5));
+        assert!(approx(row1, 1.0, 1e-5));
+        assert!(probs.data[2] > probs.data[1] && probs.data[1] > probs.data[0]);
+    }
+
+    #[test]
+    fn gelu_and_silu_backward_match_numerical_gradient() {
+        let x = Tensor {
+            shape: vec![3],
+            data: vec![-1.25, 0.25, 1.75],
+        };
+        let up = Tensor {
+            shape: vec![3],
+            data: vec![1.0, 1.0, 1.0],
+        };
+
+        let gelu_grad = x.gelu_backward(&up).expect("gelu_backward");
+        let silu_grad = x.silu_backward(&up).expect("silu_backward");
+
+        let h = 1e-3f32;
+        for i in 0..x.data.len() {
+            let mut plus = x.clone();
+            plus.data[i] += h;
+            let mut minus = x.clone();
+            minus.data[i] -= h;
+
+            let num_gelu = (plus.gelu().data[i] - minus.gelu().data[i]) / (2.0 * h);
+            let num_silu = (plus.silu().data[i] - minus.silu().data[i]) / (2.0 * h);
+
+            assert!(approx(gelu_grad.data[i], num_gelu, 2e-3));
+            assert!(approx(silu_grad.data[i], num_silu, 2e-3));
+        }
+    }
+
+    #[test]
+    fn cross_entropy_gradient_sums_to_zero_per_sample() {
+        let logits = Tensor {
+            shape: vec![2, 4],
+            data: vec![1.0, 0.0, -1.0, 2.0, 0.5, -0.5, 0.0, 1.0],
+        };
+        let targets = Tensor {
+            shape: vec![2],
+            data: vec![3.0, 0.0],
+        };
+        let grad = LossFunctions::cross_entropy_from_logits_last_dim_gradient(&logits, &targets)
+            .expect("gradient should succeed");
+        assert_eq!(grad.shape, logits.shape);
+
+        let row0: f32 = grad.data[0..4].iter().sum();
+        let row1: f32 = grad.data[4..8].iter().sum();
+        assert!(approx(row0, 0.0, 1e-5));
+        assert!(approx(row1, 0.0, 1e-5));
     }
 }
 
