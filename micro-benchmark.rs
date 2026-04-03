@@ -52,6 +52,11 @@ fn main() {
             source: build_stress_source(400),
             run_main: false,
         },
+        Sample {
+            name: "compile:ml-kernel",
+            source: build_ml_source(64),
+            run_main: false,
+        },
     ];
 
     for sample in &samples {
@@ -73,6 +78,8 @@ struct SampleReport {
     rss_after: u64,
 }
 
+const COMPILE_SLA: Duration = Duration::from_millis(1500);
+
 fn run_sample(sample: &Sample, iterations: usize) -> Result<SampleReport, String> {
     let mut compile_times = Vec::with_capacity(iterations);
     let mut runtime_times = if sample.run_main {
@@ -82,10 +89,10 @@ fn run_sample(sample: &Sample, iterations: usize) -> Result<SampleReport, String
     };
 
     let rss_before = rss_bytes().unwrap_or(0);
+    let pipeline = Pipeline::new();
 
     for i in 0..iterations {
         let mut unit = CompileUnit::new(format!("<bench:{}:{i}>", sample.name), &sample.source);
-        let pipeline = Pipeline::new();
 
         let compile_start = Instant::now();
         let result = pipeline.run(&mut unit);
@@ -112,9 +119,12 @@ fn run_sample(sample: &Sample, iterations: usize) -> Result<SampleReport, String
             let mut interp = jules::interp::Interpreter::new();
             interp.load_program(&program);
             let run_start = Instant::now();
-            interp
-                .call_fn("main", vec![])
-                .map_err(|e| format!("runtime error in `{}` iteration {}: {}", sample.name, i, e.message))?;
+            interp.call_fn("main", vec![]).map_err(|e| {
+                format!(
+                    "runtime error in `{}` iteration {}: {}",
+                    sample.name, i, e.message
+                )
+            })?;
             let run_elapsed = run_start.elapsed();
             runtime_times.as_mut().unwrap().push(run_elapsed);
         }
@@ -163,6 +173,7 @@ fn percentile(sorted: &[Duration], pct: f64) -> Duration {
 fn print_report(sample: &Sample, report: &SampleReport) {
     println!("== {} ==", sample.name);
     print_timing("compile", &report.compile);
+    print_sla("compile", &report.compile);
     if let Some(runtime) = &report.runtime {
         print_timing("runtime", runtime);
     }
@@ -187,6 +198,22 @@ fn print_timing(label: &str, t: &TimingSummary) {
         fmt_duration(t.max),
         fmt_duration(t.mean)
     );
+}
+
+fn print_sla(label: &str, t: &TimingSummary) {
+    if t.p95 <= COMPILE_SLA {
+        println!(
+            "{label}-sla: pass (p95 {} <= {})",
+            fmt_duration(t.p95),
+            fmt_duration(COMPILE_SLA)
+        );
+    } else {
+        println!(
+            "{label}-sla: FAIL (p95 {} > {})",
+            fmt_duration(t.p95),
+            fmt_duration(COMPILE_SLA)
+        );
+    }
 }
 
 fn fmt_duration(d: Duration) -> String {
@@ -220,6 +247,21 @@ fn build_stress_source(n_lets: usize) -> String {
     for i in 0..n_lets {
         let line = format!("  let v{i} = {} + {};\n", i, i + 1);
         out.push_str(&line);
+    }
+    out.push_str("}\n");
+    out
+}
+
+fn build_ml_source(width: usize) -> String {
+    let mut out = String::from("fn main() {\n");
+    out.push_str("  let scale = 2;\n");
+    for i in 0..width {
+        out.push_str(&format!("  let x{i} = {} * scale;\n", i + 1));
+    }
+    for i in 0..width {
+        let a = i;
+        let b = (i + 3) % width;
+        out.push_str(&format!("  let m{i} = x{a} * x{b} + scale;\n"));
     }
     out.push_str("}\n");
     out
