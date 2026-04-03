@@ -2868,13 +2868,13 @@ impl TypeCk {
     // =========================================================================
 
     fn check_agent(&mut self, a: &AgentDecl) {
-        // ─── NEW: Validate @AI decorator if present ───────────────────────────
-        if let Some(ai_attr) = a
-            .attrs
-            .iter()
-            .find(|attr| matches!(attr, crate::ast::Attribute::Named { name, .. } if name == "ai"))
-        {
-            self.validate_ai_decorator(a, ai_attr);
+        // Validate @AI / @PPO / @DQN ... decorators.
+        for attr in &a.attrs {
+            if let crate::ast::Attribute::Named { name, .. } = attr {
+                if is_network_decorator(name) {
+                    self.validate_ai_decorator(a, attr, name);
+                }
+            }
         }
 
         // If learning is reinforcement/imitation, there should be a policy model.
@@ -3009,16 +3009,22 @@ impl TypeCk {
         }
     }
 
-    fn validate_ai_decorator(&mut self, a: &AgentDecl, attr: &crate::ast::Attribute) {
+    fn validate_ai_decorator(
+        &mut self,
+        a: &AgentDecl,
+        attr: &crate::ast::Attribute,
+        decorator_name: &str,
+    ) {
         let crate::ast::Attribute::Named { args, .. } = attr else {
             return;
         };
+        let dec = decorator_name.to_uppercase();
 
         // Optional positional first arg: network architecture string.
         if let Some(first) = args.first() {
             if let crate::ast::Expr::StrLit { value, span } = first {
                 if let Err(e) = self.validate_architecture_string(value) {
-                    self.diag.error(*span, format!("@AI: {}", e));
+                    self.diag.error(*span, format!("@{}: {}", dec, e));
                 }
             }
         }
@@ -3033,28 +3039,41 @@ impl TypeCk {
                     "network" => {
                         if let crate::ast::Expr::StrLit { value: arch, span } = &**value {
                             if let Err(e) = self.validate_architecture_string(arch) {
-                                self.diag.error(*span, format!("@AI network: {}", e));
+                                self.diag.error(*span, format!("@{} network: {}", dec, e));
                             }
                         } else {
-                            self.diag.error(value.span(), "@AI `network` must be a string architecture");
+                            self.diag.error(
+                                value.span(),
+                                format!("@{} `network` must be a string architecture", dec),
+                            );
                         }
                     }
                     "lr" | "learning_rate" => {
                         if let Some(v) = self.ai_number_literal(value) {
                             if v <= 0.0 {
-                                self.diag.error(value.span(), "@AI learning rate must be > 0");
+                                self.diag.error(
+                                    value.span(),
+                                    format!("@{} learning rate must be > 0", dec),
+                                );
                             }
                         } else {
-                            self.diag.error(value.span(), "@AI learning rate must be numeric");
+                            self.diag.error(
+                                value.span(),
+                                format!("@{} learning rate must be numeric", dec),
+                            );
                         }
                     }
                     "input" | "output" => {
                         if let Some(v) = self.ai_u64_literal(value) {
                             if v == 0 {
-                                self.diag.error(value.span(), format!("@AI `{}` must be > 0", key));
+                                self.diag
+                                    .error(value.span(), format!("@{} `{}` must be > 0", dec, key));
                             }
                         } else {
-                            self.diag.error(value.span(), format!("@AI `{}` must be an integer", key));
+                            self.diag.error(
+                                value.span(),
+                                format!("@{} `{}` must be an integer", dec, key),
+                            );
                         }
                     }
                     _ => {}
@@ -3065,86 +3084,100 @@ impl TypeCk {
         let _ = a;
     }
 
-    fn supported_ai_network_types() -> &'static [&'static str] {
-        &[
-            "mlp",
-            "lstm",
-            "gru",
-            "rnn",
-            "cnn",
-            "resnet",
-            "unet",
-            "transformer",
-            "bert",
-            "gpt",
-            "vae",
-            "gan",
-            "autoencoder",
-            "diffusion",
-            "dueling",
-        ]
-    }
-
     /// Validate that an architecture string has valid format.
-    /// Format: `type:spec` (type optional, defaults to `mlp`).
+    /// Rule-based, architecture-agnostic validation:
+    ///   - accepts optional `type:spec` prefixes with any type name
+    ///   - accepts shorthand chains (`124->248->68`)
+    ///   - allows key/value style specs (`d_model=768,heads=12,layers=12`)
+    ///   - checks balanced delimiters and disallows invalid punctuation
     fn validate_architecture_string(&self, s: &str) -> Result<(), String> {
         let s = s.trim();
         if s.is_empty() {
             return Err("empty architecture specification".into());
         }
 
-        // Check for type prefix
-        let (arch_type, rest) = if let Some(colon_pos) = s.find(':') {
+        // Optional `type:spec` prefix; type is intentionally unrestricted.
+        let rest = if let Some(colon_pos) = s.find(':') {
             let (prefix, tail) = s.split_at(colon_pos);
-            (prefix.to_lowercase(), &tail[1..]) // Skip the ':'
+            let p = prefix.trim();
+            if p.is_empty() {
+                return Err("architecture type prefix before `:` cannot be empty".into());
+            }
+            if !p
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err(format!(
+                    "invalid architecture type prefix `{}`; use letters, digits, `_` or `-`",
+                    p
+                ));
+            }
+            &tail[1..] // skip ':'
         } else {
-            ("mlp".into(), s)
+            s
         };
-
-        let supported = Self::supported_ai_network_types();
-        if !supported.contains(&arch_type.as_str()) {
-            return Err(format!(
-                "unknown architecture type `{}`. Supported: {}",
-                arch_type,
-                supported.join(", ")
-            ));
-        }
-
-        // Basic format validation: should have numbers and operators
         if rest.is_empty() {
-            return Err(format!("architecture `{}:` is incomplete", arch_type));
+            return Err("architecture spec is empty".into());
         }
 
-        // For feed-forward/recurrent families, enforce explicit layer chain.
-        if matches!(arch_type.as_str(), "mlp" | "lstm" | "gru" | "rnn") && !rest.contains("->") {
-            return Err(format!(
-                "`{}` architecture must have layers separated by `->` (e.g., `{}:256->512->10`)",
-                arch_type, arch_type
-            ));
+        // Rule-based character validation.
+        if !rest.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '_'
+                        | '-'
+                        | '>'
+                        | '<'
+                        | '='
+                        | ','
+                        | '.'
+                        | ':'
+                        | 'x'
+                        | 'X'
+                        | '['
+                        | ']'
+                        | '('
+                        | ')'
+                        | '+'
+                        | '*'
+                        | '/'
+                        | ' '
+                )
+        }) {
+            return Err("architecture contains unsupported characters".into());
         }
 
-        // CNN-like types must include at least one channel/feature map marker.
-        if matches!(arch_type.as_str(), "cnn" | "resnet" | "unet")
-            && !rest.contains('x')
-            && !rest.contains("->")
-        {
-            return Err(format!(
-                "`{}` architecture should include channel/shape progression (e.g., `{}:3x224x224->64->128`)",
-                arch_type, arch_type
-            ));
+        // Balanced delimiters.
+        let mut round = 0usize;
+        let mut square = 0usize;
+        for ch in rest.chars() {
+            match ch {
+                '(' => round += 1,
+                ')' => {
+                    if round == 0 {
+                        return Err("unbalanced `()` in architecture spec".into());
+                    }
+                    round -= 1;
+                }
+                '[' => square += 1,
+                ']' => {
+                    if square == 0 {
+                        return Err("unbalanced `[]` in architecture spec".into());
+                    }
+                    square -= 1;
+                }
+                _ => {}
+            }
         }
-
-        // Transformer-family models should include width/depth/head hints.
-        if matches!(arch_type.as_str(), "transformer" | "bert" | "gpt")
-            && !rest.contains("d_model")
-            && !rest.contains("heads")
-            && !rest.contains("layers")
-            && !rest.contains("->")
-        {
-            return Err(format!(
-                "`{}` architecture should describe model width/depth (e.g., `{}:d_model=768,heads=12,layers=12`)",
-                arch_type, arch_type
-            ));
+        if round != 0 || square != 0 {
+            return Err("unbalanced delimiters in architecture spec".into());
+        }
+        if rest.contains("->") && (rest.starts_with("->") || rest.ends_with("->")) {
+            return Err("layer chain cannot start or end with `->`".into());
+        }
+        if rest.contains(",,") {
+            return Err("architecture spec has an empty comma-separated segment".into());
         }
 
         Ok(())
@@ -3957,6 +3990,76 @@ mod tests {
         let mut ck = make_checker();
         ck.check_program(&program);
         assert!(ck.diag.has_errors());
+    }
+
+    #[test]
+    fn test_ppo_decorator_arch_and_lr_is_valid() {
+        let ppo_attr = Attribute::Named {
+            name: "ppo".into(),
+            args: vec![
+                Expr::StrLit {
+                    span: dummy(),
+                    value: "124->248->68".into(),
+                },
+                Expr::Assign {
+                    span: dummy(),
+                    op: AssignOpKind::Assign,
+                    target: Box::new(Expr::Ident {
+                        span: dummy(),
+                        name: "lr".into(),
+                    }),
+                    value: Box::new(Expr::FloatLit {
+                        span: dummy(),
+                        value: 0.0001,
+                    }),
+                },
+            ],
+        };
+
+        let program = Program {
+            span: dummy(),
+            items: vec![Item::Agent(mk_agent_with_attrs(vec![ppo_attr]))],
+        };
+
+        let mut ck = make_checker();
+        ck.check_program(&program);
+        assert!(
+            !ck.diag.has_errors(),
+            "unexpected errors for valid @ppo options: {:?}",
+            ck.diag.items
+        );
+    }
+
+    #[test]
+    fn test_ai_decorator_allows_custom_arch_prefixes() {
+        let ai_attr = Attribute::Named {
+            name: "ai".into(),
+            args: vec![Expr::Assign {
+                span: dummy(),
+                op: AssignOpKind::Assign,
+                target: Box::new(Expr::Ident {
+                    span: dummy(),
+                    name: "network".into(),
+                }),
+                value: Box::new(Expr::StrLit {
+                    span: dummy(),
+                    value: "my_custom_policy:obs=124->248->68,heads=4".into(),
+                }),
+            }],
+        };
+
+        let program = Program {
+            span: dummy(),
+            items: vec![Item::Agent(mk_agent_with_attrs(vec![ai_attr]))],
+        };
+
+        let mut ck = make_checker();
+        ck.check_program(&program);
+        assert!(
+            !ck.diag.has_errors(),
+            "unexpected errors for custom architecture prefix: {:?}",
+            ck.diag.items
+        );
     }
 
     #[test]
