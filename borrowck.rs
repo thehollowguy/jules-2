@@ -39,6 +39,15 @@ impl Diagnostics {
             labels: vec![],
         });
     }
+
+    fn error_with_fix(&mut self, span: Span, message: impl Into<String>, fix: impl Into<String>) {
+        self.items.push(Diagnostic {
+            severity: Severity::Error,
+            span,
+            message: message.into(),
+            labels: vec![(span, format!("auto-fix: {}", fix.into()))],
+        });
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -50,6 +59,7 @@ struct LoanState {
 #[derive(Debug, Default, Clone)]
 struct VarState {
     moved: bool,
+    is_copy: bool,
 }
 
 #[derive(Debug)]
@@ -97,7 +107,9 @@ impl BorrowChecker {
         // If this name already holds a reference, drop that loan before rebinding.
         // Without this, shadowing a ref variable leaks its loan forever.
         self.release_ref_binding(name);
-        self.var_state.entry(name.to_string()).or_default().moved = false;
+        let st = self.var_state.entry(name.to_string()).or_default();
+        st.moved = false;
+        st.is_copy = false;
         if let Some(scope) = self.scope_bindings.last_mut() {
             scope.push(name.to_string());
         }
@@ -111,6 +123,10 @@ impl BorrowChecker {
 
     fn mark_initialized(&mut self, name: &str) {
         self.var_state.entry(name.to_string()).or_default().moved = false;
+    }
+
+    fn set_copy_flag(&mut self, name: &str, is_copy: bool) {
+        self.var_state.entry(name.to_string()).or_default().is_copy = is_copy;
     }
 
     fn release_ref_binding(&mut self, ref_name: &str) {
@@ -133,9 +149,10 @@ impl BorrowChecker {
 
     fn try_borrow(&mut self, target: &str, is_mut: bool, span: Span) -> bool {
         if self.var_state.get(target).map(|v| v.moved).unwrap_or(false) {
-            self.diag.error(
+            self.diag.error_with_fix(
                 span,
                 format!("cannot borrow `{target}` because it has been moved"),
+                format!("borrow `{target}` earlier with `&{target}` (or clone before moving)"),
             );
             return false;
         }
@@ -144,9 +161,7 @@ impl BorrowChecker {
         if is_mut && self.parallel_depth > 0 {
             self.diag.error(
                 span,
-                format!(
-                    "cannot mutably borrow `{target}` inside a parallel or spawned block"
-                ),
+                format!("cannot mutably borrow `{target}` inside a parallel or spawned block"),
             );
             return false;
         }
@@ -178,8 +193,11 @@ impl BorrowChecker {
 
     fn check_read(&mut self, name: &str, span: Span) {
         if self.var_state.get(name).map(|v| v.moved).unwrap_or(false) {
-            self.diag
-                .error(span, format!("use of moved value `{name}`"));
+            self.diag.error_with_fix(
+                span,
+                format!("use of moved value `{name}`"),
+                format!("change the earlier move to `&{name}`"),
+            );
         }
         if let Some(st) = self.loans_by_target.get(name) {
             if st.mut_ > 0 {
@@ -195,18 +213,27 @@ impl BorrowChecker {
         // Writing to a moved value is always an error: the storage no longer
         // belongs to this binding (it may have been transferred elsewhere).
         if self.var_state.get(name).map(|v| v.moved).unwrap_or(false) {
-            self.diag
-                .error(span, format!("cannot assign to `{name}`: value has been moved"));
+            self.diag.error_with_fix(
+                span,
+                format!("cannot assign to `{name}`: value has been moved"),
+                format!("reinitialize `{name}` before assignment"),
+            );
         }
         if let Some(st) = self.loans_by_target.get(name) {
             if st.mut_ > 0 || st.imm > 0 {
-                self.diag
-                    .error(span, format!("cannot assign to `{name}` while it is borrowed"));
+                self.diag.error(
+                    span,
+                    format!("cannot assign to `{name}` while it is borrowed"),
+                );
             }
         }
     }
 
     fn move_ident(&mut self, name: &str, span: Span) {
+        if self.var_state.get(name).map(|v| v.is_copy).unwrap_or(false) {
+            self.check_read(name, span);
+            return;
+        }
         // Moving out of a variable inside a parallel body is unsafe: another
         // concurrent thread may still hold a reference to the same value.
         if self.parallel_depth > 0 {
@@ -218,10 +245,8 @@ impl BorrowChecker {
         }
         if let Some(st) = self.loans_by_target.get(name) {
             if st.mut_ > 0 || st.imm > 0 {
-                self.diag.error(
-                    span,
-                    format!("cannot move `{name}` while it is borrowed"),
-                );
+                self.diag
+                    .error(span, format!("cannot move `{name}` while it is borrowed"));
                 return;
             }
         }
@@ -236,18 +261,17 @@ impl BorrowChecker {
     /// double-borrow bug that previously caused loans to never be released.
     fn validate_borrow(&mut self, target: &str, is_mut: bool, span: Span) {
         if self.var_state.get(target).map(|v| v.moved).unwrap_or(false) {
-            self.diag.error(
+            self.diag.error_with_fix(
                 span,
                 format!("cannot borrow `{target}` because it has been moved"),
+                format!("replace the consuming use with `&{target}`"),
             );
             return;
         }
         if is_mut && self.parallel_depth > 0 {
             self.diag.error(
                 span,
-                format!(
-                    "cannot mutably borrow `{target}` inside a parallel or spawned block"
-                ),
+                format!("cannot mutably borrow `{target}` inside a parallel or spawned block"),
             );
             return;
         }
@@ -255,9 +279,7 @@ impl BorrowChecker {
             if is_mut && (st.mut_ > 0 || st.imm > 0) {
                 self.diag.error(
                     span,
-                    format!(
-                        "cannot mutably borrow `{target}` because it is already borrowed"
-                    ),
+                    format!("cannot mutably borrow `{target}` because it is already borrowed"),
                 );
             } else if !is_mut && st.mut_ > 0 {
                 self.diag.error(
@@ -363,12 +385,18 @@ impl BorrowChecker {
                     _ => self.check_expr(expr),
                 }
             }
-            Expr::Assign { op, target, value, span } => {
+            Expr::Assign {
+                op,
+                target,
+                value,
+                span,
+            } => {
                 match &**target {
                     Expr::Ident { name, .. } => {
                         self.check_write(name, *span);
                         if matches!(op, AssignOpKind::Assign) {
                             self.mark_initialized(name);
+                            self.set_copy_flag(name, self.expr_is_copy(value));
                         } else {
                             self.check_read(name, *span);
                         }
@@ -377,14 +405,23 @@ impl BorrowChecker {
                         if let Some((src, mv_span)) = Self::expr_as_simple_move(value) {
                             self.move_ident(src, mv_span);
                         }
-                        if let Some((borrowed, is_mut, bspan)) = Self::expr_as_simple_borrow(value) {
+                        if let Some((borrowed, is_mut, bspan)) = Self::expr_as_simple_borrow(value)
+                        {
                             if self.try_borrow(borrowed, is_mut, bspan) {
                                 self.bind_reference_var(name, borrowed, is_mut);
                             }
                         }
                     }
-                    Expr::UnOp { op: UnOpKind::Deref, expr: inner, .. } => {
-                        if let Expr::Ident { name: ref_name, span: ref_span } = &**inner {
+                    Expr::UnOp {
+                        op: UnOpKind::Deref,
+                        expr: inner,
+                        ..
+                    } => {
+                        if let Expr::Ident {
+                            name: ref_name,
+                            span: ref_span,
+                        } = &**inner
+                        {
                             self.check_read(ref_name, *ref_span);
                             match self.ref_binding_to_target.get(ref_name) {
                                 Some((_, true)) => {}
@@ -400,7 +437,8 @@ impl BorrowChecker {
                                 ),
                             }
                         } else {
-                            self.diag.error(*span, "unsupported assignment target through dereference");
+                            self.diag
+                                .error(*span, "unsupported assignment target through dereference");
                         }
                     }
                     _ => self.check_expr(target),
@@ -414,18 +452,28 @@ impl BorrowChecker {
             | Expr::TensorConcat { lhs, rhs, .. }
             | Expr::KronProd { lhs, rhs, .. }
             | Expr::OuterProd { lhs, rhs, .. }
-            | Expr::Pow { base: lhs, exp: rhs, .. } => {
+            | Expr::Pow {
+                base: lhs,
+                exp: rhs,
+                ..
+            } => {
                 self.check_expr(lhs);
                 self.check_expr(rhs);
             }
-            Expr::Field { object, .. } | Expr::Grad { inner: object, .. } => self.check_expr(object),
-            Expr::Index { object, indices, .. } => {
+            Expr::Field { object, .. } | Expr::Grad { inner: object, .. } => {
+                self.check_expr(object)
+            }
+            Expr::Index {
+                object, indices, ..
+            } => {
                 self.check_expr(object);
                 for i in indices {
                     self.check_expr(i);
                 }
             }
-            Expr::Call { func, args, named, .. } => {
+            Expr::Call {
+                func, args, named, ..
+            } => {
                 self.check_expr(func);
                 for a in args {
                     self.check_expr(a);
@@ -455,7 +503,9 @@ impl BorrowChecker {
                 }
             }
             Expr::Cast { expr, .. } => self.check_expr(expr),
-            Expr::IfExpr { cond, then, else_, .. } => {
+            Expr::IfExpr {
+                cond, then, else_, ..
+            } => {
                 self.check_expr(cond);
                 self.check_block(then);
                 if let Some(else_) = else_ {
@@ -487,6 +537,38 @@ impl BorrowChecker {
         }
     }
 
+    fn expr_is_copy(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::IntLit { .. }
+            | Expr::FloatLit { .. }
+            | Expr::BoolLit { .. }
+            | Expr::StrLit { .. } => true,
+            Expr::Ident { name, .. } => {
+                self.var_state.get(name).map(|v| v.is_copy).unwrap_or(false)
+            }
+            Expr::UnOp { op, expr, .. } => match op {
+                UnOpKind::Ref | UnOpKind::RefMut => true,
+                _ => self.expr_is_copy(expr),
+            },
+            Expr::BinOp { lhs, rhs, .. }
+            | Expr::MatMul { lhs, rhs, .. }
+            | Expr::HadamardMul { lhs, rhs, .. }
+            | Expr::HadamardDiv { lhs, rhs, .. }
+            | Expr::TensorConcat { lhs, rhs, .. }
+            | Expr::KronProd { lhs, rhs, .. }
+            | Expr::OuterProd { lhs, rhs, .. }
+            | Expr::Pow {
+                base: lhs,
+                exp: rhs,
+                ..
+            } => self.expr_is_copy(lhs) && self.expr_is_copy(rhs),
+            Expr::Tuple { elems, .. } | Expr::ArrayLit { elems, .. } => {
+                elems.iter().all(|e| self.expr_is_copy(e))
+            }
+            _ => false,
+        }
+    }
+
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let { pattern, init, .. } => {
@@ -496,6 +578,7 @@ impl BorrowChecker {
                 self.bind_pattern_vars(pattern);
                 if let Some(binding_name) = Self::first_ident_in_pattern(pattern) {
                     if let Some(init) = init {
+                        self.set_copy_flag(binding_name, self.expr_is_copy(init));
                         if let Some((src, span)) = Self::expr_as_simple_move(init) {
                             self.move_ident(src, span);
                         }
@@ -518,7 +601,12 @@ impl BorrowChecker {
                 }
             }
             Stmt::Continue { .. } => {}
-            Stmt::ForIn { pattern, iter, body, .. } => {
+            Stmt::ForIn {
+                pattern,
+                iter,
+                body,
+                ..
+            } => {
                 self.check_expr(iter);
                 // The for-in loop consumes the iterator by value.  Mark it moved
                 // so any subsequent use is caught as use-after-move.
@@ -530,10 +618,12 @@ impl BorrowChecker {
                 self.check_block(body);
                 self.pop_scope();
             }
-            Stmt::EntityFor { body, .. }
-            | Stmt::While { body, .. }
-            | Stmt::Loop { body, .. } => self.check_block(body),
-            Stmt::If { cond, then, else_, .. } => {
+            Stmt::EntityFor { body, .. } | Stmt::While { body, .. } | Stmt::Loop { body, .. } => {
+                self.check_block(body)
+            }
+            Stmt::If {
+                cond, then, else_, ..
+            } => {
                 self.check_expr(cond);
                 self.check_block(then);
                 if let Some(else_) = else_ {
@@ -615,7 +705,9 @@ pub fn jules_borrowck(program: &Program) -> Diagnostics {
                 ck.check_block(&s.body);
                 ck.pop_scope();
             }
-            Item::Mod { items: Some(items), .. } => {
+            Item::Mod {
+                items: Some(items), ..
+            } => {
                 for it in items {
                     if let Item::Fn(f) = it {
                         if let Some(body) = &f.body {
@@ -656,6 +748,16 @@ mod tests {
             .count()
     }
 
+    fn borrow_diags(source: &str) -> Diagnostics {
+        let mut lx = Lexer::new(source);
+        let (tokens, lex_errs) = lx.tokenize();
+        assert!(lex_errs.is_empty(), "lexer errors: {lex_errs:?}");
+        let mut p = Parser::new(tokens);
+        let prog = p.parse_program();
+        assert!(p.errors.is_empty(), "parser errors: {:?}", p.errors);
+        jules_borrowck(&prog)
+    }
+
     #[test]
     fn catches_write_while_borrowed() {
         let src = r#"
@@ -681,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn catches_use_after_move() {
+    fn allows_copy_scalars_without_move_errors() {
         let src = r#"
             fn main() {
                 let x = 1;
@@ -689,14 +791,14 @@ mod tests {
                 let z = x;
             }
         "#;
-        assert!(borrow_errors(src) >= 1);
+        assert_eq!(borrow_errors(src), 0);
     }
 
     #[test]
-    fn catches_move_while_borrowed() {
+    fn catches_move_while_borrowed_for_non_copy_values() {
         let src = r#"
             fn main() {
-                let x = 1;
+                let x = make_board();
                 let r = &x;
                 let y = x;
             }
@@ -705,10 +807,10 @@ mod tests {
     }
 
     #[test]
-    fn catches_borrow_after_move() {
+    fn catches_borrow_after_move_for_non_copy_values() {
         let src = r#"
             fn main() {
-                let x = 1;
+                let x = make_board();
                 let y = x;
                 let r = &x;
             }
@@ -726,5 +828,21 @@ mod tests {
             }
         "#;
         assert!(borrow_errors(src) >= 1);
+    }
+
+    #[test]
+    fn moved_value_error_contains_autofix_hint() {
+        let src = r#"
+            fn main() {
+                let x = make_board();
+                let y = x;
+                let z = x;
+            }
+        "#;
+        let diags = borrow_diags(src);
+        assert!(diags.items.iter().any(|d| {
+            d.message.contains("use of moved value")
+                && d.labels.iter().any(|(_, l)| l.contains("auto-fix:"))
+        }));
     }
 }
