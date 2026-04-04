@@ -40,6 +40,7 @@ use crate::ast::{
 use crate::game_systems::{InputState, PhysicsShape, PhysicsWorld, RenderState};
 use crate::lexer::Span;
 use crate::ml_engine::{ComputationGraph, Optimizer, OptimizerState};
+use matrixmultiply::sgemm;
 
 // =============================================================================
 // §1  RUNTIME VALUE
@@ -149,7 +150,9 @@ impl DataLoader {
             // deterministic shuffle so tests remain stable
             let mut seed = 4211_u64;
             for i in (1..self.samples.len()).rev() {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let j = (seed % (i as u64 + 1)) as usize;
                 self.samples.swap(i, j);
             }
@@ -288,7 +291,13 @@ impl fmt::Display for Value {
             Value::Struct { name, .. } => write!(f, "{name} {{ … }}"),
             Value::DataLoader(d) => {
                 let d = d.lock().unwrap();
-                write!(f, "dataloader(batch_size={}, index={}, total={})", d.batch_size, d.index, d.samples.len())
+                write!(
+                    f,
+                    "dataloader(batch_size={}, index={}, total={})",
+                    d.batch_size,
+                    d.index,
+                    d.samples.len()
+                )
             }
             Value::Some(v) => write!(f, "Some({})", v),
             Value::None => write!(f, "None"),
@@ -428,12 +437,37 @@ impl Tensor {
         let b = rhs.cpu_data();
         let mut c = vec![0.0_f32; batch_count * m * n];
 
-        // Cache-tiled GEMM within each batch element.
+        // Hybrid GEMM strategy:
+        // - matrixmultiply::sgemm for large dense workloads (near-BLAS path)
+        // - cache-tiled scalar kernel for smaller matrices
         const TILE: usize = 32;
+        let use_sgemm = m >= 64 && n >= 64 && k >= 64;
         for batch in 0..batch_count {
             let a_offset = batch * m * k;
             let b_offset = batch * k * n;
             let c_offset = batch * m * n;
+
+            if use_sgemm {
+                unsafe {
+                    sgemm(
+                        m,
+                        k,
+                        n,
+                        1.0,
+                        a[a_offset..].as_ptr(),
+                        k as isize,
+                        1,
+                        b[b_offset..].as_ptr(),
+                        n as isize,
+                        1,
+                        0.0,
+                        c[c_offset..].as_mut_ptr(),
+                        n as isize,
+                        1,
+                    );
+                }
+                continue;
+            }
 
             for ii in (0..m).step_by(TILE) {
                 for jj in (0..n).step_by(TILE) {
@@ -445,8 +479,7 @@ impl Tensor {
                             for t in kk..k_end {
                                 let a_it = a[a_offset + i * k + t];
                                 for j in jj..j_end {
-                                    c[c_offset + i * n + j] +=
-                                        a_it * b[b_offset + t * n + j];
+                                    c[c_offset + i * n + j] += a_it * b[b_offset + t * n + j];
                                 }
                             }
                         }
@@ -644,6 +677,14 @@ impl Tensor {
     pub fn scale(&self, s: f32) -> Tensor {
         let data: Vec<f32> = self.cpu_data().iter().map(|x| x * s).collect();
         Tensor::from_data(self.shape.clone(), data)
+    }
+
+    /// In-place scaling of all elements (avoids allocation).
+    pub fn scale_inplace(&mut self, s: f32) {
+        let data = self.cpu_data_mut();
+        for v in data.iter_mut() {
+            *v *= s;
+        }
     }
 
     /// Add another tensor (in-place on self).
@@ -900,7 +941,7 @@ impl EcsWorld {
 
 /// A weight layer in the runtime model.
 #[derive(Debug, Clone)]
-pub(crate) enum WeightLayer {
+pub enum WeightLayer {
     Dense {
         w: Tensor,
         b: Tensor,
@@ -2751,7 +2792,9 @@ impl Interpreter {
                 Ok(Value::Array(Arc::new(Mutex::new(v))))
             }
             "dataloader" | "pipeline" => {
-                let source = args.get(0).ok_or_else(|| RuntimeError::new("dataloader() requires a source array or tensor"))?;
+                let source = args.get(0).ok_or_else(|| {
+                    RuntimeError::new("dataloader() requires a source array or tensor")
+                })?;
                 let batch_size = args
                     .get(1)
                     .and_then(|v| v.as_i64())
@@ -2778,7 +2821,9 @@ impl Interpreter {
                             let chunk = t.cpu_data()[start..end].to_vec();
                             let mut row_shape = t.shape.clone();
                             row_shape.remove(0);
-                            samples.push(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(row_shape, chunk)))));
+                            samples.push(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(
+                                row_shape, chunk,
+                            )))));
                         }
                     }
                     _ => return rt_err!("dataloader() source must be Array or Tensor"),
@@ -2868,20 +2913,6 @@ impl Interpreter {
                 Some(v) => rt_err!("len() not applicable to {}", v.type_name()),
                 None => rt_err!("len() requires an argument"),
             },
-            "range" => {
-                match (
-                    args.get(0).and_then(|v| v.as_i64()),
-                    args.get(1).and_then(|v| v.as_i64()),
-                ) {
-                    (Some(start), Some(end)) => {
-                        let range: Vec<Value> =
-                            (start as i32..end as i32).map(Value::I32).collect();
-                        Ok(Value::Array(Arc::new(Mutex::new(range))))
-                    }
-                    _ => rt_err!("range() requires two numbers"),
-                }
-            }
-
             // ── Option / Result constructors ───────────────────────────────────
             "Some" => Ok(Value::Some(Box::new(
                 args.into_iter().next().unwrap_or(Value::Unit),
@@ -3052,8 +3083,9 @@ impl Interpreter {
                         Ok(entries) => {
                             let mut names = vec![];
                             for entry in entries {
-                                let entry =
-                                    entry.map_err(|e| RuntimeError::new(format!("sys::list_dir failed: {}", e)))?;
+                                let entry = entry.map_err(|e| {
+                                    RuntimeError::new(format!("sys::list_dir failed: {}", e))
+                                })?;
                                 names.push(Value::Str(
                                     entry.file_name().to_string_lossy().into_owned(),
                                 ));
@@ -3088,12 +3120,10 @@ impl Interpreter {
                 _ => rt_err!("sys::copy requires (from_path, to_path) strings"),
             },
             "sys::rename" => match (args.get(0), args.get(1)) {
-                (Some(Value::Str(from)), Some(Value::Str(to))) => {
-                    match std::fs::rename(from, to) {
-                        Ok(_) => Ok(Value::Bool(true)),
-                        Err(e) => rt_err!("sys::rename failed: {}", e),
-                    }
-                }
+                (Some(Value::Str(from)), Some(Value::Str(to))) => match std::fs::rename(from, to) {
+                    Ok(_) => Ok(Value::Bool(true)),
+                    Err(e) => rt_err!("sys::rename failed: {}", e),
+                },
                 _ => rt_err!("sys::rename requires (from_path, to_path) strings"),
             },
             "sys::metadata" => {
@@ -3182,7 +3212,10 @@ impl Interpreter {
             }
             "sys::exec" => {
                 if let Some(Value::Str(command)) = args.first() {
-                    let output = std::process::Command::new("sh").arg("-c").arg(command).output();
+                    let output = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(command)
+                        .output();
                     match output {
                         Ok(out) => {
                             let mut result = HashMap::new();
@@ -3241,7 +3274,7 @@ impl Interpreter {
                     }
                 }
                 _ => rt_err!("sys::exec_argv requires (program, args_array)"),
-            }
+            },
             "sys::exec_argv_in" => match (args.get(0), args.get(1), args.get(2)) {
                 (Some(Value::Str(program)), Some(Value::Array(argv)), Some(Value::Str(cwd))) => {
                     let arg_values = argv.lock().unwrap();
@@ -3250,7 +3283,9 @@ impl Interpreter {
                         if let Value::Str(s) = v {
                             parsed.push(s.clone());
                         } else {
-                            return rt_err!("sys::exec_argv_in args array must contain only strings");
+                            return rt_err!(
+                                "sys::exec_argv_in args array must contain only strings"
+                            );
                         }
                     }
                     let output = std::process::Command::new(program)
@@ -3279,7 +3314,7 @@ impl Interpreter {
                     }
                 }
                 _ => rt_err!("sys::exec_argv_in requires (program, args_array, cwd)"),
-            }
+            },
 
             // ── Physics functions ──────────────────────────────────────────────
             "physics::world_new" => Ok(Value::I64(1)),
@@ -3355,7 +3390,7 @@ impl Interpreter {
                     args.get(2).and_then(|v| v.as_f64()),
                     args.get(3).and_then(|v| v.as_f64()),
                 ) {
-                    let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
+                    let world = self.physics_world.as_ref().unwrap().lock().unwrap();
                     // Placeholder: force integration API is not currently exposed.
                     let _ = (body_id, fx, fy, fz);
                     Ok(Value::Bool(false))
@@ -3419,8 +3454,8 @@ impl Interpreter {
                     args.get(0).and_then(|v| v.as_i64()),
                     args.get(1).and_then(|v| v.as_i64()),
                 ) {
-                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    let _ = (mesh_id, mat_id);
+                    let render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    let _ = (render, mesh_id, mat_id);
                     Ok(Value::Bool(false))
                 } else {
                     rt_err!("graphics::render_mesh requires (mesh_id, material_id)")
@@ -3943,7 +3978,8 @@ impl Interpreter {
                     let mut mapped = Vec::new();
                     for sample in samples {
                         let mut call_env = Env::new();
-                        let mapped_val = self.eval_call(Value::Fn(func.clone()), vec![sample], &mut call_env)?;
+                        let mapped_val =
+                            self.eval_call(Value::Fn(func.clone()), vec![sample], &mut call_env)?;
                         mapped.push(mapped_val);
                     }
                     Ok(Value::DataLoader(Arc::new(Mutex::new(DataLoader {
@@ -3969,7 +4005,11 @@ impl Interpreter {
                     let mut filtered = Vec::new();
                     for sample in samples {
                         let mut call_env = Env::new();
-                        let result = self.eval_call(Value::Fn(func.clone()), vec![sample.clone()], &mut call_env)?;
+                        let result = self.eval_call(
+                            Value::Fn(func.clone()),
+                            vec![sample.clone()],
+                            &mut call_env,
+                        )?;
                         if result.as_bool().unwrap_or(false) {
                             filtered.push(sample);
                         }
@@ -4566,7 +4606,9 @@ impl GpuBackend for JulesGpuAdapter {
 
     fn elementwise(&self, a: &GpuBufferHandle, b: &GpuBufferHandle, op: GpuOp) -> GpuBufferHandle {
         let a_data = self.download(a);
-        let out = self.backend.upload(&vec![0.0; a_data.len()], vec![a_data.len()]);
+        let out = self
+            .backend
+            .upload(&vec![0.0; a_data.len()], vec![a_data.len()]);
         let ga = crate::gpu_backend::GpuBufferHandle { id: a.0 };
         let gb = crate::gpu_backend::GpuBufferHandle { id: b.0 };
         let go = crate::gpu_backend::GpuBufferHandle { id: out.id };
@@ -5678,7 +5720,10 @@ mod tests {
         ])));
 
         let loader = interp
-            .eval_builtin("dataloader", vec![source.clone(), Value::I32(2), Value::Bool(false)])
+            .eval_builtin(
+                "dataloader",
+                vec![source.clone(), Value::I32(2), Value::Bool(false)],
+            )
             .unwrap();
 
         let has_next = interp
@@ -5739,7 +5784,10 @@ mod tests {
             let a = arr.lock().unwrap();
             let ints: Vec<i32> = a
                 .iter()
-                .filter_map(|v| match v { Value::I32(x) => Some(*x), _ => None })
+                .filter_map(|v| match v {
+                    Value::I32(x) => Some(*x),
+                    _ => None,
+                })
                 .collect();
             assert_eq!(ints, vec![0, 2, 4]);
         } else {
@@ -5759,7 +5807,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter_map(|v| match v { Value::F32(x) => Some(*x), _ => None })
+                .filter_map(|v| match v {
+                    Value::F32(x) => Some(*x),
+                    _ => None,
+                })
                 .collect();
             assert_eq!(values, vec![1.0, 1.0]);
         } else {
@@ -5897,7 +5948,9 @@ mod tests {
         let metadata = interp
             .eval_builtin(
                 "sys::metadata",
-                vec![Value::Str(tmp_root.join("blob.bin").to_string_lossy().to_string())],
+                vec![Value::Str(
+                    tmp_root.join("blob.bin").to_string_lossy().to_string(),
+                )],
             )
             .unwrap();
         if let Value::HashMap(map) = metadata {
