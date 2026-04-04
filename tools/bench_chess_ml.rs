@@ -13,17 +13,24 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let episodes: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
     let max_steps: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(32);
-    let batch: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let envs: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let batch_raw: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let envs_raw: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let batch = batch_raw.max(1).min(4096);
+    let envs = envs_raw.max(1).min(4096);
     let device = args.get(5).map(String::as_str).unwrap_or("cpu");
+    if batch != batch_raw || envs != envs_raw {
+        println!("⚠️ safety clamp applied: batch {batch_raw}->{batch}, envs {envs_raw}->{envs}");
+    }
 
     println!(
         "bench-chess-ml episodes={episodes} max_steps={max_steps} batch={batch} envs={envs} device={device}"
     );
 
     let jules = if device == "gpu" {
-        train_chess_policy_gpu(episodes, envs, max_steps, batch, 0xC0FFEE)
-            .expect("gpu training path failed")
+        train_chess_policy_gpu(episodes, envs, max_steps, batch, 0xC0FFEE).unwrap_or_else(|e| {
+            println!("⚠️ GPU path unavailable ({e}), falling back to CPU SoA path.");
+            train_chess_policy_soa(episodes, envs, max_steps, batch, 0xC0FFEE)
+        })
     } else if envs > 1 {
         train_chess_policy_soa(episodes, envs, max_steps, batch, 0xC0FFEE)
     } else {

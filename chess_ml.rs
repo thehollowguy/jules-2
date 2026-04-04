@@ -2,6 +2,9 @@ use crate::gpu_backend::{GpuBackend, GpuMemoryManager};
 use std::time::{Duration, Instant};
 
 const FEAT_DIM: usize = 8;
+const MAX_ABS_FEATURE: f32 = 64.0;
+const MAX_ABS_WEIGHT: f32 = 1_000_000.0;
+const MAX_ABS_REWARD: f32 = 2.0;
 
 #[derive(Clone, Debug)]
 struct GradBuffer {
@@ -530,7 +533,7 @@ pub fn train_chess_policy_soa(
     batch_size: usize,
     seed: u64,
 ) -> BenchResult {
-    let envs = envs.max(1);
+    let envs = envs.max(1).min(4096);
     let mut rng = XorShift64::new(seed);
     let mut weights = [0.03f32, 0.0, 0.0, 0.2, 0.01, -0.01, 0.0, 0.0];
     let mut grads = GradBuffer::new();
@@ -603,7 +606,7 @@ pub fn train_chess_policy_gpu(
     batch_size: usize,
     seed: u64,
 ) -> Result<BenchResult, String> {
-    let envs = envs.max(1);
+    let envs = envs.max(1).min(4096);
     let mut rng = XorShift64::new(seed);
     let mut weights = [0.03f32, 0.0, 0.0, 0.2, 0.01, -0.01, 0.0, 0.0];
     // 4-action projection weights [8,4]

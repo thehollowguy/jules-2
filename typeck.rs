@@ -653,8 +653,17 @@ impl TypeCk {
             Type::Named(name) => {
                 match name.as_str() {
                     "world" | "World" => Ty::World,
-                    "bool" => Ty::Bool,
+                    "bool" | "Bool" => Ty::Bool,
                     "str" | "String" => Ty::Str,
+                    // Prelude aliases for ergonomic startup in .jules files.
+                    "Int" | "int" => Ty::Scalar(ElemType::I64),
+                    "Float" | "float" => Ty::Scalar(ElemType::F32),
+                    "Tensor" | "tensor" => Ty::Tensor {
+                        elem: ElemType::F32,
+                        shape: vec![Dim::Dynamic],
+                    },
+                    // Built-in board handle used by game-search examples.
+                    "Board" | "board" => Ty::Struct("Board".to_string()),
                     _ => {
                         if self.symbols.structs.contains_key(name) {
                             let info = &self.symbols.structs[name];
@@ -3137,8 +3146,7 @@ impl TypeCk {
             c.is_ascii_alphanumeric()
                 || matches!(
                     c,
-                    '_'
-                        | '-'
+                    '_' | '-'
                         | '>'
                         | '<'
                         | '='
@@ -4327,5 +4335,34 @@ mod tests {
     fn test_ty_display_infer_var() {
         let ty = Ty::Infer(7);
         assert_eq!(ty.display(), "_#7");
+    }
+
+    #[test]
+    fn prelude_type_aliases_are_available() {
+        let mut ck = make_checker();
+        let span = dummy();
+        let int_ty = ck.lower_ast_type(&Type::Named("Int".into()), span);
+        let float_ty = ck.lower_ast_type(&Type::Named("Float".into()), span);
+        let bool_ty = ck.lower_ast_type(&Type::Named("Bool".into()), span);
+        let tensor_ty = ck.lower_ast_type(&Type::Named("Tensor".into()), span);
+        let tensor_lower_ty = ck.lower_ast_type(&Type::Named("tensor".into()), span);
+
+        assert_eq!(int_ty, Ty::Scalar(ElemType::I64));
+        assert_eq!(float_ty, Ty::Scalar(ElemType::F32));
+        assert_eq!(bool_ty, Ty::Bool);
+        assert!(matches!(
+            tensor_ty,
+            Ty::Tensor {
+                elem: ElemType::F32,
+                ..
+            }
+        ));
+        assert!(matches!(
+            tensor_lower_ty,
+            Ty::Tensor {
+                elem: ElemType::F32,
+                ..
+            }
+        ));
     }
 }
