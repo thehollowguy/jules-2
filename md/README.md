@@ -30,9 +30,35 @@ Jules now includes an INT8 inference path for linear layers:
 - `Tensor::quantize_linear_int8()` (offline weight quantization)
 - `Tensor::linear_int8()` (inference with 1-byte weights + per-channel scales)
 - `Int8LinearWeights::effective_bytes_per_param()` to estimate memory cost
+- `Tensor::softmax_last_dim()` for batched class probabilities
+- `Tensor::gelu()` and `Tensor::silu()` activations for Transformer/LMM-style blocks
+- `Tensor::gelu_backward()` and `Tensor::silu_backward()` gradients for training
+- `LossFunctions::cross_entropy_from_logits_last_dim()` for indexed-class training
+- `LossFunctions::cross_entropy_from_logits_last_dim_gradient()` for stable logits gradients
 
 This targets roughly **~1 byte/parameter** plus small scale overhead, for
 running (inference) workloads.
+
+## Strict ML memory ceiling (core + extra)
+
+Jules supports an explicit memory-cap model for ML workloads:
+
+- **Core floor** `M_min`: model-critical bytes (weights, gradients, active batch activations)
+- **Extra headroom** `ΔM`: runtime scratchpad (prefetch, kernel workspace, temp tensors)
+
+The runtime enforces:
+
+`M_usage <= M_min + ΔM`
+
+This is exposed via FFI/bindings APIs:
+
+- `jules_ml_memory_configure(min_bytes, extra_bytes)`
+- `jules_ml_memory_acquire(bytes, pool)` with `Core` / `Extra`
+- `jules_ml_memory_release(bytes, pool)`
+- `jules_ml_memory_snapshot(...)`
+
+This helps game+ML scenarios avoid OOM crashes, maintain deterministic frame-time behavior,
+and control temporary overhead when using INT8 quantization/inference flows.
 
 ## Faster CPU matmul path
 

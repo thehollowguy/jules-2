@@ -15,6 +15,21 @@ extern "C" {
         JulesError_UnknownError = 255,
     };
 
+    enum JulesMemoryPool {
+        JulesMemoryPool_Core = 0,
+        JulesMemoryPool_Extra = 1,
+    };
+
+    struct JulesMlMemorySnapshot {
+        size_t min_bytes;
+        size_t extra_bytes;
+        size_t core_used_bytes;
+        size_t extra_used_bytes;
+        size_t total_used_bytes;
+        size_t total_cap_bytes;
+        size_t headroom_bytes;
+    };
+
     JulesContext* jules_init();
     void jules_destroy(JulesContext*);
 
@@ -23,6 +38,12 @@ extern "C" {
 
     JulesError jules_run_file_ffi(const char* path);
     JulesError jules_check_code_ffi(const char* source);
+
+    JulesError jules_ml_memory_configure(size_t min_bytes, size_t extra_bytes);
+    JulesError jules_ml_memory_acquire(size_t bytes, JulesMemoryPool pool);
+    JulesError jules_ml_memory_release(size_t bytes, JulesMemoryPool pool);
+    JulesError jules_ml_memory_reset_usage();
+    JulesError jules_ml_memory_snapshot(JulesMlMemorySnapshot* out_snapshot);
 
     JulesTensor* jules_tensor_create(const size_t* shape, size_t shape_len);
     void jules_tensor_destroy(JulesTensor* tensor);

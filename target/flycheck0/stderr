@@ -1,8 +1,11 @@
-warning: file `/workspaces/jules/main.rs` found to be present in multiple build targets:
+warning: file `/workspaces/jules-2/main.rs` found to be present in multiple build targets:
   * `lib` target `jules`
   * `bin` target `jules`
-   0.286845992s  INFO prepare_target{force=false package_id=jules v0.1.0 (/workspaces/jules) target="jules"}: cargo::core::compiler::fingerprint: fingerprint error for jules v0.1.0 (/workspaces/jules)/Check { test: false }/TargetInner { ..: lib_target("jules", ["cdylib", "rlib"], "/workspaces/jules/main.rs", Edition2021) }
-   0.286917536s  INFO prepare_target{force=false package_id=jules v0.1.0 (/workspaces/jules) target="jules"}: cargo::core::compiler::fingerprint:     err: failed to read `/workspaces/jules/target/debug/.fingerprint/jules-f0bad241008df016/lib-jules`
+warning: file `/workspaces/jules-2/benches/bench_ecs.rs` found to be present in multiple build targets:
+  * `bin` target `bench-ecs`
+  * `bench` target `bench_ecs`
+   0.113451743s  INFO prepare_target{force=false package_id=jules v0.2.0 (/workspaces/jules-2) target="jules"}: cargo::core::compiler::fingerprint: fingerprint error for jules v0.2.0 (/workspaces/jules-2)/Check { test: true }/TargetInner { ..: lib_target("jules", ["cdylib", "rlib"], "/workspaces/jules-2/main.rs", Edition2021) }
+   0.113722910s  INFO prepare_target{force=false package_id=jules v0.2.0 (/workspaces/jules-2) target="jules"}: cargo::core::compiler::fingerprint:     err: failed to read `/workspaces/jules-2/target/debug/.fingerprint/jules-53a6b00aceb07ff8/test-lib-jules`
 
 Caused by:
     No such file or directory (os error 2)
@@ -23,31 +26,31 @@ Stack backtrace:
   12: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
   13: std::rt::lang_start::<()>::{closure#0}
   14: core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:287:21
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:287:21
   15: std::panicking::catch_unwind::do_call
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:581:40
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:581:40
   16: std::panicking::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:544:19
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:544:19
   17: std::panic::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panic.rs:359:14
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panic.rs:359:14
   18: std::rt::lang_start_internal::{{closure}}
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/rt.rs:175:24
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/rt.rs:175:24
   19: std::panicking::catch_unwind::do_call
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:581:40
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:581:40
   20: std::panicking::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:544:19
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:544:19
   21: std::panic::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panic.rs:359:14
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panic.rs:359:14
   22: std::rt::lang_start_internal
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/rt.rs:171:5
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/rt.rs:171:5
   23: main
   24: __libc_start_call_main
              at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16
   25: __libc_start_main_impl
              at ./csu/../csu/libc-start.c:360:3
   26: <unknown>
-   0.359124318s  INFO prepare_target{force=false package_id=jules v0.1.0 (/workspaces/jules) target="jules"}: cargo::core::compiler::fingerprint: fingerprint error for jules v0.1.0 (/workspaces/jules)/Check { test: true }/TargetInner { ..: lib_target("jules", ["cdylib", "rlib"], "/workspaces/jules/main.rs", Edition2021) }
-   0.359147992s  INFO prepare_target{force=false package_id=jules v0.1.0 (/workspaces/jules) target="jules"}: cargo::core::compiler::fingerprint:     err: failed to read `/workspaces/jules/target/debug/.fingerprint/jules-b1fa4097a4e8d86a/test-lib-jules`
+   0.627123701s  INFO prepare_target{force=false package_id=jules v0.2.0 (/workspaces/jules-2) target="bench-ecs"}: cargo::core::compiler::fingerprint: fingerprint error for jules v0.2.0 (/workspaces/jules-2)/Check { test: true }/TargetInner { name: "bench-ecs", doc: true, ..: with_path("/workspaces/jules-2/benches/bench_ecs.rs", Edition2021) }
+   0.627174506s  INFO prepare_target{force=false package_id=jules v0.2.0 (/workspaces/jules-2) target="bench-ecs"}: cargo::core::compiler::fingerprint:     err: failed to read `/workspaces/jules-2/target/debug/.fingerprint/jules-dbc390edd3976ac6/test-bin-bench-ecs`
 
 Caused by:
     No such file or directory (os error 2)
@@ -68,31 +71,31 @@ Stack backtrace:
   12: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
   13: std::rt::lang_start::<()>::{closure#0}
   14: core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:287:21
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:287:21
   15: std::panicking::catch_unwind::do_call
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:581:40
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:581:40
   16: std::panicking::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:544:19
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:544:19
   17: std::panic::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panic.rs:359:14
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panic.rs:359:14
   18: std::rt::lang_start_internal::{{closure}}
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/rt.rs:175:24
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/rt.rs:175:24
   19: std::panicking::catch_unwind::do_call
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:581:40
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:581:40
   20: std::panicking::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:544:19
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:544:19
   21: std::panic::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panic.rs:359:14
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panic.rs:359:14
   22: std::rt::lang_start_internal
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/rt.rs:171:5
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/rt.rs:171:5
   23: main
   24: __libc_start_call_main
              at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16
   25: __libc_start_main_impl
              at ./csu/../csu/libc-start.c:360:3
   26: <unknown>
-   0.359890907s  INFO prepare_target{force=false package_id=jules v0.1.0 (/workspaces/jules) target="jules"}: cargo::core::compiler::fingerprint: fingerprint error for jules v0.1.0 (/workspaces/jules)/Check { test: false }/TargetInner { name: "jules", doc: true, ..: with_path("/workspaces/jules/main.rs", Edition2021) }
-   0.359929910s  INFO prepare_target{force=false package_id=jules v0.1.0 (/workspaces/jules) target="jules"}: cargo::core::compiler::fingerprint:     err: failed to read `/workspaces/jules/target/debug/.fingerprint/jules-4330579e0585485e/bin-jules`
+   0.628198337s  INFO prepare_target{force=false package_id=jules v0.2.0 (/workspaces/jules-2) target="jules"}: cargo::core::compiler::fingerprint: fingerprint error for jules v0.2.0 (/workspaces/jules-2)/Check { test: true }/TargetInner { name: "jules", doc: true, ..: with_path("/workspaces/jules-2/main.rs", Edition2021) }
+   0.628244744s  INFO prepare_target{force=false package_id=jules v0.2.0 (/workspaces/jules-2) target="jules"}: cargo::core::compiler::fingerprint:     err: failed to read `/workspaces/jules-2/target/debug/.fingerprint/jules-9368e9ea3f70318b/test-bin-jules`
 
 Caused by:
     No such file or directory (os error 2)
@@ -113,31 +116,31 @@ Stack backtrace:
   12: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
   13: std::rt::lang_start::<()>::{closure#0}
   14: core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:287:21
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:287:21
   15: std::panicking::catch_unwind::do_call
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:581:40
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:581:40
   16: std::panicking::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:544:19
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:544:19
   17: std::panic::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panic.rs:359:14
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panic.rs:359:14
   18: std::rt::lang_start_internal::{{closure}}
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/rt.rs:175:24
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/rt.rs:175:24
   19: std::panicking::catch_unwind::do_call
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:581:40
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:581:40
   20: std::panicking::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:544:19
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:544:19
   21: std::panic::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panic.rs:359:14
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panic.rs:359:14
   22: std::rt::lang_start_internal
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/rt.rs:171:5
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/rt.rs:171:5
   23: main
   24: __libc_start_call_main
              at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16
   25: __libc_start_main_impl
              at ./csu/../csu/libc-start.c:360:3
   26: <unknown>
-   0.360254856s  INFO prepare_target{force=false package_id=jules v0.1.0 (/workspaces/jules) target="jules"}: cargo::core::compiler::fingerprint: fingerprint error for jules v0.1.0 (/workspaces/jules)/Check { test: true }/TargetInner { name: "jules", doc: true, ..: with_path("/workspaces/jules/main.rs", Edition2021) }
-   0.360263753s  INFO prepare_target{force=false package_id=jules v0.1.0 (/workspaces/jules) target="jules"}: cargo::core::compiler::fingerprint:     err: failed to read `/workspaces/jules/target/debug/.fingerprint/jules-3a821f15c1675a85/test-bin-jules`
+   0.629303120s  INFO prepare_target{force=false package_id=jules v0.2.0 (/workspaces/jules-2) target="micro-benchmark"}: cargo::core::compiler::fingerprint: fingerprint error for jules v0.2.0 (/workspaces/jules-2)/Check { test: true }/TargetInner { name: "micro-benchmark", doc: true, ..: with_path("/workspaces/jules-2/micro-benchmark.rs", Edition2021) }
+   0.629341482s  INFO prepare_target{force=false package_id=jules v0.2.0 (/workspaces/jules-2) target="micro-benchmark"}: cargo::core::compiler::fingerprint:     err: failed to read `/workspaces/jules-2/target/debug/.fingerprint/jules-da83ad3682393be7/test-bin-micro-benchmark`
 
 Caused by:
     No such file or directory (os error 2)
@@ -158,30 +161,73 @@ Stack backtrace:
   12: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
   13: std::rt::lang_start::<()>::{closure#0}
   14: core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:287:21
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:287:21
   15: std::panicking::catch_unwind::do_call
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:581:40
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:581:40
   16: std::panicking::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:544:19
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:544:19
   17: std::panic::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panic.rs:359:14
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panic.rs:359:14
   18: std::rt::lang_start_internal::{{closure}}
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/rt.rs:175:24
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/rt.rs:175:24
   19: std::panicking::catch_unwind::do_call
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:581:40
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:581:40
   20: std::panicking::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:544:19
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:544:19
   21: std::panic::catch_unwind
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panic.rs:359:14
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panic.rs:359:14
   22: std::rt::lang_start_internal
-             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/rt.rs:171:5
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/rt.rs:171:5
   23: main
   24: __libc_start_call_main
              at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16
   25: __libc_start_main_impl
              at ./csu/../csu/libc-start.c:360:3
   26: <unknown>
-    Checking jules v0.1.0 (/workspaces/jules)
-error: could not compile `jules` (lib) due to 1 previous error
-warning: build failed, waiting for other jobs to finish...
-error: could not compile `jules` (lib test) due to 1 previous error
+   0.630070853s  INFO prepare_target{force=false package_id=jules v0.2.0 (/workspaces/jules-2) target="bench_ecs"}: cargo::core::compiler::fingerprint: fingerprint error for jules v0.2.0 (/workspaces/jules-2)/Check { test: true }/TargetInner { kind: "bench", name: "bench_ecs", tested: false, ..: with_path("/workspaces/jules-2/benches/bench_ecs.rs", Edition2021) }
+   0.630124744s  INFO prepare_target{force=false package_id=jules v0.2.0 (/workspaces/jules-2) target="bench_ecs"}: cargo::core::compiler::fingerprint:     err: failed to read `/workspaces/jules-2/target/debug/.fingerprint/jules-a32467ffc5af134f/test-bench-bench_ecs`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: cargo_util::paths::read_bytes
+   1: cargo_util::paths::read
+   2: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   3: cargo::core::compiler::fingerprint::prepare_target
+   4: cargo::core::compiler::compile
+   5: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   6: cargo::ops::cargo_compile::compile_ws
+   7: cargo::ops::cargo_compile::compile_with_exec
+   8: cargo::ops::cargo_compile::compile
+   9: cargo::commands::check::exec
+  10: <cargo::cli::Exec>::exec
+  11: cargo::main
+  12: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  13: std::rt::lang_start::<()>::{closure#0}
+  14: core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:287:21
+  15: std::panicking::catch_unwind::do_call
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:581:40
+  16: std::panicking::catch_unwind
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:544:19
+  17: std::panic::catch_unwind
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panic.rs:359:14
+  18: std::rt::lang_start_internal::{{closure}}
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/rt.rs:175:24
+  19: std::panicking::catch_unwind::do_call
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:581:40
+  20: std::panicking::catch_unwind
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:544:19
+  21: std::panic::catch_unwind
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panic.rs:359:14
+  22: std::rt::lang_start_internal
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/rt.rs:171:5
+  23: main
+  24: __libc_start_call_main
+             at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16
+  25: __libc_start_main_impl
+             at ./csu/../csu/libc-start.c:360:3
+  26: <unknown>
+    Checking jules v0.2.0 (/workspaces/jules-2)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.98s

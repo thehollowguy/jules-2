@@ -1,64 +1,7 @@
-use crate::gpu_backend::{GpuBackend, GpuMemoryManager};
 use std::time::{Duration, Instant};
+use crate::gpu_backend::{GpuBackend, GpuMemoryManager};
 
 const FEAT_DIM: usize = 8;
-
-#[inline(always)]
-fn dot8(weights: &[f32; FEAT_DIM], f: &[f32; FEAT_DIM]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f") {
-            // SAFETY: guarded by runtime AVX-512F feature detection.
-            unsafe {
-                return dot8_avx512(weights, f);
-            }
-        }
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: guarded by runtime AVX2 feature detection.
-            unsafe {
-                return dot8_avx2(weights, f);
-            }
-        }
-    }
-    let mut acc = 0.0f32;
-    for i in 0..FEAT_DIM {
-        acc += weights[i] * f[i];
-    }
-    acc
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn dot8_avx512(weights: &[f32; FEAT_DIM], f: &[f32; FEAT_DIM]) -> f32 {
-    use std::arch::x86_64::*;
-    let mut wa = [0.0f32; 16];
-    let mut fa = [0.0f32; 16];
-    wa[..FEAT_DIM].copy_from_slice(weights);
-    fa[..FEAT_DIM].copy_from_slice(f);
-    // SAFETY: arrays have 16 f32 lanes; unaligned loads are used.
-    let w = unsafe { _mm512_loadu_ps(wa.as_ptr()) };
-    // SAFETY: arrays have 16 f32 lanes; unaligned loads are used.
-    let x = unsafe { _mm512_loadu_ps(fa.as_ptr()) };
-    let m = _mm512_mul_ps(w, x);
-    _mm512_reduce_add_ps(m)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn dot8_avx2(weights: &[f32; FEAT_DIM], f: &[f32; FEAT_DIM]) -> f32 {
-    use std::arch::x86_64::*;
-    // SAFETY: pointers are valid for 8 f32 values and unaligned loads are used.
-    let w = unsafe { _mm256_loadu_ps(weights.as_ptr()) };
-    // SAFETY: pointers are valid for 8 f32 values and unaligned loads are used.
-    let x = unsafe { _mm256_loadu_ps(f.as_ptr()) };
-    let m = _mm256_mul_ps(w, x);
-    let hi = _mm256_extractf128_ps(m, 1);
-    let lo = _mm256_castps256_ps128(m);
-    let s = _mm_add_ps(lo, hi);
-    let t = _mm_hadd_ps(s, s);
-    let u = _mm_hadd_ps(t, t);
-    _mm_cvtss_f32(u)
-}
 
 #[derive(Clone, Debug)]
 struct GradBuffer {
@@ -69,10 +12,7 @@ struct GradBuffer {
 impl GradBuffer {
     #[inline]
     fn new() -> Self {
-        Self {
-            acc: [0.0; FEAT_DIM],
-            count: 0,
-        }
+        Self { acc: [0.0; FEAT_DIM], count: 0 }
     }
 
     #[inline]
@@ -99,12 +39,7 @@ impl GradBuffer {
 }
 
 #[inline]
-fn infer_action_noalloc(
-    weights: &[f32; FEAT_DIM],
-    f: &[f32; FEAT_DIM],
-    white_to_move: bool,
-    rng: &mut XorShift64,
-) -> u8 {
+fn infer_action_noalloc(weights: &[f32; FEAT_DIM], f: &[f32; FEAT_DIM], white_to_move: bool, rng: &mut XorShift64) -> u8 {
     // explicit vector-like action lanes (4 macro-actions), no heap allocations.
     let tactical = if white_to_move {
         [0.00f32, 0.02, 0.06, 0.10]
@@ -112,13 +47,16 @@ fn infer_action_noalloc(
         [0.10f32, 0.06, 0.02, 0.00]
     };
 
-    let base = dot8(weights, f);
+    let mut base = 0.0f32;
+    for i in 0..FEAT_DIM {
+        base += weights[i] * f[i];
+    }
 
     let mut best_idx = 0u8;
     let mut best = f32::MIN;
     // unrolled 4-lane scoring
     for lane in 0..4 {
-        let noise = rng.next_small_noise();
+        let noise = (rng.next_f32() - 0.5) * 0.01;
         let s = base + tactical[lane] + noise;
         if s > best {
             best = s;
@@ -126,22 +64,6 @@ fn infer_action_noalloc(
         }
     }
     best_idx
-}
-
-#[inline(always)]
-fn argmax4_with_noise(s0: f32, s1: f32, s2: f32, s3: f32, rng: &mut XorShift64) -> usize {
-    let n0 = s0 + rng.next_small_noise();
-    let n1 = s1 + rng.next_small_noise();
-    let n2 = s2 + rng.next_small_noise();
-    let n3 = s3 + rng.next_small_noise();
-
-    let (i01, v01) = if n1 > n0 { (1usize, n1) } else { (0usize, n0) };
-    let (i23, v23) = if n3 > n2 { (3usize, n3) } else { (2usize, n2) };
-    if v23 > v01 {
-        i23
-    } else {
-        i01
-    }
 }
 
 #[derive(Clone)]
@@ -170,6 +92,7 @@ impl EnvSoA {
         self.black_adv.fill(0.0);
     }
 }
+
 
 #[derive(Clone, Copy, Debug)]
 pub struct BenchResult {
@@ -223,13 +146,7 @@ impl XorShift64 {
 
     #[inline]
     fn next_f32(&mut self) -> f32 {
-        const INV_24: f32 = 1.0 / 16_777_216.0;
-        ((self.next_u64() >> 40) as u32 as f32) * INV_24
-    }
-
-    #[inline]
-    fn next_small_noise(&mut self) -> f32 {
-        (self.next_f32() - 0.5) * 0.01
+        (self.next_u64() as u32 as f32) / (u32::MAX as f32)
     }
 }
 
@@ -291,10 +208,7 @@ impl Board {
                 bb &= bb - 1;
                 let fwd = sq + 8;
                 if fwd < 64 && (occ & (1u64 << fwd)) == 0 {
-                    out[n] = Move {
-                        from: sq as u8,
-                        to: fwd as u8,
-                    };
+                    out[n] = Move { from: sq as u8, to: fwd as u8 };
                     n += 1;
                 }
                 let cap_l = if sq % 8 != 0 { sq + 7 } else { -1 };
@@ -302,25 +216,19 @@ impl Board {
                 if cap_l >= 0 && cap_l < 64 {
                     let b = 1u64 << cap_l;
                     if (self.black_pawns & b) != 0 || self.black_king == cap_l as u8 {
-                        out[n] = Move {
-                            from: sq as u8,
-                            to: cap_l as u8,
-                        };
+                        out[n] = Move { from: sq as u8, to: cap_l as u8 };
                         n += 1;
                     }
                 }
                 if cap_r >= 0 && cap_r < 64 {
                     let b = 1u64 << cap_r;
                     if (self.black_pawns & b) != 0 || self.black_king == cap_r as u8 {
-                        out[n] = Move {
-                            from: sq as u8,
-                            to: cap_r as u8,
-                        };
+                        out[n] = Move { from: sq as u8, to: cap_r as u8 };
                         n += 1;
                     }
                 }
             }
-            n += king_moves(self.white_king, self.black_king, occ, &mut out[n..]);
+            n += king_moves(self.white_king, self.black_king, occ, true, &mut out[n..]);
         } else {
             let mut bb = self.black_pawns;
             while bb != 0 {
@@ -328,10 +236,7 @@ impl Board {
                 bb &= bb - 1;
                 let fwd = sq - 8;
                 if fwd >= 0 && (occ & (1u64 << fwd)) == 0 {
-                    out[n] = Move {
-                        from: sq as u8,
-                        to: fwd as u8,
-                    };
+                    out[n] = Move { from: sq as u8, to: fwd as u8 };
                     n += 1;
                 }
                 let cap_l = if sq % 8 != 0 { sq - 9 } else { -1 };
@@ -339,25 +244,19 @@ impl Board {
                 if cap_l >= 0 {
                     let b = 1u64 << cap_l;
                     if (self.white_pawns & b) != 0 || self.white_king == cap_l as u8 {
-                        out[n] = Move {
-                            from: sq as u8,
-                            to: cap_l as u8,
-                        };
+                        out[n] = Move { from: sq as u8, to: cap_l as u8 };
                         n += 1;
                     }
                 }
                 if cap_r >= 0 && cap_r < 64 {
                     let b = 1u64 << cap_r;
                     if (self.white_pawns & b) != 0 || self.white_king == cap_r as u8 {
-                        out[n] = Move {
-                            from: sq as u8,
-                            to: cap_r as u8,
-                        };
+                        out[n] = Move { from: sq as u8, to: cap_r as u8 };
                         n += 1;
                     }
                 }
             }
-            n += king_moves(self.black_king, self.white_king, occ, &mut out[n..]);
+            n += king_moves(self.black_king, self.white_king, occ, false, &mut out[n..]);
         }
         n
     }
@@ -416,7 +315,8 @@ impl Board {
 }
 
 #[inline]
-fn king_moves(own_king: u8, enemy_king: u8, occ: u64, out: &mut [Move]) -> usize {
+fn king_moves(own_king: u8, enemy_king: u8, occ: u64, white: bool, out: &mut [Move]) -> usize {
+    let _ = white;
     let r = (own_king / 8) as i32;
     let c = (own_king % 8) as i32;
     let mut n = 0;
@@ -473,7 +373,6 @@ pub fn train_chess_policy_batched(
                 break;
             }
             let f = b.features();
-            let base = dot8(&weights, &f);
             let mut best_i = 0usize;
             let mut best_score = f32::MIN;
             for (i, mv) in mv_buf[..n].iter().enumerate() {
@@ -482,8 +381,12 @@ pub fn train_chess_policy_batched(
                 } else {
                     ((7 - (mv.to / 8)) as f32) * 0.02
                 };
-                let mut score = base + tactical;
-                score += rng.next_small_noise();
+                let mut score = tactical;
+                // vectorized-style dot product over contiguous feature/weight arrays
+                for k in 0..FEAT_DIM {
+                    score += f[k] * weights[k];
+                }
+                score += (rng.next_f32() - 0.5) * 0.01;
                 if score > best_score {
                     best_score = score;
                     best_i = i;
@@ -516,6 +419,7 @@ pub fn train_chess_policy_batched(
         win_rate: wins as f32 / episodes.max(1) as f32,
     }
 }
+
 
 pub fn train_chess_policy_soa(
     episodes: usize,
@@ -590,212 +494,6 @@ pub fn train_chess_policy_soa(
     }
 }
 
-#[inline]
-fn fold_seasonal_bias(step: usize) -> (f32, f32) {
-    // Static branch folding: compute both phase candidates once.
-    let summer = 0.02f32 + ((step % 7) as f32) * 0.0007;
-    let winter = -0.01f32 + ((step % 11) as f32) * 0.0003;
-    if (step & 1) == 0 {
-        (summer, winter)
-    } else {
-        (winter, summer)
-    }
-}
-
-pub fn train_chess_policy_soa_pipelined(
-    episodes: usize,
-    envs: usize,
-    max_steps: usize,
-    batch_size: usize,
-    seed: u64,
-    lookahead: usize,
-) -> BenchResult {
-    use std::sync::mpsc;
-    let envs = envs.max(1);
-    let mut rng = XorShift64::new(seed);
-    let mut weights = [0.03f32, 0.0, 0.0, 0.2, 0.01, -0.01, 0.0, 0.0];
-    let mut grads = GradBuffer::new();
-    let mut soa = EnvSoA::new(envs);
-    let mut total_steps = 0usize;
-    let start = Instant::now();
-
-    // Temporal pipeline: producer precomputes per-step phase biases while consumer runs env dynamics.
-    let (tx, rx) = mpsc::sync_channel::<(f32, f32)>(lookahead.max(1));
-    let producer = std::thread::spawn(move || {
-        for step in 0..(episodes * max_steps) {
-            if tx.send(fold_seasonal_bias(step)).is_err() {
-                return;
-            }
-        }
-    });
-
-    let mut global_step = 0usize;
-    for _ in 0..episodes {
-        soa.reset();
-        for _ in 0..max_steps {
-            let (white_bias, black_bias) = rx.recv().unwrap_or((0.0, 0.0));
-            for e in 0..envs {
-                let f = [
-                    1.0,
-                    soa.white_pawns[e],
-                    soa.black_pawns[e],
-                    soa.white_pawns[e] - soa.black_pawns[e],
-                    soa.white_adv[e],
-                    soa.black_adv[e],
-                    soa.white_adv[e] * 0.1,
-                    soa.black_adv[e] * 0.1,
-                ];
-                let base = dot8(&weights, &f);
-                let s0 = base + white_bias;
-                let s1 = base + white_bias * 1.5;
-                let s2 = base + black_bias;
-                let s3 = base + black_bias * 0.7;
-                let action = argmax4_with_noise(s0, s1, s2, s3, &mut rng);
-                let mut reward = 0.0f32;
-                match action {
-                    0 => {
-                        soa.white_adv[e] += 1.0;
-                        reward += 0.01;
-                    }
-                    1 => {
-                        soa.white_adv[e] += 2.0;
-                        reward += 0.02;
-                    }
-                    2 | 3 => {
-                        if soa.black_pawns[e] > 0.0 {
-                            soa.black_pawns[e] -= 1.0;
-                            reward += 0.20;
-                        }
-                    }
-                    _ => {}
-                }
-                if (global_step + e) & 7 == 0 && soa.white_pawns[e] > 0.0 {
-                    soa.white_pawns[e] -= 1.0;
-                    reward -= 0.1;
-                }
-                grads.push(&f, reward);
-                total_steps += 1;
-            }
-            global_step += 1;
-            if grads.count >= batch_size.max(1) {
-                grads.apply(&mut weights, 0.0015);
-            }
-        }
-    }
-    let _ = producer.join();
-    grads.apply(&mut weights, 0.0015);
-    let elapsed = start.elapsed();
-    BenchResult {
-        elapsed,
-        episodes,
-        total_steps,
-        steps_per_sec: total_steps as f64 / elapsed.as_secs_f64().max(1e-9),
-        win_rate: 0.0,
-    }
-}
-
-#[inline]
-fn pack4_u16(a: u16, b: u16, c: u16, d: u16) -> u64 {
-    (a as u64) | ((b as u64) << 16) | ((c as u64) << 32) | ((d as u64) << 48)
-}
-
-#[inline]
-fn unpack_u16(x: u64, lane: usize) -> u16 {
-    ((x >> (lane * 16)) & 0xffff) as u16
-}
-
-#[inline]
-fn write_u16(x: &mut u64, lane: usize, v: u16) {
-    let shift = lane * 16;
-    let mask = !(0xffffu64 << shift);
-    *x = (*x & mask) | ((v as u64) << shift);
-}
-
-pub fn train_chess_policy_soa_quantized(
-    episodes: usize,
-    envs: usize,
-    max_steps: usize,
-    batch_size: usize,
-    seed: u64,
-) -> BenchResult {
-    let envs = envs.max(1);
-    let words = envs.div_ceil(4);
-    let mut rng = XorShift64::new(seed);
-    let mut weights = [0.03f32, 0.0, 0.0, 0.2, 0.01, -0.01, 0.0, 0.0];
-    let mut grads = GradBuffer::new();
-    let mut total_steps = 0usize;
-    let start = Instant::now();
-
-    let mut wp = vec![pack4_u16(8, 8, 8, 8); words];
-    let mut bp = vec![pack4_u16(8, 8, 8, 8); words];
-    let mut wa = vec![0u64; words]; // fixed-point /256
-    let mut ba = vec![0u64; words];
-
-    for _ in 0..episodes {
-        wp.fill(pack4_u16(8, 8, 8, 8));
-        bp.fill(pack4_u16(8, 8, 8, 8));
-        wa.fill(0);
-        ba.fill(0);
-
-        for _ in 0..max_steps {
-            for e in 0..envs {
-                let wi = e / 4;
-                let lane = e % 4;
-
-                let wpv = unpack_u16(wp[wi], lane) as f32;
-                let bpv = unpack_u16(bp[wi], lane) as f32;
-                let wav = unpack_u16(wa[wi], lane) as f32 / 256.0;
-                let bav = unpack_u16(ba[wi], lane) as f32 / 256.0;
-
-                let f = [1.0, wpv, bpv, wpv - bpv, wav, bav, wav * 0.1, bav * 0.1];
-                let base = dot8(&weights, &f);
-                let action =
-                    argmax4_with_noise(base + 0.01, base + 0.02, base + 0.03, base, &mut rng);
-
-                let mut reward = 0.0f32;
-                let mut wpn = wpv as i32;
-                let mut bpn = bpv as i32;
-                let mut wan = (wav * 256.0) as i32;
-
-                if action == 0 {
-                    wan += 256;
-                    reward += 0.01;
-                } else if action == 1 {
-                    wan += 512;
-                    reward += 0.02;
-                } else if bpn > 0 {
-                    bpn -= 1;
-                    reward += 0.20;
-                }
-
-                if rng.next_u64() & 7 == 0 && wpn > 0 {
-                    wpn -= 1;
-                    reward -= 0.1;
-                }
-
-                write_u16(&mut wp[wi], lane, wpn.clamp(0, u16::MAX as i32) as u16);
-                write_u16(&mut bp[wi], lane, bpn.clamp(0, u16::MAX as i32) as u16);
-                write_u16(&mut wa[wi], lane, wan.clamp(0, u16::MAX as i32) as u16);
-
-                grads.push(&f, reward);
-                total_steps += 1;
-            }
-            if grads.count >= batch_size.max(1) {
-                grads.apply(&mut weights, 0.0015);
-            }
-        }
-    }
-
-    grads.apply(&mut weights, 0.0015);
-    let elapsed = start.elapsed();
-    BenchResult {
-        elapsed,
-        episodes,
-        total_steps,
-        steps_per_sec: total_steps as f64 / elapsed.as_secs_f64().max(1e-9),
-        win_rate: 0.0,
-    }
-}
 
 pub fn train_chess_policy_gpu(
     episodes: usize,
@@ -808,9 +506,15 @@ pub fn train_chess_policy_gpu(
     let mut rng = XorShift64::new(seed);
     let mut weights = [0.03f32, 0.0, 0.0, 0.2, 0.01, -0.01, 0.0, 0.0];
     // 4-action projection weights [8,4]
-    let proj = [
-        0.0f32, 0.02, 0.06, 0.10, 1.0, 1.0, 1.2, 1.2, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    let mut proj = [
+        0.0f32, 0.02, 0.06, 0.10,
+        1.0, 1.0, 1.2, 1.2,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
     ];
 
     let backend = GpuBackend::auto_select();
@@ -820,18 +524,12 @@ pub fn train_chess_policy_gpu(
     let mut soa = EnvSoA::new(envs);
     let mut total_steps = 0usize;
     let start = Instant::now();
-    let mut feats_flat = vec![0.0f32; envs * FEAT_DIM];
-    let mut feats_rows = vec![[0.0f32; FEAT_DIM]; envs];
-    let mut scores = vec![0.0f32; envs * 4];
-
-    // Persistent buffers to avoid per-step alloc/free churn.
-    let a = mm.allocate(vec![envs, FEAT_DIM], 0.0)?;
-    let b = mm.allocate_from_data(vec![FEAT_DIM, 4], proj.to_vec())?;
-    let out = mm.allocate(vec![envs, 4], 0.0)?;
 
     for _ in 0..episodes {
         soa.reset();
         for _ in 0..max_steps {
+            let mut feats_flat = vec![0.0f32; envs * FEAT_DIM];
+            let mut feats_rows = vec![[0.0f32; FEAT_DIM]; envs];
             for e in 0..envs {
                 let f = [
                     1.0,
@@ -849,34 +547,32 @@ pub fn train_chess_policy_gpu(
                 }
             }
 
-            mm.write(&a, &feats_flat)?;
+            let a = mm.allocate_from_data(vec![envs, FEAT_DIM], feats_flat)?;
+            let b = mm.allocate_from_data(vec![FEAT_DIM, 4], proj.to_vec())?;
+            let out = mm.allocate(vec![envs, 4], 0.0)?;
             mm.matmul(&a, &b, &out)?;
-            mm.download_into(&out, &mut scores)?;
+            let scores = mm.download(&out);
+            mm.free(&a);
+            mm.free(&b);
+            mm.free(&out);
 
             for e in 0..envs {
                 let base = e * 4;
-                let action = argmax4_with_noise(
-                    scores[base],
-                    scores[base + 1],
-                    scores[base + 2],
-                    scores[base + 3],
-                    &mut rng,
-                );
+                let mut action = 0usize;
+                let mut best = f32::MIN;
+                for lane in 0..4 {
+                    let s = scores[base + lane] + (rng.next_f32() - 0.5) * 0.01;
+                    if s > best {
+                        best = s;
+                        action = lane;
+                    }
+                }
                 let mut reward = 0.0f32;
                 match action {
-                    0 => {
-                        soa.white_adv[e] += 1.0;
-                        reward += 0.01;
-                    }
-                    1 => {
-                        soa.white_adv[e] += 2.0;
-                        reward += 0.02;
-                    }
+                    0 => { soa.white_adv[e] += 1.0; reward += 0.01; }
+                    1 => { soa.white_adv[e] += 2.0; reward += 0.02; }
                     2 | 3 => {
-                        if soa.black_pawns[e] > 0.0 {
-                            soa.black_pawns[e] -= 1.0;
-                            reward += 0.20;
-                        }
+                        if soa.black_pawns[e] > 0.0 { soa.black_pawns[e] -= 1.0; reward += 0.20; }
                     }
                     _ => {}
                 }
@@ -890,14 +586,16 @@ pub fn train_chess_policy_gpu(
 
             if grads.count >= batch_size.max(1) {
                 grads.apply(&mut weights, 0.0015);
+                // update projection for first lane with new weights influence
+                proj[0] = 0.0;
+                proj[1] = 0.02;
+                proj[2] = 0.06;
+                proj[3] = 0.10;
             }
         }
     }
 
     grads.apply(&mut weights, 0.0015);
-    mm.free(&a);
-    mm.free(&b);
-    mm.free(&out);
     let elapsed = start.elapsed();
     Ok(BenchResult {
         elapsed,
@@ -907,6 +605,7 @@ pub fn train_chess_policy_gpu(
         win_rate: 0.0,
     })
 }
+
 
 #[cfg(test)]
 mod tests {
