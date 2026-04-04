@@ -63,7 +63,7 @@ fn infer_action_noalloc(
 ) -> u8 {
     // explicit vector-like action lanes (4 macro-actions), no heap allocations.
     let tactical = if white_to_move {
-        [0.00f32, 0.02, 0.06, 0.10]
+        TACTICAL_LANES
     } else {
         [0.10f32, 0.06, 0.02, 0.00]
     };
@@ -645,7 +645,7 @@ pub fn train_chess_policy_gpu(
                 ];
                 feats_rows[e] = f;
                 for k in 0..FEAT_DIM {
-                    feats_flat[e * FEAT_DIM + k] = f[k] * weights[k];
+                    feats_flat[e * FEAT_DIM + k] = f[k];
                 }
             }
 
@@ -654,11 +654,12 @@ pub fn train_chess_policy_gpu(
             mm.download_into(&out, &mut scores)?;
 
             for e in 0..envs {
-                let base = e * 4;
+                let base = scores[e];
                 let mut action = 0usize;
                 let mut best = f32::MIN;
                 for lane in 0..4 {
-                    let s = scores[base + lane] + (rng.next_f32() - 0.5) * 0.01;
+                    let tactical = TACTICAL_LANES[lane];
+                    let s = base + tactical + (rng.next_f32() - 0.5) * 0.01;
                     if s > best {
                         best = s;
                         action = lane;
@@ -692,11 +693,7 @@ pub fn train_chess_policy_gpu(
 
             if grads.count >= batch_size.max(1) {
                 grads.apply(&mut weights, 0.0015);
-                // update projection for first lane with new weights influence
-                proj[0] = 0.0;
-                proj[1] = 0.02;
-                proj[2] = 0.06;
-                proj[3] = 0.10;
+                weights_dirty = true;
             }
         }
     }

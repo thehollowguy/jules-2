@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::Instant;
 
 use jules::chess_ml::{
     eval_policy_vs_random, train_chess_policy_batched, train_chess_policy_batched_from,
