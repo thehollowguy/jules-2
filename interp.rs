@@ -40,6 +40,7 @@ use crate::ast::{
 use crate::game_systems::{InputState, PhysicsShape, PhysicsWorld, RenderState};
 use crate::lexer::Span;
 use crate::ml_engine::{ComputationGraph, Optimizer, OptimizerState};
+use matrixmultiply::sgemm;
 
 // =============================================================================
 // §1  RUNTIME VALUE
@@ -428,12 +429,37 @@ impl Tensor {
         let b = rhs.cpu_data();
         let mut c = vec![0.0_f32; batch_count * m * n];
 
-        // Cache-tiled GEMM within each batch element.
+        // Hybrid GEMM strategy:
+        // - matrixmultiply::sgemm for large dense workloads (near-BLAS path)
+        // - cache-tiled scalar kernel for smaller matrices
         const TILE: usize = 32;
+        let use_sgemm = m >= 64 && n >= 64 && k >= 64;
         for batch in 0..batch_count {
             let a_offset = batch * m * k;
             let b_offset = batch * k * n;
             let c_offset = batch * m * n;
+
+            if use_sgemm {
+                unsafe {
+                    sgemm(
+                        m,
+                        k,
+                        n,
+                        1.0,
+                        a[a_offset..].as_ptr(),
+                        k as isize,
+                        1,
+                        b[b_offset..].as_ptr(),
+                        n as isize,
+                        1,
+                        0.0,
+                        c[c_offset..].as_mut_ptr(),
+                        n as isize,
+                        1,
+                    );
+                }
+                continue;
+            }
 
             for ii in (0..m).step_by(TILE) {
                 for jj in (0..n).step_by(TILE) {
@@ -445,8 +471,7 @@ impl Tensor {
                             for t in kk..k_end {
                                 let a_it = a[a_offset + i * k + t];
                                 for j in jj..j_end {
-                                    c[c_offset + i * n + j] +=
-                                        a_it * b[b_offset + t * n + j];
+                                    c[c_offset + i * n + j] += a_it * b[b_offset + t * n + j];
                                 }
                             }
                         }
@@ -900,7 +925,7 @@ impl EcsWorld {
 
 /// A weight layer in the runtime model.
 #[derive(Debug, Clone)]
-pub(crate) enum WeightLayer {
+pub enum WeightLayer {
     Dense {
         w: Tensor,
         b: Tensor,
@@ -2868,20 +2893,6 @@ impl Interpreter {
                 Some(v) => rt_err!("len() not applicable to {}", v.type_name()),
                 None => rt_err!("len() requires an argument"),
             },
-            "range" => {
-                match (
-                    args.get(0).and_then(|v| v.as_i64()),
-                    args.get(1).and_then(|v| v.as_i64()),
-                ) {
-                    (Some(start), Some(end)) => {
-                        let range: Vec<Value> =
-                            (start as i32..end as i32).map(Value::I32).collect();
-                        Ok(Value::Array(Arc::new(Mutex::new(range))))
-                    }
-                    _ => rt_err!("range() requires two numbers"),
-                }
-            }
-
             // ── Option / Result constructors ───────────────────────────────────
             "Some" => Ok(Value::Some(Box::new(
                 args.into_iter().next().unwrap_or(Value::Unit),
@@ -3355,7 +3366,7 @@ impl Interpreter {
                     args.get(2).and_then(|v| v.as_f64()),
                     args.get(3).and_then(|v| v.as_f64()),
                 ) {
-                    let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
+                    let world = self.physics_world.as_ref().unwrap().lock().unwrap();
                     // Placeholder: force integration API is not currently exposed.
                     let _ = (body_id, fx, fy, fz);
                     Ok(Value::Bool(false))
@@ -3419,8 +3430,8 @@ impl Interpreter {
                     args.get(0).and_then(|v| v.as_i64()),
                     args.get(1).and_then(|v| v.as_i64()),
                 ) {
-                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    let _ = (mesh_id, mat_id);
+                    let render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    let _ = (render, mesh_id, mat_id);
                     Ok(Value::Bool(false))
                 } else {
                     rt_err!("graphics::render_mesh requires (mesh_id, material_id)")

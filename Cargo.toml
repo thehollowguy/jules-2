@@ -5,6 +5,7 @@ edition = "2021"
 authors = ["jules"]
 description = "Jules programming language compiler/interpreter with game dev, ML, and FFI support"
 license = "MIT"
+autobenches = false
 
 [lib]
 name = "jules"
@@ -18,6 +19,14 @@ path = "main.rs"
 [[bin]]
 name = "bench-ecs"
 path = "benches/bench_ecs.rs"
+
+[[bin]]
+name = "bench-chess-ml"
+path = "tools/bench_chess_ml.rs"
+
+[[bin]]
+name = "bench-jules-ml-chess"
+path = "tools/bench_jules_ml_chess.rs"
 
 [dependencies]
 pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
