@@ -692,13 +692,13 @@ impl TypeCk {
                     }
                 } else {
                     self.diag.error(
-                            span,
-                            "array length must be a compile-time constant — use a literal \
+                        span,
+                        "array length must be a compile-time constant — use a literal \
                              integer (e.g. `[f32; 16]`) or a `const` declaration \
                              (e.g. `const N: usize = 16; let a: [f32; N] = ...`). \
                              Dynamic lengths are not allowed in array types; \
-                             use a `Slice` or `Vec` if the length is runtime-determined."
-                        );
+                             use a `Slice` or `Vec` if the length is runtime-determined.",
+                    );
                     self.infer.fresh()
                 }
             }
@@ -811,8 +811,7 @@ impl TypeCk {
                              like `{}: f32`, or use `_` as a wildcard placeholder if the \
                              type is fully inferred from call sites. Unannotated function \
                              parameters make overload resolution and documentation harder.",
-                            param.name,
-                            param.name
+                            param.name, param.name
                         ),
                     );
                     self.infer.fresh()
@@ -887,8 +886,7 @@ impl TypeCk {
                          and must have a concrete type at compile time. \
                          Add a type annotation: `{}: f32` (or the appropriate type). \
                          Example: `system update(dt: f32, gravity: vec3) {{ ... }}`",
-                        param.name,
-                        param.name
+                        param.name, param.name
                     ),
                 );
             }
@@ -985,14 +983,16 @@ impl TypeCk {
                     if Self::is_runtime_builtin_ident(name.as_str()) {
                         return self.infer.fresh();
                     }
-                    self.diag
-                        .error(*span, format!(
+                    self.diag.error(
+                        *span,
+                        format!(
                             "use of undeclared variable `{}` — \
                              declare it before use with `let {} = ...;`, \
                              add it as a function parameter, or check for \
                              a spelling mistake. Variable names are case-sensitive.",
                             name, name
-                        ));
+                        ),
+                    );
                     self.infer.fresh()
                 }
             },
@@ -1017,15 +1017,15 @@ impl TypeCk {
                             }
                         } else {
                             self.diag.error(
-                            *span,
-                            format!(
-                                "unknown path `{}` — check that every segment is declared \
+                                *span,
+                                format!(
+                                    "unknown path `{}` — check that every segment is declared \
                                  and that any required `use` imports are present. \
                                  Built-in runtime paths begin with `game::`, `graphics::`, \
                                  `audio::`, `input::`, `physics::`, `ml::`, etc.",
-                                name
-                            ),
-                        );
+                                    name
+                                ),
+                            );
                             self.infer.fresh()
                         }
                     }
@@ -1776,7 +1776,8 @@ impl TypeCk {
                          Square matrix multiplication requires both matrices to have \
                          the same size (e.g. `mat3 @ mat3`). \
                          Did you mean to use a `mat{r}` on the left?",
-                        lt = l.display(), rt = r.display(),
+                        lt = l.display(),
+                        rt = r.display(),
                         r = rs.lanes()
                     ),
                 );
@@ -1793,7 +1794,8 @@ impl TypeCk {
                         "matrix–vector multiply: size mismatch — `{lt}` @ `{rt}`. \
                          An N×N matrix can only multiply an N-component vector. \
                          Use `mat{mv}` with a `vec{mv}` (or vice versa).",
-                        lt = l.display(), rt = r.display(),
+                        lt = l.display(),
+                        rt = r.display(),
                         mv = ms.lanes()
                     ),
                 );
@@ -1836,8 +1838,10 @@ impl TypeCk {
                         "matrix multiply (`@`) requires at least 2-D tensors, \
                          but got rank-{la} `{lt}` and rank-{rb} `{rt}`. \
                          Use `.unsqueeze(0)` to promote a 1-D tensor to 2-D before multiplying.",
-                        la = sa.len(), lt = l.display(),
-                        rb = sb.len(), rt = r.display()
+                        la = sa.len(),
+                        lt = l.display(),
+                        rb = sb.len(),
+                        rt = r.display()
                     ),
                 );
                 return self.infer.fresh();
@@ -1855,7 +1859,8 @@ impl TypeCk {
                              but the corresponding dimension of the right operand is {kr}. \
                              For `A[M, K] @ B[K, N]` the K dimensions must be equal. \
                              Transpose one operand (`.transpose()`) if the shapes are swapped.",
-                            kl = kl, kr = kr
+                            kl = kl,
+                            kr = kr
                         ),
                     );
                 }
@@ -1870,7 +1875,10 @@ impl TypeCk {
                     format!(
                         "matrix multiply batch shape mismatch: `{}` @ `{}`. \
                          Left batch dims {:?} do not match right batch dims {:?}.",
-                        l.display(), r.display(), batch_a, batch_b
+                        l.display(),
+                        r.display(),
+                        batch_a,
+                        batch_b
                     ),
                 );
             }
@@ -1891,7 +1899,8 @@ impl TypeCk {
                  but got `{lt}` and `{rt}`. \
                  Valid forms: `tensor<E>[M,K] @ tensor<E>[K,N]`, `mat3 @ mat3`, `mat3 @ vec3`. \
                  If you want element-wise multiplication use `.*` instead.",
-                lt = l.display(), rt = r.display()
+                lt = l.display(),
+                rt = r.display()
             ),
         );
         self.infer.fresh()
@@ -1961,7 +1970,8 @@ impl TypeCk {
                              For example, `[3, 1]` broadcasts with `[1, 4]` → `[3, 4]`, \
                              but `[3, 2]` and `[2, 3]` are incompatible. \
                              Reshape one operand to make the shapes broadcastable.",
-                            lt = l.display(), rt = r.display()
+                            lt = l.display(),
+                            rt = r.display()
                         ),
                     );
                     return self.infer.fresh();
@@ -1975,7 +1985,8 @@ impl TypeCk {
                 format!(
                     "Hadamard `.*`/`./` operand mismatch: left is `{lt}` and right is `{rt}`. \
                      Both operands must be the same type or broadcastable tensor shapes.",
-                    lt = l.display(), rt = r.display()
+                    lt = l.display(),
+                    rt = r.display()
                 ),
             );
         }
@@ -2251,22 +2262,22 @@ impl TypeCk {
                     }
                     if Self::is_runtime_builtin_ident(name.as_str()) {
                         if name == "dataloader" || name == "pipeline" {
-                        return Ty::Struct("DataLoader".into());
+                            return Ty::Struct("DataLoader".into());
+                        }
+                        if name == "range" || name == "arange" {
+                            return Ty::Array {
+                                elem: Box::new(Ty::Scalar(ElemType::I32)),
+                                len: 0,
+                            };
+                        }
+                        if name == "zeros" || name == "ones" {
+                            return Ty::Array {
+                                elem: Box::new(Ty::Scalar(ElemType::F32)),
+                                len: 0,
+                            };
+                        }
+                        return self.infer.fresh();
                     }
-                    if name == "range" || name == "arange" {
-                        return Ty::Array {
-                            elem: Box::new(Ty::Scalar(ElemType::I32)),
-                            len: 0,
-                        };
-                    }
-                    if name == "zeros" || name == "ones" {
-                        return Ty::Array {
-                            elem: Box::new(Ty::Scalar(ElemType::F32)),
-                            len: 0,
-                        };
-                    }
-                    return self.infer.fresh();
-                }
                     // Unknown function — emit error, return fresh var.
                     self.diag
                         .error(span, format!("call to undeclared function `{}`", name));
@@ -2978,7 +2989,8 @@ impl TypeCk {
             // Expect a string literal as the first argument.
             if let Some(crate::ast::Expr::StrLit { value, span }) = args.first() {
                 if let Err(e) = self.validate_architecture_string(value) {
-                    self.diag.error(*span, format!("@{}: {}", decorator_name.to_uppercase(), e));
+                    self.diag
+                        .error(*span, format!("@{}: {}", decorator_name.to_uppercase(), e));
                     return None;
                 }
                 // Basic validation succeeded.
@@ -3391,7 +3403,6 @@ mod tests {
     fn make_checker() -> TypeCk {
         TypeCk::new()
     }
-
 
     fn mk_agent_with_attrs(attrs: Vec<Attribute>) -> AgentDecl {
         AgentDecl {
@@ -4110,6 +4121,123 @@ mod tests {
     }
 
     #[test]
+    fn test_ppo_decorator_requires_explicit_training_args() {
+        let ppo_attr = Attribute::Named {
+            name: "ppo".into(),
+            args: vec![Expr::StrLit {
+                span: dummy(),
+                value: "128->64->32".into(),
+            }],
+        };
+
+        let program = Program {
+            span: dummy(),
+            items: vec![Item::Agent(mk_agent_with_attrs(vec![ppo_attr]))],
+        };
+
+        let mut ck = make_checker();
+        ck.check_program(&program);
+        assert!(
+            ck.diag.has_errors(),
+            "expected missing required PPO args to produce errors"
+        );
+    }
+
+    #[test]
+    fn test_ppo_decorator_valid_config() {
+        let ppo_attr = Attribute::Named {
+            name: "ppo".into(),
+            args: vec![
+                Expr::StrLit {
+                    span: dummy(),
+                    value: "128->512->64".into(),
+                },
+                assign_kv(
+                    "learning_rate",
+                    Expr::FloatLit {
+                        span: dummy(),
+                        value: 3e-4,
+                    },
+                ),
+                assign_kv(
+                    "gamma",
+                    Expr::FloatLit {
+                        span: dummy(),
+                        value: 0.99,
+                    },
+                ),
+                assign_kv(
+                    "lambda",
+                    Expr::FloatLit {
+                        span: dummy(),
+                        value: 0.95,
+                    },
+                ),
+                assign_kv(
+                    "clip",
+                    Expr::FloatLit {
+                        span: dummy(),
+                        value: 0.2,
+                    },
+                ),
+                assign_kv(
+                    "epochs",
+                    Expr::IntLit {
+                        span: dummy(),
+                        value: 4,
+                    },
+                ),
+                assign_kv(
+                    "batch",
+                    Expr::IntLit {
+                        span: dummy(),
+                        value: 64,
+                    },
+                ),
+                assign_kv(
+                    "ent_coef",
+                    Expr::FloatLit {
+                        span: dummy(),
+                        value: 0.01,
+                    },
+                ),
+                assign_kv(
+                    "vf_coef",
+                    Expr::FloatLit {
+                        span: dummy(),
+                        value: 0.5,
+                    },
+                ),
+            ],
+        };
+
+        let program = Program {
+            span: dummy(),
+            items: vec![Item::Agent(mk_agent_with_attrs(vec![ppo_attr]))],
+        };
+
+        let mut ck = make_checker();
+        ck.check_program(&program);
+        assert!(
+            !ck.diag.has_errors(),
+            "expected valid PPO config to pass, got: {:?}",
+            ck.diag.items
+        );
+    }
+
+    fn assign_kv(key: &str, value: Expr) -> Expr {
+        Expr::Assign {
+            span: dummy(),
+            op: AssignOpKind::Assign,
+            target: Box::new(Expr::Ident {
+                span: dummy(),
+                name: key.into(),
+            }),
+            value: Box::new(value),
+        }
+    }
+
+    #[test]
     fn test_ident_function_resolves_as_callable() {
         let span = dummy();
         let fn_decl = FnDecl {
@@ -4117,15 +4245,13 @@ mod tests {
             name: "clamp".into(),
             attrs: vec![],
             generics: vec![],
-            params: vec![
-                Param {
-                    span,
-                    name: "x".into(),
-                    ty: Some(Type::Scalar(ElemType::I32)),
-                    default: None,
-                    mutable: false,
-                },
-            ],
+            params: vec![Param {
+                span,
+                name: "x".into(),
+                ty: Some(Type::Scalar(ElemType::I32)),
+                default: None,
+                mutable: false,
+            }],
             ret_ty: None,
             body: Some(Block {
                 span,
@@ -4156,7 +4282,10 @@ mod tests {
         let mut env = TyEnv::new();
         let _ = ck.check_expr(&call, &mut env);
         assert!(
-            !ck.diag.items.iter().any(|d| d.message.contains("undeclared variable `clamp`")),
+            !ck.diag
+                .items
+                .iter()
+                .any(|d| d.message.contains("undeclared variable `clamp`")),
             "function identifier should resolve for calls: {:?}",
             ck.diag.items
         );

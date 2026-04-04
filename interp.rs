@@ -150,7 +150,9 @@ impl DataLoader {
             // deterministic shuffle so tests remain stable
             let mut seed = 4211_u64;
             for i in (1..self.samples.len()).rev() {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let j = (seed % (i as u64 + 1)) as usize;
                 self.samples.swap(i, j);
             }
@@ -289,7 +291,13 @@ impl fmt::Display for Value {
             Value::Struct { name, .. } => write!(f, "{name} {{ … }}"),
             Value::DataLoader(d) => {
                 let d = d.lock().unwrap();
-                write!(f, "dataloader(batch_size={}, index={}, total={})", d.batch_size, d.index, d.samples.len())
+                write!(
+                    f,
+                    "dataloader(batch_size={}, index={}, total={})",
+                    d.batch_size,
+                    d.index,
+                    d.samples.len()
+                )
             }
             Value::Some(v) => write!(f, "Some({})", v),
             Value::None => write!(f, "None"),
@@ -669,6 +677,14 @@ impl Tensor {
     pub fn scale(&self, s: f32) -> Tensor {
         let data: Vec<f32> = self.cpu_data().iter().map(|x| x * s).collect();
         Tensor::from_data(self.shape.clone(), data)
+    }
+
+    /// In-place scaling of all elements (avoids allocation).
+    pub fn scale_inplace(&mut self, s: f32) {
+        let data = self.cpu_data_mut();
+        for v in data.iter_mut() {
+            *v *= s;
+        }
     }
 
     /// Add another tensor (in-place on self).
@@ -2776,7 +2792,9 @@ impl Interpreter {
                 Ok(Value::Array(Arc::new(Mutex::new(v))))
             }
             "dataloader" | "pipeline" => {
-                let source = args.get(0).ok_or_else(|| RuntimeError::new("dataloader() requires a source array or tensor"))?;
+                let source = args.get(0).ok_or_else(|| {
+                    RuntimeError::new("dataloader() requires a source array or tensor")
+                })?;
                 let batch_size = args
                     .get(1)
                     .and_then(|v| v.as_i64())
@@ -2803,7 +2821,9 @@ impl Interpreter {
                             let chunk = t.cpu_data()[start..end].to_vec();
                             let mut row_shape = t.shape.clone();
                             row_shape.remove(0);
-                            samples.push(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(row_shape, chunk)))));
+                            samples.push(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(
+                                row_shape, chunk,
+                            )))));
                         }
                     }
                     _ => return rt_err!("dataloader() source must be Array or Tensor"),
@@ -3063,8 +3083,9 @@ impl Interpreter {
                         Ok(entries) => {
                             let mut names = vec![];
                             for entry in entries {
-                                let entry =
-                                    entry.map_err(|e| RuntimeError::new(format!("sys::list_dir failed: {}", e)))?;
+                                let entry = entry.map_err(|e| {
+                                    RuntimeError::new(format!("sys::list_dir failed: {}", e))
+                                })?;
                                 names.push(Value::Str(
                                     entry.file_name().to_string_lossy().into_owned(),
                                 ));
@@ -3099,12 +3120,10 @@ impl Interpreter {
                 _ => rt_err!("sys::copy requires (from_path, to_path) strings"),
             },
             "sys::rename" => match (args.get(0), args.get(1)) {
-                (Some(Value::Str(from)), Some(Value::Str(to))) => {
-                    match std::fs::rename(from, to) {
-                        Ok(_) => Ok(Value::Bool(true)),
-                        Err(e) => rt_err!("sys::rename failed: {}", e),
-                    }
-                }
+                (Some(Value::Str(from)), Some(Value::Str(to))) => match std::fs::rename(from, to) {
+                    Ok(_) => Ok(Value::Bool(true)),
+                    Err(e) => rt_err!("sys::rename failed: {}", e),
+                },
                 _ => rt_err!("sys::rename requires (from_path, to_path) strings"),
             },
             "sys::metadata" => {
@@ -3193,7 +3212,10 @@ impl Interpreter {
             }
             "sys::exec" => {
                 if let Some(Value::Str(command)) = args.first() {
-                    let output = std::process::Command::new("sh").arg("-c").arg(command).output();
+                    let output = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(command)
+                        .output();
                     match output {
                         Ok(out) => {
                             let mut result = HashMap::new();
@@ -3252,7 +3274,7 @@ impl Interpreter {
                     }
                 }
                 _ => rt_err!("sys::exec_argv requires (program, args_array)"),
-            }
+            },
             "sys::exec_argv_in" => match (args.get(0), args.get(1), args.get(2)) {
                 (Some(Value::Str(program)), Some(Value::Array(argv)), Some(Value::Str(cwd))) => {
                     let arg_values = argv.lock().unwrap();
@@ -3261,7 +3283,9 @@ impl Interpreter {
                         if let Value::Str(s) = v {
                             parsed.push(s.clone());
                         } else {
-                            return rt_err!("sys::exec_argv_in args array must contain only strings");
+                            return rt_err!(
+                                "sys::exec_argv_in args array must contain only strings"
+                            );
                         }
                     }
                     let output = std::process::Command::new(program)
@@ -3290,7 +3314,7 @@ impl Interpreter {
                     }
                 }
                 _ => rt_err!("sys::exec_argv_in requires (program, args_array, cwd)"),
-            }
+            },
 
             // ── Physics functions ──────────────────────────────────────────────
             "physics::world_new" => Ok(Value::I64(1)),
@@ -3954,7 +3978,8 @@ impl Interpreter {
                     let mut mapped = Vec::new();
                     for sample in samples {
                         let mut call_env = Env::new();
-                        let mapped_val = self.eval_call(Value::Fn(func.clone()), vec![sample], &mut call_env)?;
+                        let mapped_val =
+                            self.eval_call(Value::Fn(func.clone()), vec![sample], &mut call_env)?;
                         mapped.push(mapped_val);
                     }
                     Ok(Value::DataLoader(Arc::new(Mutex::new(DataLoader {
@@ -3980,7 +4005,11 @@ impl Interpreter {
                     let mut filtered = Vec::new();
                     for sample in samples {
                         let mut call_env = Env::new();
-                        let result = self.eval_call(Value::Fn(func.clone()), vec![sample.clone()], &mut call_env)?;
+                        let result = self.eval_call(
+                            Value::Fn(func.clone()),
+                            vec![sample.clone()],
+                            &mut call_env,
+                        )?;
                         if result.as_bool().unwrap_or(false) {
                             filtered.push(sample);
                         }
@@ -4577,7 +4606,9 @@ impl GpuBackend for JulesGpuAdapter {
 
     fn elementwise(&self, a: &GpuBufferHandle, b: &GpuBufferHandle, op: GpuOp) -> GpuBufferHandle {
         let a_data = self.download(a);
-        let out = self.backend.upload(&vec![0.0; a_data.len()], vec![a_data.len()]);
+        let out = self
+            .backend
+            .upload(&vec![0.0; a_data.len()], vec![a_data.len()]);
         let ga = crate::gpu_backend::GpuBufferHandle { id: a.0 };
         let gb = crate::gpu_backend::GpuBufferHandle { id: b.0 };
         let go = crate::gpu_backend::GpuBufferHandle { id: out.id };
@@ -5689,7 +5720,10 @@ mod tests {
         ])));
 
         let loader = interp
-            .eval_builtin("dataloader", vec![source.clone(), Value::I32(2), Value::Bool(false)])
+            .eval_builtin(
+                "dataloader",
+                vec![source.clone(), Value::I32(2), Value::Bool(false)],
+            )
             .unwrap();
 
         let has_next = interp
@@ -5750,7 +5784,10 @@ mod tests {
             let a = arr.lock().unwrap();
             let ints: Vec<i32> = a
                 .iter()
-                .filter_map(|v| match v { Value::I32(x) => Some(*x), _ => None })
+                .filter_map(|v| match v {
+                    Value::I32(x) => Some(*x),
+                    _ => None,
+                })
                 .collect();
             assert_eq!(ints, vec![0, 2, 4]);
         } else {
@@ -5770,7 +5807,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter_map(|v| match v { Value::F32(x) => Some(*x), _ => None })
+                .filter_map(|v| match v {
+                    Value::F32(x) => Some(*x),
+                    _ => None,
+                })
                 .collect();
             assert_eq!(values, vec![1.0, 1.0]);
         } else {
@@ -5908,7 +5948,9 @@ mod tests {
         let metadata = interp
             .eval_builtin(
                 "sys::metadata",
-                vec![Value::Str(tmp_root.join("blob.bin").to_string_lossy().to_string())],
+                vec![Value::Str(
+                    tmp_root.join("blob.bin").to_string_lossy().to_string(),
+                )],
             )
             .unwrap();
         if let Value::HashMap(map) = metadata {
