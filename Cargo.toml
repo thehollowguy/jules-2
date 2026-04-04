@@ -5,6 +5,7 @@ edition = "2021"
 authors = ["jules"]
 description = "Jules programming language compiler/interpreter with game dev, ML, and FFI support"
 license = "MIT"
+autobenches = false
 
 [lib]
 name = "jules"

@@ -32,6 +32,7 @@ pub mod shader_tooling;
 pub mod networking;
 pub mod profiling_tools;
 pub mod hot_reload;
+pub mod chess_ml;
 
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -1919,8 +1920,8 @@ mod tests {
         // Inject a synthetic warning directly, then apply promote.
         let mut unit = CompileUnit::new("test.jules", "let x = 1\n");
         unit.diags.push(Diag::warning(sp(1, 1, 0, 1), "unused"));
-        let mut pipeline = Pipeline::new();
-        pipeline.warn_as_error = true;
+        let mut _pipeline = Pipeline::new();
+        _pipeline.warn_as_error = true;
         // The warning is already present; run again to trigger promotion.
         // (In real usage the pipeline inserts the warning during analysis.)
         // Promote manually to test the behaviour.
@@ -1935,8 +1936,8 @@ mod tests {
         let mut unit = CompileUnit::new("test.jules", "let x = 1\n");
         unit.diags.push(Diag::note(sp(1,1,0,1), "just info"));
         unit.diags.push(Diag::error(sp(1,1,0,1), "real error"));
-        let mut pipeline = Pipeline::new();
-        pipeline.quiet = true;
+        let mut _pipeline = Pipeline::new();
+        _pipeline.quiet = true;
         unit.diags.retain(|d| d.severity == DiagSeverity::Error);
         assert_eq!(unit.diags.len(), 1);
         assert!(unit.has_errors());

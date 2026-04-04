@@ -105,7 +105,7 @@ impl Tensor {
         let data = (0..numel)
             .map(|_| {
                 // Pseudo-random number between -limit and limit
-                let r = ((numel as f32 * (_as_pseudo_rand(numel) as f32)).sin() * limit.abs());
+                let r = (numel as f32 * (_as_pseudo_rand(numel) as f32)).sin() * limit.abs();
                 if (numel ^ _as_pseudo_rand(numel * 2)) & 1 == 0 {
                     r
                 } else {
@@ -123,7 +123,7 @@ impl Tensor {
         let std = (2.0 / fan_in).sqrt();
         let data = (0..numel)
             .map(|i| {
-                let r = ((i as f32 * std * 3.14159).sin() * std);
+                let r = (i as f32 * std * 3.14159).sin() * std;
                 r.max(-3.0 * std).min(3.0 * std)
             })
             .collect();

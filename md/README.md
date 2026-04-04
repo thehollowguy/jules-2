@@ -108,3 +108,28 @@ loop example (player/enemy movement, collisions, waves, scoring, HP).
 ```bash
 cargo run --bin jules -- check game_arcade_showcase.jules
 ```
+
+## Chess ML learning environment + benchmark
+
+A high-throughput chess-like learning environment is available via:
+
+```bash
+cargo run --release --bin bench-chess-ml -- 50000 24
+```
+
+This runs the Jules training loop, reports steps/s, and compares against a Python baseline to verify runtime performance.
+
+
+## Jules-native ML chess script
+
+A toy ML chess training environment written directly in Jules is available at `ml_chess.jules`.
+
+```bash
+cargo run --bin jules -- run ml_chess.jules
+```
+
+To benchmark script execution vs Python baseline:
+
+```bash
+cargo run --release --bin bench-jules-ml-chess -- ml_chess.jules
+```
