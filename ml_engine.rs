@@ -1116,6 +1116,8 @@ pub struct OptimizerState {
     pub velocity_m: HashMap<u64, Vec<f32>>, // First moment (Adam)
     pub velocity_v: HashMap<u64, Vec<f32>>, // Second moment (Adam)
     pub step_count: u64,
+    pub beta1_pow: f32,
+    pub beta2_pow: f32,
 }
 
 impl OptimizerState {
@@ -1125,6 +1127,8 @@ impl OptimizerState {
             velocity_m: HashMap::new(),
             velocity_v: HashMap::new(),
             step_count: 0,
+            beta1_pow: 1.0,
+            beta2_pow: 1.0,
         }
     }
 }
@@ -1229,9 +1233,15 @@ impl Optimizer {
             momentum_vec.resize(weights.len(), 0.0);
         }
 
-        for i in 0..weights.len() {
-            let grad = if i < grads.len() { grads[i] } else { 0.0 };
+        let min_len = weights.len().min(grads.len());
+        for i in 0..min_len {
+            let grad = grads[i];
             momentum_vec[i] = momentum * momentum_vec[i] - lr * grad;
+            weights[i] += momentum_vec[i];
+        }
+        // If gradients are shorter, apply momentum decay only.
+        for i in min_len..weights.len() {
+            momentum_vec[i] *= momentum;
             weights[i] += momentum_vec[i];
         }
     }
@@ -1246,9 +1256,10 @@ impl Optimizer {
         state: &mut OptimizerState,
     ) {
         state.step_count += 1;
-        let step = state.step_count as f32;
-        let bias_correction1 = 1.0 - beta1.powf(step);
-        let bias_correction2 = 1.0 - beta2.powf(step);
+        state.beta1_pow *= beta1;
+        state.beta2_pow *= beta2;
+        let bias_correction1 = 1.0 - state.beta1_pow;
+        let bias_correction2 = 1.0 - state.beta2_pow;
 
         let m = state
             .velocity_m
@@ -1258,17 +1269,23 @@ impl Optimizer {
             .velocity_v
             .entry(0)
             .or_insert_with(|| vec![0.0; weights.len()]);
+        if m.len() != weights.len() {
+            m.resize(weights.len(), 0.0);
+        }
+        if v.len() != weights.len() {
+            v.resize(weights.len(), 0.0);
+        }
 
-        for i in 0..weights.len() {
-            if i < grads.len() {
-                m[i] = beta1 * m[i] + (1.0 - beta1) * grads[i];
-                v[i] = beta2 * v[i] + (1.0 - beta2) * grads[i] * grads[i];
+        let min_len = weights.len().min(grads.len());
+        for i in 0..min_len {
+            let g = grads[i];
+            m[i] = beta1 * m[i] + (1.0 - beta1) * g;
+            v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
 
-                let m_hat = m[i] / bias_correction1;
-                let v_hat = v[i] / bias_correction2;
+            let m_hat = m[i] / bias_correction1.max(1e-12);
+            let v_hat = v[i] / bias_correction2.max(1e-12);
 
-                weights[i] -= lr * m_hat / (v_hat.sqrt() + eps);
-            }
+            weights[i] -= lr * m_hat / (v_hat.sqrt() + eps);
         }
     }
 
@@ -1303,12 +1320,15 @@ impl Optimizer {
             .velocity_v
             .entry(0)
             .or_insert_with(|| vec![0.0; weights.len()]);
+        if v.len() != weights.len() {
+            v.resize(weights.len(), 0.0);
+        }
 
-        for i in 0..weights.len() {
-            if i < grads.len() {
-                v[i] = rho * v[i] + (1.0 - rho) * grads[i] * grads[i];
-                weights[i] -= lr * grads[i] / (v[i].sqrt() + eps);
-            }
+        let min_len = weights.len().min(grads.len());
+        for i in 0..min_len {
+            let g = grads[i];
+            v[i] = rho * v[i] + (1.0 - rho) * g * g;
+            weights[i] -= lr * g / (v[i].sqrt() + eps);
         }
     }
 }
@@ -1531,7 +1551,11 @@ impl LossFunctions {
 
             for i in 0..classes {
                 let p = (row[i] - row_max).exp() * inv_sum;
-                grad[base + i] = if i == class_idx { (p - 1.0) * inv_n } else { p * inv_n };
+                grad[base + i] = if i == class_idx {
+                    (p - 1.0) * inv_n
+                } else {
+                    p * inv_n
+                };
             }
         }
 
@@ -1626,7 +1650,9 @@ mod tests_ml_ext {
             shape: vec![2, 3],
             data: vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0],
         };
-        let probs = logits.softmax_last_dim().expect("softmax_last_dim should succeed");
+        let probs = logits
+            .softmax_last_dim()
+            .expect("softmax_last_dim should succeed");
         assert_eq!(probs.shape, vec![2, 3]);
 
         let row0: f32 = probs.data[0..3].iter().sum();
