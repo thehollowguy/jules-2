@@ -41,6 +41,12 @@ pub trait GpuBackendImpl: Send + Sync {
     /// Download data from GPU
     fn download(&self, handle: &GpuBufferHandle) -> Vec<f32>;
 
+    /// Download data from GPU into caller-provided output buffer.
+    fn download_into(&self, handle: &GpuBufferHandle, out: &mut [f32]) -> Result<(), String>;
+
+    /// Overwrite an existing GPU buffer with new data
+    fn write(&self, handle: &GpuBufferHandle, data: &[f32]) -> Result<(), String>;
+
     /// Matrix multiplication: C = A @ B
     fn matmul(
         &self,
@@ -137,6 +143,30 @@ impl GpuBackendImpl for CpuBackend {
             .get(&handle.id)
             .map(|b| b.data.clone())
             .unwrap_or_default()
+    }
+
+    fn download_into(&self, handle: &GpuBufferHandle, out: &mut [f32]) -> Result<(), String> {
+        let buffers = self.buffers.lock().unwrap();
+        let src = buffers
+            .get(&handle.id)
+            .ok_or("Buffer not found for download_into")?;
+        if src.data.len() != out.len() {
+            return Err("download_into output size mismatch".into());
+        }
+        out.copy_from_slice(&src.data);
+        Ok(())
+    }
+
+    fn write(&self, handle: &GpuBufferHandle, data: &[f32]) -> Result<(), String> {
+        let mut buffers = self.buffers.lock().unwrap();
+        let buf = buffers
+            .get_mut(&handle.id)
+            .ok_or("Buffer not found for write")?;
+        if buf.data.len() != data.len() {
+            return Err("Write size does not match buffer size".into());
+        }
+        buf.data.copy_from_slice(data);
+        Ok(())
     }
 
     fn matmul(
@@ -270,7 +300,46 @@ fn matmul_blocked_rows(
 fn accelerated_matmul(a_data: &[f32], b_data: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let bt = transpose_2d(b_data, k, n);
     let mut out = vec![0.0f32; m * n];
-    matmul_blocked_rows(a_data, &bt, 0, m, k, n, &mut out, 0);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if threads > 1 && m >= 128 && n >= 64 {
+        let rows_per_worker = m.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for tid in 0..threads {
+                let row_start = tid * rows_per_worker;
+                let row_end = (row_start + rows_per_worker).min(m);
+                if row_start >= row_end {
+                    continue;
+                }
+                let a_ref = a_data;
+                let bt_ref = &bt;
+                handles.push(scope.spawn(move || {
+                    let mut chunk = vec![0.0f32; (row_end - row_start) * n];
+                    matmul_blocked_rows(
+                        a_ref,
+                        bt_ref,
+                        row_start,
+                        row_end,
+                        k,
+                        n,
+                        &mut chunk,
+                        row_start,
+                    );
+                    (row_start, chunk)
+                }));
+            }
+
+            for h in handles {
+                let (row_start, chunk) = h.join().expect("worker thread panicked");
+                let dst = row_start * n;
+                out[dst..dst + chunk.len()].copy_from_slice(&chunk);
+            }
+        });
+    } else {
+        matmul_blocked_rows(a_data, &bt, 0, m, k, n, &mut out, 0);
+    }
     out
 }
 
@@ -355,6 +424,30 @@ impl GpuBackendImpl for WgpuBackend {
             .get(&handle.id)
             .map(|buf| buf.data.clone())
             .unwrap_or_default()
+    }
+
+    fn download_into(&self, handle: &GpuBufferHandle, out: &mut [f32]) -> Result<(), String> {
+        let buffers = self.buffers.lock().unwrap();
+        let src = buffers
+            .get(&handle.id)
+            .ok_or("Buffer not found for download_into")?;
+        if src.data.len() != out.len() {
+            return Err("download_into output size mismatch".into());
+        }
+        out.copy_from_slice(&src.data);
+        Ok(())
+    }
+
+    fn write(&self, handle: &GpuBufferHandle, data: &[f32]) -> Result<(), String> {
+        let mut buffers = self.buffers.lock().unwrap();
+        let buf = buffers
+            .get_mut(&handle.id)
+            .ok_or("Buffer not found for write")?;
+        if buf.data.len() != data.len() {
+            return Err("Write size does not match buffer size".into());
+        }
+        buf.data.copy_from_slice(data);
+        Ok(())
     }
 
     fn matmul(
@@ -613,6 +706,14 @@ impl GpuBackend {
         self.as_impl().download(handle)
     }
 
+    pub fn download_into(&self, handle: &GpuBufferHandle, out: &mut [f32]) -> Result<(), String> {
+        self.as_impl().download_into(handle, out)
+    }
+
+    pub fn write(&self, handle: &GpuBufferHandle, data: &[f32]) -> Result<(), String> {
+        self.as_impl().write(handle, data)
+    }
+
     pub fn matmul(
         &self,
         a: &GpuBufferHandle,
@@ -776,6 +877,22 @@ impl GpuMemoryManager {
 
     pub fn download(&self, handle: &GpuBufferHandle) -> Vec<f32> {
         self.backend.download(handle)
+    }
+
+    pub fn download_into(&self, handle: &GpuBufferHandle, out: &mut [f32]) -> Result<(), String> {
+        self.backend.download_into(handle, out)
+    }
+
+    pub fn write(&self, handle: &GpuBufferHandle, data: &[f32]) -> Result<(), String> {
+        let mut allocated = self.allocated.lock().unwrap();
+        let local = allocated
+            .get_mut(&handle.id)
+            .ok_or("Buffer not managed by this memory manager")?;
+        if local.data.len() != data.len() {
+            return Err("Write size does not match managed buffer size".into());
+        }
+        local.data.copy_from_slice(data);
+        self.backend.write(handle, data)
     }
 }
 
