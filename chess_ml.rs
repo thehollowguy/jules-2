@@ -2,7 +2,6 @@ use crate::gpu_backend::{GpuBackend, GpuMemoryManager};
 use std::time::{Duration, Instant};
 
 const FEAT_DIM: usize = 8;
-const TACTICAL_LANES: [f32; 4] = [0.00f32, 0.02, 0.06, 0.10];
 const MAX_ABS_FEATURE: f32 = 64.0;
 const MAX_ABS_WEIGHT: f32 = 1_000_000.0;
 const MAX_ABS_REWARD: f32 = 2.0;
@@ -25,15 +24,14 @@ impl GradBuffer {
     #[inline]
     fn push(&mut self, features: &[f32; FEAT_DIM], reward: f32) {
         // unrolled update keeps this tiny hot path branch-light and bounds-check free.
-        let r = sanitize_scalar(reward).clamp(-MAX_ABS_REWARD, MAX_ABS_REWARD);
-        self.acc[0] += r * sanitize_scalar(features[0]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[1] += r * sanitize_scalar(features[1]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[2] += r * sanitize_scalar(features[2]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[3] += r * sanitize_scalar(features[3]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[4] += r * sanitize_scalar(features[4]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[5] += r * sanitize_scalar(features[5]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[6] += r * sanitize_scalar(features[6]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[7] += r * sanitize_scalar(features[7]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
+        self.acc[0] += reward * features[0];
+        self.acc[1] += reward * features[1];
+        self.acc[2] += reward * features[2];
+        self.acc[3] += reward * features[3];
+        self.acc[4] += reward * features[4];
+        self.acc[5] += reward * features[5];
+        self.acc[6] += reward * features[6];
+        self.acc[7] += reward * features[7];
         self.count += 1;
     }
 
@@ -51,20 +49,8 @@ impl GradBuffer {
         weights[5] += self.acc[5] * scale;
         weights[6] += self.acc[6] * scale;
         weights[7] += self.acc[7] * scale;
-        for w in weights.iter_mut() {
-            *w = sanitize_scalar(*w).clamp(-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT);
-        }
         self.acc = [0.0; FEAT_DIM];
         self.count = 0;
-    }
-}
-
-#[inline]
-fn sanitize_scalar(x: f32) -> f32 {
-    if x.is_finite() {
-        x
-    } else {
-        0.0
     }
 }
 
@@ -623,6 +609,11 @@ pub fn train_chess_policy_gpu(
     let envs = envs.max(1).min(4096);
     let mut rng = XorShift64::new(seed);
     let mut weights = [0.03f32, 0.0, 0.0, 0.2, 0.01, -0.01, 0.0, 0.0];
+    // 4-action projection weights [8,4]
+    let mut proj = [
+        0.0f32, 0.02, 0.06, 0.10, 1.0, 1.0, 1.2, 1.2, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    ];
 
     let backend = GpuBackend::auto_select();
     let mm = GpuMemoryManager::new(backend);
@@ -633,11 +624,10 @@ pub fn train_chess_policy_gpu(
     let start = Instant::now();
     let mut feats_flat = vec![0.0f32; envs * FEAT_DIM];
     let mut feats_rows = vec![[0.0f32; FEAT_DIM]; envs];
-    let mut scores = vec![0.0f32; envs];
+    let mut scores = vec![0.0f32; envs * 4];
     let a = mm.allocate(vec![envs, FEAT_DIM], 0.0)?;
-    let b = mm.allocate_from_data(vec![FEAT_DIM, 1], weights.to_vec())?;
-    let out = mm.allocate(vec![envs, 1], 0.0)?;
-    let mut weights_dirty = true;
+    let b = mm.allocate_from_data(vec![FEAT_DIM, 4], proj.to_vec())?;
+    let out = mm.allocate(vec![envs, 4], 0.0)?;
 
     for _ in 0..episodes {
         soa.reset();
@@ -660,10 +650,6 @@ pub fn train_chess_policy_gpu(
             }
 
             mm.write(&a, &feats_flat)?;
-            if weights_dirty {
-                mm.write(&b, &weights)?;
-                weights_dirty = false;
-            }
             mm.matmul(&a, &b, &out)?;
             mm.download_into(&out, &mut scores)?;
 

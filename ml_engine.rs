@@ -1235,7 +1235,7 @@ impl Optimizer {
 
         let min_len = weights.len().min(grads.len());
         for i in 0..min_len {
-            let grad = if grads[i].is_finite() { grads[i] } else { 0.0 };
+            let grad = grads[i];
             momentum_vec[i] = momentum * momentum_vec[i] - lr * grad;
             weights[i] += momentum_vec[i];
         }
@@ -1278,7 +1278,7 @@ impl Optimizer {
 
         let min_len = weights.len().min(grads.len());
         for i in 0..min_len {
-            let g = if grads[i].is_finite() { grads[i] } else { 0.0 };
+            let g = grads[i];
             m[i] = beta1 * m[i] + (1.0 - beta1) * g;
             v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
 
@@ -1326,7 +1326,7 @@ impl Optimizer {
 
         let min_len = weights.len().min(grads.len());
         for i in 0..min_len {
-            let g = if grads[i].is_finite() { grads[i] } else { 0.0 };
+            let g = grads[i];
             v[i] = rho * v[i] + (1.0 - rho) * g * g;
             weights[i] -= lr * g / (v[i].sqrt() + eps);
         }

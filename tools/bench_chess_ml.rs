@@ -9,7 +9,6 @@ use jules::chess_ml::{
     eval_policy_vs_random, train_chess_policy_batched, train_chess_policy_batched_from,
     train_chess_policy_gpu, train_chess_policy_soa,
 };
-use matrixmultiply::sgemm;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -119,91 +118,6 @@ fn main() {
             break;
         }
     }
-
-    // Real NN benchmark path (~9M parameters) for chess-policy style training throughput.
-    let nn_steps = 6usize;
-    let nn_batch = 32usize;
-    let nn = nn9m_train_like_sgemm(nn_steps, nn_batch);
-    println!(
-        "NN-9M train-like: steps={} batch={} params={} elapsed={:.3}s {:.2} steps/s checksum={:.4}",
-        nn_steps, nn_batch, nn.0, nn.1, nn.2, nn.3
-    );
-}
-
-fn nn9m_train_like_sgemm(steps: usize, batch: usize) -> (usize, f64, f64, f32) {
-    // Chess-style policy network dimensions:
-    // 768 -> 6144 -> 704  (9,043,968 params)
-    let in_dim = 768usize;
-    let hidden = 6144usize;
-    let out_dim = 704usize;
-    let params = in_dim * hidden + hidden * out_dim;
-
-    let mut w1 = init_vec(in_dim * hidden, 11);
-    let mut w2 = init_vec(hidden * out_dim, 22);
-    let x = init_vec(batch * in_dim, 33);
-    let mut h = vec![0.0f32; batch * hidden];
-    let mut y = vec![0.0f32; batch * out_dim];
-    let mut checksum = 0.0f32;
-
-    let t0 = Instant::now();
-    for step in 0..steps {
-        unsafe {
-            sgemm(
-                batch,
-                in_dim,
-                hidden,
-                1.0,
-                x.as_ptr(),
-                in_dim as isize,
-                1,
-                w1.as_ptr(),
-                hidden as isize,
-                1,
-                0.0,
-                h.as_mut_ptr(),
-                hidden as isize,
-                1,
-            );
-            sgemm(
-                batch,
-                hidden,
-                out_dim,
-                1.0,
-                h.as_ptr(),
-                hidden as isize,
-                1,
-                w2.as_ptr(),
-                out_dim as isize,
-                1,
-                0.0,
-                y.as_mut_ptr(),
-                out_dim as isize,
-                1,
-            );
-        }
-        // low-overhead checksum to keep optimizer from dead-code eliminating the loop.
-        let idx = (step.wrapping_mul(9973)) % y.len().max(1);
-        checksum += y[idx] * 1e-6;
-        // lightweight train-like update/regularization step
-        for v in &mut w1 {
-            *v *= 0.99998;
-        }
-        for v in &mut w2 {
-            *v *= 0.99998;
-        }
-    }
-    let dt = t0.elapsed().as_secs_f64();
-    (params, dt, steps as f64 / dt.max(1e-9), checksum)
-}
-
-fn init_vec(n: usize, seed: u64) -> Vec<f32> {
-    let mut x = seed;
-    let mut out = vec![0.0f32; n];
-    for v in &mut out {
-        x = x.wrapping_mul(1664525).wrapping_add(1013904223);
-        *v = (((x >> 8) & 0xFFFF) as f32 / 65535.0) * 0.02 - 0.01;
-    }
-    out
 }
 
 fn python_baseline(episodes: usize, max_steps: usize) -> Result<(f64, f64), String> {
