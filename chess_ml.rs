@@ -24,15 +24,14 @@ impl GradBuffer {
     #[inline]
     fn push(&mut self, features: &[f32; FEAT_DIM], reward: f32) {
         // unrolled update keeps this tiny hot path branch-light and bounds-check free.
-        let r = sanitize_scalar(reward).clamp(-MAX_ABS_REWARD, MAX_ABS_REWARD);
-        self.acc[0] += r * sanitize_scalar(features[0]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[1] += r * sanitize_scalar(features[1]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[2] += r * sanitize_scalar(features[2]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[3] += r * sanitize_scalar(features[3]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[4] += r * sanitize_scalar(features[4]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[5] += r * sanitize_scalar(features[5]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[6] += r * sanitize_scalar(features[6]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
-        self.acc[7] += r * sanitize_scalar(features[7]).clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE);
+        self.acc[0] += reward * features[0];
+        self.acc[1] += reward * features[1];
+        self.acc[2] += reward * features[2];
+        self.acc[3] += reward * features[3];
+        self.acc[4] += reward * features[4];
+        self.acc[5] += reward * features[5];
+        self.acc[6] += reward * features[6];
+        self.acc[7] += reward * features[7];
         self.count += 1;
     }
 
@@ -50,20 +49,8 @@ impl GradBuffer {
         weights[5] += self.acc[5] * scale;
         weights[6] += self.acc[6] * scale;
         weights[7] += self.acc[7] * scale;
-        for w in weights.iter_mut() {
-            *w = sanitize_scalar(*w).clamp(-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT);
-        }
         self.acc = [0.0; FEAT_DIM];
         self.count = 0;
-    }
-}
-
-#[inline]
-fn sanitize_scalar(x: f32) -> f32 {
-    if x.is_finite() {
-        x
-    } else {
-        0.0
     }
 }
 
