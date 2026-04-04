@@ -338,7 +338,7 @@ impl Parser {
                     let name = raw.trim_start_matches("At").to_lowercase();
                     self.advance();
                     let args = if self.is(&TokenKind::LParen) {
-                        self.parse_call_args().unwrap_or_default()
+                        self.parse_named_attr_args().unwrap_or_default()
                     } else { vec![] };
                     Attribute::Named { name, args }
                 }
@@ -360,20 +360,49 @@ impl Parser {
     }
 
     fn parse_named_attr_args(&mut self) -> ParseResult<Vec<Expr>> {
-        // Support architecture shorthand: @PPO(124->62->32)
-        if let Some(expr) = self.try_parse_architecture_shorthand()? {
-            return Ok(vec![expr]);
+        self.expect(&TokenKind::LParen)?;
+        let mut args = Vec::new();
+
+        if self.eat(&TokenKind::RParen) {
+            return Ok(args);
         }
-        self.parse_call_args()
+
+        // Support architecture shorthand as first positional arg:
+        //   @PPO(124->248->68, lr = 0.0003)
+        if let Some(expr) = self.try_parse_architecture_chain_expr()? {
+            args.push(expr);
+        } else {
+            // Keep parity with call args: support `name: value` as a shorthand.
+            if matches!(&self.peek().kind, TokenKind::Ident(_))
+                && self.peek2().kind == TokenKind::Colon
+            {
+                self.advance();
+                self.advance();
+            }
+            args.push(self.parse_expr(0)?);
+        }
+
+        while self.eat(&TokenKind::Comma) {
+            if self.is(&TokenKind::RParen) {
+                break;
+            }
+            if matches!(&self.peek().kind, TokenKind::Ident(_))
+                && self.peek2().kind == TokenKind::Colon
+            {
+                self.advance();
+                self.advance();
+            }
+            args.push(self.parse_expr(0)?);
+        }
+
+        self.expect(&TokenKind::RParen)?;
+        Ok(args)
     }
 
-    fn try_parse_architecture_shorthand(&mut self) -> ParseResult<Option<Expr>> {
+    fn try_parse_architecture_chain_expr(&mut self) -> ParseResult<Option<Expr>> {
         let save = self.pos;
-        if !self.eat(&TokenKind::LParen) {
-            return Ok(None);
-        }
-
         let mut parts = Vec::new();
+        let mut saw_arrow = false;
         loop {
             match &self.peek().kind {
                 TokenKind::IntLit { value, .. } => {
@@ -390,13 +419,14 @@ impl Parser {
                 }
             }
             if self.eat(&TokenKind::Arrow) {
+                saw_arrow = true;
                 parts.push("->".to_string());
                 continue;
             }
             break;
         }
 
-        if !self.eat(&TokenKind::RParen) {
+        if !saw_arrow {
             self.pos = save;
             return Ok(None);
         }
@@ -414,6 +444,31 @@ impl Parser {
 // =============================================================================
 
 impl Parser {
+    fn stmt_if_to_expr(stmt: &Stmt) -> Option<Expr> {
+        match stmt {
+            Stmt::If { span, cond, then, else_ } => {
+                let else_ = else_.as_ref().and_then(|branch| match branch.as_ref() {
+                    IfOrBlock::Block(b) => Some(Box::new(b.clone())),
+                    IfOrBlock::If(inner) => {
+                        let nested = Self::stmt_if_to_expr(inner)?;
+                        Some(Box::new(Block {
+                            span: nested.span(),
+                            stmts: vec![],
+                            tail: Some(Box::new(nested)),
+                        }))
+                    }
+                });
+                Some(Expr::IfExpr {
+                    span: *span,
+                    cond: Box::new(cond.clone()),
+                    then: Box::new(then.clone()),
+                    else_,
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn parse_fn(&mut self, attrs: Vec<Attribute>) -> ParseResult<FnDecl> {
         let start = self.current_span();
         let is_async = self.eat(&TokenKind::KwAsync);
@@ -427,7 +482,16 @@ impl Parser {
         } else { None };
 
         let body = if self.is(&TokenKind::LBrace) {
-            Some(self.parse_block()?)
+            let mut body = self.parse_block()?;
+            if ret_ty.is_some() && body.tail.is_none() {
+                if let Some(stmt) = body.stmts.last().cloned() {
+                    if let Some(expr) = Self::stmt_if_to_expr(&stmt) {
+                        body.stmts.pop();
+                        body.tail = Some(Box::new(expr));
+                    }
+                }
+            }
+            Some(body)
         } else {
             self.eat(&TokenKind::Semicolon);
             None
@@ -833,7 +897,9 @@ impl Parser {
         let tail = if let Some(Stmt::Expr { expr, has_semi: false, .. }) = stmts.last().cloned() {
             stmts.pop();
             Some(Box::new(expr))
-        } else { None };
+        } else {
+            None
+        };
 
         Ok(Block { span: start.merge(end), stmts, tail })
     }
@@ -1217,7 +1283,7 @@ fn prefix_bp(kind: &TokenKind) -> Option<u8> {
     match kind {
         TokenKind::Minus | TokenKind::Bang | TokenKind::Tilde
         | TokenKind::Ampersand | TokenKind::Star => Some(25),
-        TokenKind::KwGrad => Some(24),
+        TokenKind::KwGrad => Some(28),
         _ => None,
     }
 }
@@ -1301,7 +1367,7 @@ impl Parser {
         // grad expr
         if matches!(kind, TokenKind::KwGrad) {
             self.advance();
-            let inner = self.parse_expr(24)?;
+            let inner = self.parse_expr(28)?;
             return Ok(Expr::Grad { span, inner: Box::new(inner) });
         }
 
@@ -2910,6 +2976,17 @@ mod tests {
         let prog = ok("@grad model M { input 1 output 1 linear }");
         let Item::Model(m) = &prog.items[0] else { panic!() };
         assert!(m.attrs.contains(&Attribute::Grad));
+    }
+
+    #[test]
+    fn test_parse_custom_ai_attr_with_arch_and_lr() {
+        let prog = ok("@PPO(124->248->68, lr = 0.0003) agent Bot {}");
+        let Item::Agent(a) = &prog.items[0] else { panic!() };
+        let attr = a.attrs.iter().find(|x| matches!(x, Attribute::Named { name, .. } if name == "ppo"))
+            .expect("expected @ppo attribute");
+        let Attribute::Named { args, .. } = attr else { panic!() };
+        assert!(matches!(&args[0], Expr::StrLit { value, .. } if value == "124->248->68"));
+        assert!(matches!(&args[1], Expr::Assign { .. }));
     }
 
     // ── Recovery from syntax errors ───────────────────────────────────────────

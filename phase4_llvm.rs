@@ -1,23 +1,8 @@
-//! Phase 4 LLVM integration hooks.
-//!
-//! This crate currently keeps LLVM optional behind a feature flag; this module
-//! defines a small adapter surface so feature-enabled builds have a concrete
-//! target to wire into.
+//! Phase 4 LLVM placeholder module.
+//! This repository currently keeps LLVM lowering behind a feature flag while implementation is in progress.
 
-#[derive(Clone, Debug, Default)]
-pub struct LlvmPlan {
-    pub function_count: usize,
-    pub uses_simd: bool,
-}
-
-impl LlvmPlan {
-    #[inline]
-    pub fn estimated_speedup(&self) -> f32 {
-        let base = 1.0 + (self.function_count as f32 * 0.01);
-        if self.uses_simd {
-            base * 1.15
-        } else {
-            base
-        }
-    }
+/// Returns whether the optional Phase 4 LLVM backend is available.
+#[must_use]
+pub fn is_available() -> bool {
+    false
 }

@@ -182,6 +182,57 @@ pub enum JulesError {
     UnknownError = 255,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub enum JulesMemoryPool {
+    Core = 0,
+    Extra = 1,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct JulesMlMemorySnapshot {
+    pub min_bytes: usize,
+    pub extra_bytes: usize,
+    pub core_used_bytes: usize,
+    pub extra_used_bytes: usize,
+    pub total_used_bytes: usize,
+    pub total_cap_bytes: usize,
+    pub headroom_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct JulesMlMemoryState {
+    min_bytes: usize,
+    extra_bytes: usize,
+    core_used_bytes: usize,
+    extra_used_bytes: usize,
+}
+
+impl JulesMlMemoryState {
+    fn total_cap_bytes(self) -> usize {
+        self.min_bytes.saturating_add(self.extra_bytes)
+    }
+
+    fn total_used_bytes(self) -> usize {
+        self.core_used_bytes.saturating_add(self.extra_used_bytes)
+    }
+
+    fn as_snapshot(self) -> JulesMlMemorySnapshot {
+        let total_cap = self.total_cap_bytes();
+        let total_used = self.total_used_bytes();
+        JulesMlMemorySnapshot {
+            min_bytes: self.min_bytes,
+            extra_bytes: self.extra_bytes,
+            core_used_bytes: self.core_used_bytes,
+            extra_used_bytes: self.extra_used_bytes,
+            total_used_bytes: total_used,
+            total_cap_bytes: total_cap,
+            headroom_bytes: total_cap.saturating_sub(total_used),
+        }
+    }
+}
+
 // Global tensor storage for C FFI
 lazy_static! {
     static ref TENSOR_STORAGE: Mutex<HashMap<u64, Vec<f32>>> = Mutex::new(HashMap::new());
@@ -189,6 +240,12 @@ lazy_static! {
     static ref NEXT_TENSOR_ID: Mutex<u64> = Mutex::new(1);
     static ref PHYSICS_STATE: Mutex<HashMap<u64, (f32, f32, f32)>> = Mutex::new(HashMap::new());
     static ref NEXT_BODY_ID: Mutex<u64> = Mutex::new(1);
+    static ref ML_MEMORY_STATE: Mutex<JulesMlMemoryState> = Mutex::new(JulesMlMemoryState {
+        min_bytes: 0,
+        extra_bytes: usize::MAX / 2,
+        core_used_bytes: 0,
+        extra_used_bytes: 0,
+    });
 }
 
 // =============================================================================
@@ -387,6 +444,97 @@ pub extern "C" fn jules_physics_step(_ctx: *mut JulesContext, dt: f32) {
 }
 
 // =============================================================================
+// C FFI: ML memory budget controls
+// =============================================================================
+
+#[no_mangle]
+pub extern "C" fn jules_ml_memory_configure(min_bytes: usize, extra_bytes: usize) -> JulesError {
+    let mut state = ML_MEMORY_STATE.lock().unwrap();
+    let new_total = min_bytes.saturating_add(extra_bytes);
+    let used_total = state.total_used_bytes();
+    if used_total > new_total || state.core_used_bytes > min_bytes || state.extra_used_bytes > extra_bytes {
+        return JulesError::OutOfMemory;
+    }
+    state.min_bytes = min_bytes;
+    state.extra_bytes = extra_bytes;
+    JulesError::Success
+}
+
+#[no_mangle]
+pub extern "C" fn jules_ml_memory_acquire(bytes: usize, pool: JulesMemoryPool) -> JulesError {
+    let mut state = ML_MEMORY_STATE.lock().unwrap();
+    if bytes == 0 {
+        return JulesError::Success;
+    }
+
+    match pool {
+        JulesMemoryPool::Core => {
+            let next = state.core_used_bytes.saturating_add(bytes);
+            if next > state.min_bytes {
+                return JulesError::OutOfMemory;
+            }
+            state.core_used_bytes = next;
+        }
+        JulesMemoryPool::Extra => {
+            let next = state.extra_used_bytes.saturating_add(bytes);
+            if next > state.extra_bytes {
+                return JulesError::OutOfMemory;
+            }
+            state.extra_used_bytes = next;
+        }
+    }
+
+    if state.total_used_bytes() > state.total_cap_bytes() {
+        // Rollback on overflow of the total budget.
+        match pool {
+            JulesMemoryPool::Core => {
+                state.core_used_bytes = state.core_used_bytes.saturating_sub(bytes);
+            }
+            JulesMemoryPool::Extra => {
+                state.extra_used_bytes = state.extra_used_bytes.saturating_sub(bytes);
+            }
+        }
+        return JulesError::OutOfMemory;
+    }
+
+    JulesError::Success
+}
+
+#[no_mangle]
+pub extern "C" fn jules_ml_memory_release(bytes: usize, pool: JulesMemoryPool) -> JulesError {
+    let mut state = ML_MEMORY_STATE.lock().unwrap();
+    match pool {
+        JulesMemoryPool::Core => {
+            state.core_used_bytes = state.core_used_bytes.saturating_sub(bytes);
+        }
+        JulesMemoryPool::Extra => {
+            state.extra_used_bytes = state.extra_used_bytes.saturating_sub(bytes);
+        }
+    }
+    JulesError::Success
+}
+
+#[no_mangle]
+pub extern "C" fn jules_ml_memory_reset_usage() -> JulesError {
+    let mut state = ML_MEMORY_STATE.lock().unwrap();
+    state.core_used_bytes = 0;
+    state.extra_used_bytes = 0;
+    JulesError::Success
+}
+
+#[no_mangle]
+pub extern "C" fn jules_ml_memory_snapshot(out: *mut JulesMlMemorySnapshot) -> JulesError {
+    if out.is_null() {
+        return JulesError::InvalidArg;
+    }
+    let state = ML_MEMORY_STATE.lock().unwrap();
+    unsafe {
+        *out = state.as_snapshot();
+    }
+    JulesError::Success
+}
+
+// =============================================================================
 // C FFI: Error handling
 // =============================================================================
 
@@ -441,5 +589,53 @@ pub extern "C" fn julius_free_string(s: *mut c_char) {
         unsafe {
             let _ = CString::from_raw(s);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ml_memory_budget_enforces_core_and_extra_caps() {
+        assert!(matches!(
+            jules_ml_memory_configure(1024, 512),
+            JulesError::Success
+        ));
+        assert!(matches!(jules_ml_memory_reset_usage(), JulesError::Success));
+
+        assert!(matches!(
+            jules_ml_memory_acquire(1024, JulesMemoryPool::Core),
+            JulesError::Success
+        ));
+        assert!(matches!(
+            jules_ml_memory_acquire(1, JulesMemoryPool::Core),
+            JulesError::OutOfMemory
+        ));
+        assert!(matches!(
+            jules_ml_memory_acquire(512, JulesMemoryPool::Extra),
+            JulesError::Success
+        ));
+        assert!(matches!(
+            jules_ml_memory_acquire(1, JulesMemoryPool::Extra),
+            JulesError::OutOfMemory
+        ));
+
+        let mut snap = JulesMlMemorySnapshot {
+            min_bytes: 0,
+            extra_bytes: 0,
+            core_used_bytes: 0,
+            extra_used_bytes: 0,
+            total_used_bytes: 0,
+            total_cap_bytes: 0,
+            headroom_bytes: 0,
+        };
+        assert!(matches!(
+            jules_ml_memory_snapshot(&mut snap as *mut JulesMlMemorySnapshot),
+            JulesError::Success
+        ));
+        assert_eq!(snap.total_cap_bytes, 1536);
+        assert_eq!(snap.total_used_bytes, 1536);
+        assert_eq!(snap.headroom_bytes, 0);
     }
 }
