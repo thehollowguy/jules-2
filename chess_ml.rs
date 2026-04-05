@@ -5,6 +5,7 @@ const FEAT_DIM: usize = 8;
 const MAX_ABS_FEATURE: f32 = 64.0;
 const MAX_ABS_WEIGHT: f32 = 1_000_000.0;
 const MAX_ABS_REWARD: f32 = 2.0;
+const TACTICAL_LANES: [f32; 4] = [0.00, 0.02, 0.06, 0.10];
 
 #[derive(Clone, Debug)]
 struct GradBuffer {
@@ -85,6 +86,18 @@ fn infer_action_noalloc(
         }
     }
     best_idx
+}
+
+#[inline(always)]
+fn dot8(a: &[f32; FEAT_DIM], b: &[f32; FEAT_DIM]) -> f32 {
+    a[0] * b[0]
+        + a[1] * b[1]
+        + a[2] * b[2]
+        + a[3] * b[3]
+        + a[4] * b[4]
+        + a[5] * b[5]
+        + a[6] * b[6]
+        + a[7] * b[7]
 }
 
 #[derive(Clone)]
@@ -299,6 +312,8 @@ impl Board {
     fn apply_move(&mut self, mv: Move) -> f32 {
         let from_b = 1u64 << mv.from;
         let to_b = 1u64 << mv.to;
+        let from_rank = (mv.from >> 3) as f32;
+        let to_rank = (mv.to >> 3) as f32;
         let mut reward = 0.0;
         if self.white_to_move {
             if self.white_king == mv.from {
@@ -306,19 +321,19 @@ impl Board {
             } else {
                 self.white_pawns &= !from_b;
                 self.white_pawns |= to_b;
-                self.white_advance_sum += ((mv.to / 8) as f32) - ((mv.from / 8) as f32);
+                self.white_advance_sum += to_rank - from_rank;
             }
             if (self.black_pawns & to_b) != 0 {
                 self.black_pawns &= !to_b;
                 self.black_pawn_count -= 1;
-                self.black_advance_sum -= 7.0 - ((mv.to / 8) as f32);
+                self.black_advance_sum -= 7.0 - to_rank;
                 reward += 0.25;
             }
             if self.black_king == mv.to {
                 self.done = true;
                 reward += 1.0;
             }
-            if mv.to / 8 == 7 {
+            if mv.to >= 56 {
                 reward += 0.4;
             }
         } else {
@@ -327,19 +342,19 @@ impl Board {
             } else {
                 self.black_pawns &= !from_b;
                 self.black_pawns |= to_b;
-                self.black_advance_sum += ((mv.from / 8) as f32) - ((mv.to / 8) as f32);
+                self.black_advance_sum += from_rank - to_rank;
             }
             if (self.white_pawns & to_b) != 0 {
                 self.white_pawns &= !to_b;
                 self.white_pawn_count -= 1;
-                self.white_advance_sum -= (mv.to / 8) as f32;
+                self.white_advance_sum -= to_rank;
                 reward -= 0.25;
             }
             if self.white_king == mv.to {
                 self.done = true;
                 reward -= 1.0;
             }
-            if mv.to / 8 == 0 {
+            if mv.to < 8 {
                 reward -= 0.4;
             }
         }
@@ -423,19 +438,15 @@ pub fn train_chess_policy_batched_from(
                 break;
             }
             let f = b.features();
-            let mut base_score = 0.0f32;
-            for k in 0..FEAT_DIM {
-                base_score += f[k] * weights[k];
-            }
+            let base_score = dot8(&f, &weights);
             let mut best_i = 0usize;
             let mut best_score = f32::MIN;
-            for (i, mv) in mv_buf[..n].iter().enumerate() {
-                let tactical = if b.white_to_move {
-                    (mv.to >> 3) as f32 * 0.02
-                } else {
-                    (7 - (mv.to >> 3)) as f32 * 0.02
-                };
-                let score = base_score + tactical + (rng.next_f32() - 0.5) * 0.01;
+            let tactical_sign = if b.white_to_move { 1.0f32 } else { -1.0f32 };
+            for i in 0..n {
+                let mv = mv_buf[i];
+                let score = base_score
+                    + tactical_sign * (mv.to >> 3) as f32 * 0.02
+                    + (rng.next_f32() - 0.5) * 0.01;
                 if score > best_score {
                     best_score = score;
                     best_i = i;
@@ -498,13 +509,11 @@ pub fn eval_policy_vs_random(
 
             let chosen = if b.white_to_move {
                 let f = b.features();
-                let mut base_score = 0.0f32;
-                for k in 0..FEAT_DIM {
-                    base_score += f[k] * weights[k];
-                }
+                let base_score = dot8(&f, &weights);
                 let mut best_i = 0usize;
                 let mut best_score = f32::MIN;
-                for (i, mv) in mv_buf[..n].iter().enumerate() {
+                for i in 0..n {
+                    let mv = mv_buf[i];
                     let tactical = (mv.to >> 3) as f32 * 0.02;
                     let score = base_score + tactical;
                     if score > best_score {
@@ -610,7 +619,7 @@ pub fn train_chess_policy_gpu(
     let mut rng = XorShift64::new(seed);
     let mut weights = [0.03f32, 0.0, 0.0, 0.2, 0.01, -0.01, 0.0, 0.0];
     // 4-action projection weights [8,4]
-    let mut proj = [
+    let proj = [
         0.0f32, 0.02, 0.06, 0.10, 1.0, 1.0, 1.2, 1.2, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
     ];
@@ -693,7 +702,6 @@ pub fn train_chess_policy_gpu(
 
             if grads.count >= batch_size.max(1) {
                 grads.apply(&mut weights, 0.0015);
-                weights_dirty = true;
             }
         }
     }

@@ -39,7 +39,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ── Public API (used by lib.rs re-exports) ────────────────────────────────────
 
@@ -425,6 +425,7 @@ impl Pipeline {
         let mut lexer = Lexer::new(&unit.source);
         let (tokens, lex_errors) = lexer.tokenize();
 
+        unit.diags.reserve(lex_errors.len() + (tokens.len() / 32).max(8));
         for e in lex_errors {
             unit.diags.push(Diag::from(e));
         }
@@ -625,6 +626,12 @@ pub struct CliArgs {
     pub fix_dry_run:   bool,
     pub fix_diff:      bool,
     pub fix_aggressive: bool,
+    pub estimate_params: usize,
+    pub estimate_batch: usize,
+    pub estimate_episodes: usize,
+    pub estimate_steps: usize,
+    pub estimate_envs: usize,
+    pub estimate_device: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -637,6 +644,7 @@ pub enum Command {
     Fmt,
     Repl,
     Train,
+    Estimate,
     Version,
 }
 
@@ -646,6 +654,12 @@ impl CliArgs {
             color:     std::env::var("NO_COLOR").is_err(), // respect NO_COLOR
             tab_width: 4,
             entry:     "main".into(),
+            estimate_params: 1_000_000,
+            estimate_batch: 64,
+            estimate_episodes: 100_000,
+            estimate_steps: 64,
+            estimate_envs: 1,
+            estimate_device: "cpu".into(),
             ..Default::default()
         };
 
@@ -663,6 +677,7 @@ impl CliArgs {
             Some("fmt")     => { out.command = Command::Fmt;     it.next(); }
             Some("repl")    => { out.command = Command::Repl;    it.next(); }
             Some("train")   => { out.command = Command::Train;   it.next(); }
+            Some("estimate")=> { out.command = Command::Estimate; it.next(); }
             Some("version") | Some("--version") | Some("-V") => {
                 out.command = Command::Version; it.next();
             }
@@ -703,6 +718,49 @@ impl CliArgs {
                 "--dry-run" => { out.fix_dry_run = true; }
                 "--diff" => { out.fix_diff = true; }
                 "--aggressive" => { out.fix_aggressive = true; }
+                "--params" => {
+                    out.estimate_params = it.next()
+                        .ok_or("--params requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--params must be a positive integer")?
+                        .max(1);
+                }
+                "--batch" => {
+                    out.estimate_batch = it.next()
+                        .ok_or("--batch requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--batch must be a positive integer")?
+                        .max(1);
+                }
+                "--episodes" => {
+                    out.estimate_episodes = it.next()
+                        .ok_or("--episodes requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--episodes must be a positive integer")?
+                        .max(1);
+                }
+                "--steps" => {
+                    out.estimate_steps = it.next()
+                        .ok_or("--steps requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--steps must be a positive integer")?
+                        .max(1);
+                }
+                "--envs" => {
+                    out.estimate_envs = it.next()
+                        .ok_or("--envs requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--envs must be a positive integer")?
+                        .max(1);
+                }
+                "--device" => {
+                    out.estimate_device = it.next()
+                        .ok_or("--device requires `cpu` or `gpu`")?
+                        .to_ascii_lowercase();
+                    if out.estimate_device != "cpu" && out.estimate_device != "gpu" {
+                        return Err("--device must be `cpu` or `gpu`".into());
+                    }
+                }
                 s if s.starts_with('-') => {
                     return Err(format!("unknown flag `{s}`; try `jules help`"));
                 }
@@ -749,6 +807,7 @@ fn cmd_help() {
     println!("    fix   <file.jules>    Apply safe syntax autofixes from diagnostics");
     println!("    fmt   <file.jules>    Pretty-print the source (token pass)");
     println!("    train <file.jules>    Run all train {{ … }} blocks");
+    println!("    estimate           Estimate Jules training time/resources");
     println!("    repl               Interactive REPL / playground");
     println!("    version            Print version information");
     println!("    help               Print this message\n");
@@ -764,12 +823,197 @@ fn cmd_help() {
     println!("    --dry-run          (fix) show changes without writing");
     println!("    --diff             (fix) print changed lines");
     println!("    --aggressive       (fix) allow riskier fixer rules");
+    println!("    --params <N>       (estimate) model parameter count");
+    println!("    --batch <N>        (estimate) training batch size");
+    println!("    --episodes <N>     (estimate) episode count");
+    println!("    --steps <N>        (estimate) max steps per episode");
+    println!("    --envs <N>         (estimate) parallel environments");
+    println!("    --device <cpu|gpu> (estimate) execution device");
     println!("\nEXAMPLES:");
     println!("    jules run examples/physics.jules");
     println!("    jules check src/agent.jules -W");
     println!("    jules fix broken.jules");
     println!("    jules train examples/warden.jules");
+    println!("    jules estimate --params 40000000 --batch 128 --episodes 300000 --steps 128 --envs 8 --device gpu");
     println!("    jules repl");
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrainEstimate {
+    total_steps: u64,
+    estimated_steps_per_sec: f64,
+    estimated_duration: Duration,
+    estimated_memory_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResourceSnapshot {
+    ram_available_bytes: Option<u64>,
+    gpu_available_bytes: Option<u64>,
+}
+
+const EST_BASELINE_PARAMS: usize = 1_000_000;
+const F32_BYTES: u64 = std::mem::size_of::<f32>() as u64;
+
+fn cmd_estimate(args: &CliArgs) -> i32 {
+    let resources = detect_resources(&args.estimate_device);
+    println!("jules estimate");
+    println!(
+        "  params={} batch={} episodes={} steps={} envs={} device={}",
+        args.estimate_params,
+        args.estimate_batch,
+        args.estimate_episodes,
+        args.estimate_steps,
+        args.estimate_envs,
+        args.estimate_device
+    );
+    match resources.ram_available_bytes {
+        Some(v) => println!("  RAM available: {:.2} GiB", bytes_to_gib(v)),
+        None => println!("  RAM available: unknown"),
+    }
+    if args.estimate_device == "gpu" {
+        match resources.gpu_available_bytes {
+            Some(v) => println!("  GPU memory available: {:.2} GiB", bytes_to_gib(v)),
+            None => println!("  GPU memory available: unknown"),
+        }
+    }
+
+    let est = estimate_training(
+        args.estimate_params,
+        args.estimate_batch,
+        args.estimate_episodes,
+        args.estimate_steps,
+        args.estimate_envs,
+        &args.estimate_device,
+    );
+    println!(
+        "  estimated: steps={} steps/s≈{:.0} time≈{} memory≈{:.2} GiB",
+        est.total_steps,
+        est.estimated_steps_per_sec,
+        format_duration(est.estimated_duration),
+        bytes_to_gib(est.estimated_memory_bytes),
+    );
+    print_speed_suggestions(est, args);
+    0
+}
+
+fn estimate_training(
+    params: usize,
+    batch: usize,
+    episodes: usize,
+    steps: usize,
+    envs: usize,
+    device: &str,
+) -> TrainEstimate {
+    let params = params.max(1);
+    let batch = batch.max(1);
+    let envs = envs.max(1);
+    let total_steps = episodes as u64 * steps as u64 * envs as u64;
+    let base_steps_per_sec = if device == "gpu" { 20_000_000.0 } else { 7_500_000.0 };
+    let param_scale = (params as f64 / EST_BASELINE_PARAMS as f64).max(1e-9);
+    let env_gain = 1.0 + (envs as f64).log2().max(0.0) * 0.35;
+    let batch_gain = if batch <= 64 { 1.0 } else if batch <= 256 { 1.12 } else { 1.08 };
+    let estimated_steps_per_sec = (base_steps_per_sec * env_gain * batch_gain
+        / param_scale.powf(0.9))
+        .max(1.0);
+    let secs = total_steps as f64 / estimated_steps_per_sec;
+    TrainEstimate {
+        total_steps,
+        estimated_steps_per_sec,
+        estimated_duration: Duration::from_secs_f64(secs.max(0.0)),
+        estimated_memory_bytes: estimate_memory_bytes(params, batch, envs),
+    }
+}
+
+fn estimate_memory_bytes(params: usize, batch: usize, envs: usize) -> u64 {
+    let params = params as u64;
+    let batch = batch as u64;
+    let envs = envs as u64;
+    let model_state = params.saturating_mul(F32_BYTES).saturating_mul(4);
+    let activations = params
+        .saturating_mul(batch.saturating_add(envs).max(1))
+        .saturating_mul(F32_BYTES / 2 + 1);
+    (model_state + activations).saturating_mul(13) / 10
+}
+
+fn detect_resources(device: &str) -> ResourceSnapshot {
+    ResourceSnapshot {
+        ram_available_bytes: read_available_ram_bytes(),
+        gpu_available_bytes: if device == "gpu" { read_available_gpu_bytes() } else { None },
+    }
+}
+
+fn read_available_ram_bytes() -> Option<u64> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+fn read_available_gpu_bytes() -> Option<u64> {
+    let out = process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut total_mib = 0u64;
+    for line in text.lines() {
+        if let Ok(v) = line.trim().parse::<u64>() {
+            total_mib = total_mib.saturating_add(v);
+        }
+    }
+    if total_mib == 0 { None } else { Some(total_mib.saturating_mul(1024 * 1024)) }
+}
+
+fn print_speed_suggestions(est: TrainEstimate, args: &CliArgs) {
+    if est.estimated_duration < Duration::from_secs(30 * 60) {
+        println!("  suggestion: ETA is under 30 minutes; no urgency tuning needed.");
+        return;
+    }
+    println!("  suggestion: ETA exceeds 30 minutes. Quick speedups:");
+    println!(
+        "    • episodes: {} -> {}",
+        args.estimate_episodes,
+        ((args.estimate_episodes as f64) * 0.7) as usize
+    );
+    println!(
+        "    • steps: {} -> {}",
+        args.estimate_steps,
+        (args.estimate_steps as f64 * 0.8).max(1.0) as usize
+    );
+    println!(
+        "    • params: {} -> {}",
+        args.estimate_params,
+        (args.estimate_params as f64 * 0.75).max(1.0) as usize
+    );
+    if args.estimate_envs == 1 {
+        println!("    • envs: 1 -> 8 (CPU) or 32+ (GPU)");
+    } else {
+        println!("    • tune envs upward if CPU/GPU utilization is low");
+    }
+    if args.estimate_device != "gpu" {
+        println!("    • switch to --device gpu if available");
+    }
+    println!("    • try batch sizes 64/128/256 and keep highest measured steps/s");
+}
+
+fn bytes_to_gib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn format_duration(d: Duration) -> String {
+    let total = d.as_secs();
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 { format!("{h}h {m}m {s}s") } else { format!("{m}m {s}s") }
 }
 
 fn insert_char_at_byte(source: &mut String, byte_idx: usize, ch: char) {
@@ -1591,6 +1835,7 @@ pub fn main() {
         Command::Fix     => cmd_fix(&args),
         Command::Run     => cmd_run(&args),
         Command::Train   => cmd_train(&args),
+        Command::Estimate=> cmd_estimate(&args),
         Command::Fmt     => cmd_fmt(&args),
         Command::Repl    => {
             let cfg = render_cfg(&args);
@@ -1719,6 +1964,34 @@ mod tests {
     fn test_cli_repl_command() {
         let a = parse(&["repl"]).unwrap();
         assert_eq!(a.command, Command::Repl);
+    }
+
+    #[test]
+    fn test_cli_estimate_command() {
+        let a = parse(&[
+            "estimate",
+            "--params", "40000000",
+            "--batch", "128",
+            "--episodes", "300000",
+            "--steps", "128",
+            "--envs", "8",
+            "--device", "gpu",
+        ]).unwrap();
+        assert_eq!(a.command, Command::Estimate);
+        assert_eq!(a.estimate_params, 40_000_000);
+        assert_eq!(a.estimate_batch, 128);
+        assert_eq!(a.estimate_episodes, 300_000);
+        assert_eq!(a.estimate_steps, 128);
+        assert_eq!(a.estimate_envs, 8);
+        assert_eq!(a.estimate_device, "gpu");
+    }
+
+    #[test]
+    fn test_estimate_training_param_scaling() {
+        let small = estimate_training(1_000_000, 64, 100_000, 64, 1, "cpu");
+        let large = estimate_training(40_000_000, 64, 100_000, 64, 1, "cpu");
+        assert!(large.estimated_steps_per_sec < small.estimated_steps_per_sec);
+        assert!(large.estimated_duration > small.estimated_duration);
     }
 
     #[test]

@@ -1302,8 +1302,9 @@ impl<'src> Lexer<'src> {
     /// Errors are accumulated; tokenisation continues past individual bad
     /// characters so the caller can report multiple problems at once.
     pub fn tokenize(&mut self) -> (Vec<Token>, Vec<LexError>) {
-        let mut tokens = Vec::new();
-        let mut errors = Vec::new();
+        // Heuristic capacity to reduce reallocations in large-source lexing.
+        let mut tokens = Vec::with_capacity((self.src.len() / 4).max(16));
+        let mut errors = Vec::with_capacity(4);
 
         loop {
             match self.next_token() {

@@ -1,14 +1,31 @@
 // Chess learning-environment benchmark.
 // Run with: cargo run --release --bin bench-chess-ml -- <episodes> <max_steps> <batch> <envs> <device>
 
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::time::Instant;
-
 use jules::chess_ml::{
     eval_policy_vs_random, train_chess_policy_batched, train_chess_policy_batched_from,
     train_chess_policy_gpu, train_chess_policy_soa,
 };
+use std::fs;
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+const BASELINE_PARAM_COUNT: usize = 8;
+const F32_BYTES: u64 = std::mem::size_of::<f32>() as u64;
+
+#[derive(Debug, Clone, Copy)]
+struct ResourceSnapshot {
+    ram_available_bytes: Option<u64>,
+    gpu_available_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrainEstimate {
+    estimated_duration: Duration,
+    estimated_steps_per_sec: f64,
+    total_steps: u64,
+    memory_required_bytes: u64,
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -19,6 +36,29 @@ fn main() {
     let batch = batch_raw.max(1).min(4096);
     let envs = envs_raw.max(1).min(4096);
     let device = args.get(5).map(String::as_str).unwrap_or("cpu");
+    let mut params = BASELINE_PARAM_COUNT;
+    let mut estimate_only = false;
+    let mut i = 6usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--params" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
+                    params = v.max(1);
+                    i += 2;
+                } else {
+                    println!("⚠️ --params requires a positive integer; using default {params}");
+                    i += 1;
+                }
+            }
+            "--estimate-only" => {
+                estimate_only = true;
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
     if batch != batch_raw || envs != envs_raw {
         println!("⚠️ safety clamp applied: batch {batch_raw}->{batch}, envs {envs_raw}->{envs}");
     }
@@ -26,6 +66,20 @@ fn main() {
     println!(
         "bench-chess-ml episodes={episodes} max_steps={max_steps} batch={batch} envs={envs} device={device}"
     );
+    println!("estimator: params={params}, estimate_only={estimate_only}");
+
+    let resources = detect_resources(device);
+    print_resource_report(resources, device);
+    if let Some(estimate) = estimate_training_time(episodes, max_steps, batch, envs, device, params)
+    {
+        print_estimate(estimate);
+        maybe_print_speed_tips(estimate, episodes, max_steps, batch, envs, params, device);
+    } else {
+        println!("⚠️ estimator unavailable: failed to run calibration pass");
+    }
+    if estimate_only {
+        return;
+    }
 
     let jules = if device == "gpu" {
         train_chess_policy_gpu(episodes, envs, max_steps, batch, 0xC0FFEE).unwrap_or_else(|e| {
@@ -117,6 +171,186 @@ fn main() {
             );
             break;
         }
+    }
+}
+
+fn detect_resources(device: &str) -> ResourceSnapshot {
+    ResourceSnapshot {
+        ram_available_bytes: read_available_ram_bytes(),
+        gpu_available_bytes: if device == "gpu" {
+            read_available_gpu_bytes()
+        } else {
+            None
+        },
+    }
+}
+
+fn print_resource_report(resources: ResourceSnapshot, device: &str) {
+    match resources.ram_available_bytes {
+        Some(v) => println!("resource: RAM available ≈ {:.2} GiB", bytes_to_gib(v)),
+        None => println!("resource: RAM available unknown"),
+    }
+    if device == "gpu" {
+        match resources.gpu_available_bytes {
+            Some(v) => println!(
+                "resource: GPU memory available ≈ {:.2} GiB",
+                bytes_to_gib(v)
+            ),
+            None => println!("resource: GPU memory available unknown"),
+        }
+    }
+}
+
+fn estimate_training_time(
+    episodes: usize,
+    max_steps: usize,
+    batch: usize,
+    envs: usize,
+    device: &str,
+    params: usize,
+) -> Option<TrainEstimate> {
+    let calibration_episodes = episodes.clamp(32, 2_048);
+    let calibration = if device == "gpu" {
+        train_chess_policy_gpu(calibration_episodes, envs, max_steps, batch, 0xE57E_0001).ok()
+    } else if envs > 1 {
+        Some(train_chess_policy_soa(
+            calibration_episodes,
+            envs,
+            max_steps,
+            batch,
+            0xE57E_0001,
+        ))
+    } else {
+        Some(train_chess_policy_batched(
+            calibration_episodes,
+            max_steps,
+            batch,
+            0xE57E_0001,
+        ))
+    }?;
+
+    let calibration_sps = calibration.steps_per_sec.max(1.0);
+    // Compute cost scales near-linearly with parameter count for dense layers.
+    let param_scale = params as f64 / BASELINE_PARAM_COUNT as f64;
+    let estimated_steps_per_sec = (calibration_sps / param_scale.max(1e-9)).max(1.0);
+    let total_steps = episodes as u64 * max_steps as u64 * envs.max(1) as u64;
+    let secs = total_steps as f64 / estimated_steps_per_sec;
+    let estimated_duration = Duration::from_secs_f64(secs.max(0.0));
+    let memory_required_bytes = estimate_memory_bytes(params, batch, envs);
+    Some(TrainEstimate {
+        estimated_duration,
+        estimated_steps_per_sec,
+        total_steps,
+        memory_required_bytes,
+    })
+}
+
+fn print_estimate(est: TrainEstimate) {
+    println!(
+        "estimate: total_steps={} est_steps/s={:.0} est_time={} est_memory={:.2} GiB",
+        est.total_steps,
+        est.estimated_steps_per_sec,
+        format_duration(est.estimated_duration),
+        bytes_to_gib(est.memory_required_bytes)
+    );
+}
+
+fn maybe_print_speed_tips(
+    est: TrainEstimate,
+    episodes: usize,
+    max_steps: usize,
+    batch: usize,
+    envs: usize,
+    params: usize,
+    device: &str,
+) {
+    if est.estimated_duration < Duration::from_secs(30 * 60) {
+        return;
+    }
+    println!("⚠️ estimated training time exceeds 30 minutes. Speed-up suggestions:");
+    println!(
+        "  • Reduce episodes: {episodes} -> {}",
+        ((episodes as f64) * 0.7) as usize
+    );
+    println!(
+        "  • Reduce max_steps: {max_steps} -> {}",
+        (max_steps as f64 * 0.8).max(1.0) as usize
+    );
+    println!(
+        "  • Reduce params: {params} -> {}",
+        (params as f64 * 0.75).max(1.0) as usize
+    );
+    if envs == 1 {
+        println!("  • Increase envs (parallel sims): 1 -> 8 (CPU) or 32+ (GPU)");
+    } else {
+        println!("  • Tune envs to saturate hardware: current envs={envs}");
+    }
+    if device != "gpu" {
+        println!("  • Use `gpu` device mode if available for larger batches.");
+    }
+    println!("  • Batch tuning: current batch={batch}; test 64, 128, 256 and keep best steps/s.");
+}
+
+fn estimate_memory_bytes(params: usize, batch: usize, envs: usize) -> u64 {
+    let params = params as u64;
+    let batch = batch as u64;
+    let envs = envs.max(1) as u64;
+    // Weight + gradient + optimizer state (Adam-like) ~= 4 tensors.
+    let model_bytes = params * F32_BYTES * 4;
+    // Activation/workspace estimate: scales with params and active batch/env lanes.
+    let activation_bytes = params
+        .saturating_mul((batch.max(1) + envs).max(1))
+        .saturating_mul(F32_BYTES / 2 + 1);
+    // Safety factor for allocator fragmentation and temporary buffers.
+    (model_bytes + activation_bytes).saturating_mul(13) / 10
+}
+
+fn read_available_ram_bytes() -> Option<u64> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+fn read_available_gpu_bytes() -> Option<u64> {
+    let out = Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut total_mib = 0u64;
+    for line in text.lines() {
+        if let Ok(v) = line.trim().parse::<u64>() {
+            total_mib = total_mib.saturating_add(v);
+        }
+    }
+    if total_mib == 0 {
+        None
+    } else {
+        Some(total_mib.saturating_mul(1024 * 1024))
+    }
+}
+
+fn bytes_to_gib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn format_duration(d: Duration) -> String {
+    let total = d.as_secs();
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else {
+        format!("{m}m {s}s")
     }
 }
 
