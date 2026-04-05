@@ -68,7 +68,8 @@ pub struct Parser {
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0, errors: Vec::new() }
+        // Small upfront reserve avoids first diagnostic allocation on recovery paths.
+        Parser { tokens, pos: 0, errors: Vec::with_capacity(4) }
     }
 
     // ── Token access ──────────────────────────────────────────────────────────
