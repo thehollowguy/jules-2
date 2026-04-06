@@ -511,6 +511,25 @@ impl TypeCk {
             "loss::",
             "metrics::",
             "autodiff::",
+            "optimizer::",
+            "sys::",
+            "math::",
+            "tensor::",
+            "nn::",
+            "train::",
+            "data::",
+            "io::",
+            "collections::",
+            "diag::",
+            "compute::",
+            "quant::",
+            "model::",
+            "debug::",
+            "sim::",
+            "window::",
+            "core::",
+            "error::",
+            "std::",
         ];
         PREFIXES.iter().any(|p| name.starts_with(p))
     }
@@ -518,7 +537,47 @@ impl TypeCk {
     fn is_runtime_builtin_ident(name: &str) -> bool {
         matches!(
             name,
-            "println" | "print" | "dataloader" | "pipeline" | "range" | "arange" | "zeros" | "ones"
+            "println"
+                | "print"
+                | "dbg"
+                | "dataloader"
+                | "pipeline"
+                | "range"
+                | "arange"
+                | "zeros"
+                | "ones"
+                | "sin"
+                | "cos"
+                | "tan"
+                | "sqrt"
+                | "exp"
+                | "log"
+                | "abs"
+                | "min"
+                | "max"
+                | "clamp"
+                | "round"
+                | "floor"
+                | "ceil"
+                | "fract"
+                | "trunc"
+                | "pow"
+                | "tanh"
+                | "Some"
+                | "None"
+                | "Ok"
+                | "Err"
+                | "unwrap"
+                | "is_some"
+                | "is_none"
+                | "is_ok"
+                | "is_err"
+                | "len"
+                | "read_file"
+                | "write_file"
+                | "append_file"
+                | "file_exists"
+                | "delete_file"
         )
     }
 
@@ -1031,7 +1090,8 @@ impl TypeCk {
                                     "unknown path `{}` — check that every segment is declared \
                                  and that any required `use` imports are present. \
                                  Built-in runtime paths begin with `game::`, `graphics::`, \
-                                 `audio::`, `input::`, `physics::`, `ml::`, etc.",
+                                 `audio::`, `input::`, `physics::`, `ml::`, `math::`, \
+                                 `tensor::`, `sim::`, `window::`, etc.",
                                     name
                                 ),
                             );
