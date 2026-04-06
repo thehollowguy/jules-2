@@ -48,14 +48,13 @@
 )]
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 // ── Fast HashMap — ~2x faster than SipHash for short string keys ─────────────
-use rustc_hash::{FxHashMap, FxHashSet};
-// Re-export under the std name so nothing else needs changing.
-type HashMap<K, V> = FxHashMap<K, V>;
-type HashSet<T> = FxHashSet<T>;
+use rustc_hash::FxHashMap;
 
 use crate::ast::{
     Activation, AgentDecl, AssignOpKind, Attribute, BinOpKind, Block, ElemType, EntityQuery, Expr,
@@ -1510,7 +1509,7 @@ impl Env {
 }
 
 // Keep type alias for closure capture maps (used by FnClosure).
-type Frame = FxHashMap<String, Value>;
+type Frame = HashMap<String, Value>;
 
 // =============================================================================
 // §6b  BYTECODE COMPILER + REGISTER VM
@@ -2182,6 +2181,12 @@ pub fn compile_fn(decl: &FnDecl) -> CompiledFn {
     c.finish(decl.name.clone(), param_count)
 }
 
+// ── Shorthand runtime error macro ────────────────────────────────────────────
+macro_rules! rt_err {
+    ($msg:expr) => { Err(RuntimeError::new($msg)) };
+    ($fmt:literal $(, $arg:expr)*) => { Err(RuntimeError::new(format!($fmt $(, $arg)*))) };
+}
+
 // ── Register-based VM executor ───────────────────────────────────────────────
 
 /// Execute a compiled function on the VM.
@@ -2354,7 +2359,7 @@ pub fn vm_exec(
                 }
             }
             Instr::NewHashMap(d) => {
-                reg!(*d) = Value::HashMap(Arc::new(Mutex::new(FxHashMap::default())));
+                reg!(*d) = Value::HashMap(Arc::new(Mutex::new(HashMap::new())));
             }
             Instr::NewTuple(d, start, count) => {
                 let mut vals = Vec::with_capacity(*count as usize);
@@ -2365,7 +2370,7 @@ pub fn vm_exec(
             }
             Instr::NewStruct(d, ni) => {
                 let name = str_pool[*ni as usize].clone();
-                reg!(*d) = Value::Struct { name, fields: FxHashMap::default() };
+                reg!(*d) = Value::Struct { name, fields: HashMap::new() };
             }
             Instr::FieldGet(d, obj, fi) => {
                 let o = reg!(*obj).clone();
@@ -2512,13 +2517,6 @@ impl fmt::Display for RuntimeError {
             None => write!(f, "runtime error: {}", self.message),
         }
     }
-}
-
-// ── Shorthand macros ──────────────────────────────────────────────────────────
-
-macro_rules! rt_err {
-    ($msg:expr) => { Err(RuntimeError::new($msg)) };
-    ($fmt:literal $(, $arg:expr)*) => { Err(RuntimeError::new(format!($fmt $(, $arg)*))) };
 }
 
 // =============================================================================
@@ -2704,6 +2702,18 @@ pub struct Interpreter {
     // ── Bytecode cache ────────────────────────────────────────────────────────
     /// Maps function name → compiled bytecode (compiled once, reused forever).
     compiled_fns: FxHashMap<String, Arc<CompiledFn>>,
+    #[cfg(feature = "phase3-jit")]
+    native_fns: FxHashMap<String, Arc<crate::phase3_jit::NativeCode>>,
+    #[cfg(feature = "phase3-jit")]
+    pgo_started_at: Instant,
+    #[cfg(feature = "phase3-jit")]
+    pgo_window_done: bool,
+    #[cfg(feature = "phase3-jit")]
+    pgo_call_counts: FxHashMap<String, u64>,
+    /// Global VM/JIT switch. When disabled, execution falls back to tree-walking.
+    jit_enabled: bool,
+    /// If enabled, compile all top-level functions at load time to remove first-call latency.
+    advance_jit_enabled: bool,
 }
 
 impl Interpreter {
@@ -2727,6 +2737,53 @@ impl Interpreter {
             windows: HashMap::new(),
             next_window_id: 1,
             compiled_fns: FxHashMap::default(),
+            #[cfg(feature = "phase3-jit")]
+            native_fns: FxHashMap::default(),
+            #[cfg(feature = "phase3-jit")]
+            pgo_started_at: Instant::now(),
+            #[cfg(feature = "phase3-jit")]
+            pgo_window_done: false,
+            #[cfg(feature = "phase3-jit")]
+            pgo_call_counts: FxHashMap::default(),
+            jit_enabled: true,
+            advance_jit_enabled: true,
+        }
+    }
+
+    /// Enable/disable VM/JIT execution globally.
+    pub fn set_jit_enabled(&mut self, enabled: bool) {
+        self.jit_enabled = enabled;
+        if !enabled {
+            self.compiled_fns.clear();
+            #[cfg(feature = "phase3-jit")]
+            self.native_fns.clear();
+            #[cfg(feature = "phase3-jit")]
+            {
+                self.pgo_window_done = false;
+                self.pgo_started_at = Instant::now();
+                self.pgo_call_counts.clear();
+            }
+        }
+    }
+
+    /// Enable/disable advance JIT (eager pre-compilation on program load).
+    pub fn set_advance_jit_enabled(&mut self, enabled: bool) {
+        self.advance_jit_enabled = enabled;
+    }
+
+    fn precompile_loaded_functions(&mut self) {
+        if !self.jit_enabled || !self.advance_jit_enabled {
+            return;
+        }
+        let names: Vec<String> = self.fns.keys().cloned().collect();
+        for name in names {
+            if self.compiled_fns.contains_key(&name) {
+                continue;
+            }
+            if let Some(closure) = self.fns.get(&name) {
+                let compiled = compile_fn(&closure.decl);
+                self.compiled_fns.insert(name, Arc::new(compiled));
+            }
         }
     }
 
@@ -2734,9 +2791,19 @@ impl Interpreter {
 
     /// Load all top-level declarations from a parsed program into the interpreter.
     pub fn load_program(&mut self, program: &Program) {
+        // Avoid stale bytecode when reloading/redefining functions.
+        self.compiled_fns.clear();
+        #[cfg(feature = "phase3-jit")]
+        {
+            self.native_fns.clear();
+            self.pgo_window_done = false;
+            self.pgo_started_at = Instant::now();
+            self.pgo_call_counts.clear();
+        }
         for item in &program.items {
             self.load_item(item);
         }
+        self.precompile_loaded_functions();
     }
 
     fn load_item(&mut self, item: &Item) {
@@ -2792,22 +2859,63 @@ impl Interpreter {
             .ok_or_else(|| RuntimeError::new(format!("undefined function `{name}`")))?;
 
         // ── Bytecode fast path ────────────────────────────────────────────────
-        // Check if we already have a compiled version.
-        if !self.compiled_fns.contains_key(name) {
-            // Compile and cache.
-            let compiled = compile_fn(&closure.decl);
-            self.compiled_fns.insert(name.to_owned(), Arc::new(compiled));
-        }
-        let compiled = self.compiled_fns[name].clone();
+        if self.jit_enabled {
+            // Check if we already have a compiled version.
+            if !self.compiled_fns.contains_key(name) {
+                // Compile and cache.
+                let compiled = compile_fn(&closure.decl);
+                self.compiled_fns.insert(name.to_owned(), Arc::new(compiled));
+            }
+            let compiled = self.compiled_fns[name].clone();
+            #[cfg(feature = "phase3-jit")]
+            {
+                if let Some(count) = self.pgo_call_counts.get_mut(name) {
+                    *count += 1;
+                } else {
+                    self.pgo_call_counts.insert(name.to_owned(), 1);
+                }
+                if !self.pgo_window_done
+                    && self.pgo_started_at.elapsed() >= Duration::from_secs(1)
+                {
+                    self.pgo_window_done = true;
+                    if let Some((hot_name, _)) = self
+                        .pgo_call_counts
+                        .iter()
+                        .max_by_key(|(_, count)| *count)
+                        .map(|(k, v)| (k.clone(), *v))
+                    {
+                        if let Some(hot_compiled) = self.compiled_fns.get(&hot_name).cloned() {
+                            if let Some(native) = crate::phase3_jit::translate(&hot_compiled) {
+                                self.native_fns.insert(hot_name, Arc::new(native));
+                            }
+                        }
+                    }
+                }
+            }
 
-        // If the arg count matches expectation, run the VM.
-        if closure.capture.is_empty()
-            && args.len() == closure.decl.params.len()
-        {
-            return vm_exec(self, &compiled, args).map(|r| match r {
-                Value::Return(v) => *v,
-                other => other,
-            });
+            // If the arg count matches expectation, run the VM.
+            if closure.capture.is_empty()
+                && args.len() == closure.decl.params.len()
+            {
+                #[cfg(feature = "phase3-jit")]
+                {
+                    if let Some(native) = self.native_fns.get(name).cloned() {
+                        if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
+                            return Ok(v);
+                        }
+                    } else if let Some(native) = crate::phase3_jit::translate(&compiled) {
+                        let native = Arc::new(native);
+                        self.native_fns.insert(name.to_owned(), native.clone());
+                        if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
+                            return Ok(v);
+                        }
+                    }
+                }
+                return vm_exec(self, &compiled, args).map(|r| match r {
+                    Value::Return(v) => *v,
+                    other => other,
+                });
+            }
         }
 
         // ── Fallback: tree-walker (captures, mismatched args, etc.) ──────────
@@ -3879,7 +3987,14 @@ impl Interpreter {
             ),
             (
                 "debug",
-                &["dbg", "debug::tensor_shape", "debug::disable_jit"],
+                &[
+                    "dbg",
+                    "debug::tensor_shape",
+                    "debug::disable_jit",
+                    "debug::enable_jit",
+                    "debug::set_advance_jit",
+                    "debug::jit_state",
+                ],
             ),
             (
                 "sim",
@@ -4650,7 +4765,35 @@ impl Interpreter {
                     rt_err!("debug::tensor_shape requires a Tensor")
                 }
             }
-            "debug::disable_jit" => Ok(Value::Bool(true)),
+            "debug::disable_jit" => {
+                self.set_jit_enabled(false);
+                Ok(Value::Bool(true))
+            }
+            "debug::enable_jit" => {
+                self.set_jit_enabled(true);
+                Ok(Value::Bool(true))
+            }
+            "debug::set_advance_jit" => {
+                let enabled = args
+                    .first()
+                    .and_then(|v| v.as_bool())
+                    .ok_or_else(|| RuntimeError::new("debug::set_advance_jit(bool) requires bool"))?;
+                self.set_advance_jit_enabled(enabled);
+                Ok(Value::Bool(enabled))
+            }
+            "debug::jit_state" => {
+                let mut state = HashMap::default();
+                state.insert("jit_enabled".to_string(), Value::Bool(self.jit_enabled));
+                state.insert(
+                    "advance_jit_enabled".to_string(),
+                    Value::Bool(self.advance_jit_enabled),
+                );
+                state.insert(
+                    "compiled_fn_count".to_string(),
+                    Value::I64(self.compiled_fns.len() as i64),
+                );
+                Ok(Value::HashMap(Arc::new(Mutex::new(state))))
+            }
             "quant::int8_export" => Ok(Value::Bool(true)),
             "sim::world" => {
                 let dt = args
