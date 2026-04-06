@@ -284,6 +284,30 @@ pub struct SceneObject {
 }
 
 #[derive(Debug, Clone)]
+pub enum RenderCommand {
+    Clear {
+        color: [f32; 4],
+    },
+    Rect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: [f32; 4],
+        layer: i32,
+    },
+    Sprite {
+        sprite_id: u32,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        rotation_deg: f32,
+        layer: i32,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct GridMap {
     pub id: u32,
     pub width: usize,
@@ -313,6 +337,7 @@ pub struct RenderState {
     // 8K rendering support
     pub width: u32,
     pub height: u32,
+    pub command_buffer: Vec<RenderCommand>,
 }
 
 impl RenderState {
@@ -329,6 +354,7 @@ impl RenderState {
             next_id: 1,
             width: 1920,
             height: 1080,
+            command_buffer: Vec::new(),
         }
     }
 
@@ -365,6 +391,56 @@ impl RenderState {
 
     pub fn update_camera_position(&mut self, x: f32, y: f32, z: f32) {
         self.camera.position = [x, y, z];
+    }
+
+    pub fn begin_frame(&mut self, width: u32, height: u32) {
+        self.width = width.max(1);
+        self.height = height.max(1);
+        self.command_buffer.clear();
+    }
+
+    pub fn queue_clear(&mut self, color: [f32; 4]) {
+        self.command_buffer.push(RenderCommand::Clear { color });
+    }
+
+    pub fn queue_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4], layer: i32) {
+        self.command_buffer.push(RenderCommand::Rect {
+            x,
+            y,
+            w,
+            h,
+            color,
+            layer,
+        });
+    }
+
+    pub fn queue_sprite(
+        &mut self,
+        sprite_id: u32,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        rotation_deg: f32,
+        layer: i32,
+    ) -> Result<(), String> {
+        if !self.sprites.contains_key(&sprite_id) {
+            return Err(format!("unknown sprite_id {}", sprite_id));
+        }
+        self.command_buffer.push(RenderCommand::Sprite {
+            sprite_id,
+            x,
+            y,
+            w,
+            h,
+            rotation_deg,
+            layer,
+        });
+        Ok(())
+    }
+
+    pub fn drain_command_buffer(&mut self) -> Vec<RenderCommand> {
+        std::mem::take(&mut self.command_buffer)
     }
 
     pub fn create_sprite(&mut self, name: String, width: f32, height: f32) -> u32 {

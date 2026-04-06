@@ -71,6 +71,30 @@ as well (transpose + blocked kernel + threaded row chunks), following the same
 core ideas used by high-performance JIT stacks: contiguous access, tiling, and
 parallel work partitioning.
 
+## Game-dev movement helpers
+
+Jules now ships additional game-loop-friendly built-ins in `math`:
+
+- `math::approach(current, target, max_delta)` for deterministic scalar movement/easing
+- `math::move_towards2(cx, cy, tx, ty, max_delta)` for fixed-step 2D follow behavior
+- `math::angle_to(ax, ay, bx, by)` for heading/orientation calculations
+- `math::rand_unit2()` for random normalized directions
+
+## Rendering API with AoT-friendly command streams
+
+Jules now includes a `render::*` API that records frame commands into a structured
+command buffer:
+
+- `render::begin_frame(width, height)`
+- `render::clear(r, g, b, a)`
+- `render::rect(x, y, w, h, r, g, b, a, layer)`
+- `render::sprite(sprite_id, x, y, w, h, rotation_deg, layer)`
+- `render::flush()` (drain queued commands for host-side execution)
+- `render::stats()` (queue + frame metrics)
+
+This keeps rendering deterministic at script-level and makes AoT/embedded engine
+integration easier because command data is plain structured values.
+
 
 
 ## Standard built-in library modules

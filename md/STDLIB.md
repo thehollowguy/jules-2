@@ -10,7 +10,7 @@ Jules follows a **small-core, composable, deterministic-friendly, ML-aware** sta
 ## Built-in module map
 
 - `core`: `Some`, `None`, `Ok`, `Err`, `unwrap`, `is_some`, `is_none`, `is_ok`, `is_err`
-- `math`: `sin`, `cos`, `tan`, `exp`, `log`, `sqrt`, `tanh`, `softmax`, `random`, `random_seed`, `rand_int`, `sigmoid`, `relu`, `lerp`, `smoothstep`, `dot2`, `length2`, `distance2`, `remap`, `clamp01`
+- `math`: `sin`, `cos`, `tan`, `exp`, `log`, `sqrt`, `tanh`, `softmax`, `random`, `random_seed`, `rand_int`, `sigmoid`, `relu`, `lerp`, `smoothstep`, `dot2`, `length2`, `distance2`, `remap`, `clamp01`, `approach`, `move_towards2`, `angle_to`, `rand_unit2`
 - `tensor`: `zeros`, `ones`, `sum`, `mean`, `max`, `softmax`, `normalize`
 - `nn`: `relu`, `gelu`, `sigmoid`, `tanh`, `cross_entropy`, `mse`
 - `train`: `optimizer::create`, `optimizer::step`
@@ -26,6 +26,7 @@ Jules follows a **small-core, composable, deterministic-friendly, ML-aware** sta
 - `debug`: `dbg`, `debug::tensor_shape`, `debug::disable_jit`
 - `sim`: `sim::world`, `sim::spawn`, `sim::step`, `sim::reset`, `sim::get_state`, `sim::state_tensor`, `sim::apply`, `sim::entity_count`, `sim::nearest_entity`, `sim::query_radius`
 - `window`: `window::create`, `window::open`, `window::clear`, `window::draw_rect`, `window::present`, `window::close`, `window::input_key_down`, `window::size`, `window::title`, `window::frames`
+- `render`: `render::begin_frame`, `render::clear`, `render::rect`, `render::sprite`, `render::flush`, `render::stats`
 
 ## Runtime discovery
 Use:
@@ -35,6 +36,28 @@ let mods = std::modules();
 ```
 
 This returns a map from module name to built-in function names.
+
+## Game-loop focused math helpers
+
+The `math` module now includes helpers tuned for gameplay movement and steering:
+
+- `math::approach(current, target, max_delta)` for deterministic scalar easing.
+- `math::move_towards2(cx, cy, tx, ty, max_delta)` for fixed-step 2D chasing.
+- `math::angle_to(ax, ay, bx, by)` for heading calculation (`atan2`).
+- `math::rand_unit2()` for random normalized 2D directions (spawn spread, AI jitter).
+
+## Rendering API (AoT-friendly command buffer)
+
+`render::*` is designed around a **command buffer** model so scripts can build a
+frame deterministically and either execute it in the interpreter or ship the
+same command stream to a host renderer in AoT pipelines.
+
+- `render::begin_frame(width, height)` resets frame state and command queue.
+- `render::clear(r?, g?, b?, a?)` queues a clear command.
+- `render::rect(x, y, w, h, r?, g?, b?, a?, layer?)` queues a colored rectangle.
+- `render::sprite(sprite_id, x, y, w, h, rotation_deg?, layer?)` queues sprite draw.
+- `render::flush()` drains queued commands as structured data.
+- `render::stats()` returns dimensions + queue counters for instrumentation.
 
 ## Minimal sim + window loop
 
