@@ -527,11 +527,49 @@ impl TypeCk {
             "debug::",
             "sim::",
             "window::",
+            "render::",
             "core::",
             "error::",
             "std::",
         ];
         PREFIXES.iter().any(|p| name.starts_with(p))
+    }
+
+    fn is_runtime_builtin_path_segments(segments: &[String]) -> bool {
+        matches!(
+            segments.first().map(String::as_str),
+            Some(
+                "game"
+                    | "graphics"
+                    | "audio"
+                    | "input"
+                    | "physics"
+                    | "ml"
+                    | "loss"
+                    | "metrics"
+                    | "autodiff"
+                    | "optimizer"
+                    | "sys"
+                    | "math"
+                    | "tensor"
+                    | "nn"
+                    | "train"
+                    | "data"
+                    | "io"
+                    | "collections"
+                    | "diag"
+                    | "compute"
+                    | "quant"
+                    | "model"
+                    | "debug"
+                    | "sim"
+                    | "window"
+                    | "render"
+                    | "core"
+                    | "error"
+                    | "std"
+            )
+        )
     }
 
     fn is_runtime_builtin_ident(name: &str) -> bool {
@@ -579,6 +617,51 @@ impl TypeCk {
                 | "file_exists"
                 | "delete_file"
         )
+    }
+
+    /// Best-effort static return typing for common runtime built-in path calls.
+    fn runtime_builtin_path_return_ty_from_segments(&mut self, segments: &[String]) -> Option<Ty> {
+        let ty = match segments {
+            // window
+            [window, create] if window == "window" && create == "create" => {
+                Ty::Scalar(ElemType::I64)
+            }
+            [window, open] if window == "window" && open == "open" => Ty::Bool,
+            [window, cmd]
+                if window == "window"
+                    && matches!(cmd.as_str(), "clear" | "draw_rect" | "present" | "close") =>
+            {
+                Ty::Bool
+            }
+            [window, input_key_down]
+                if window == "window" && input_key_down == "input_key_down" =>
+            {
+                Ty::Bool
+            }
+            [window, frames] if window == "window" && frames == "frames" => {
+                Ty::Scalar(ElemType::I64)
+            }
+            [window, title] if window == "window" && title == "title" => Ty::Str,
+            [window, size] if window == "window" && size == "size" => Ty::Array {
+                elem: Box::new(Ty::Scalar(ElemType::I64)),
+                len: 2,
+            },
+
+            // render command-buffer API
+            [render, cmd]
+                if render == "render"
+                    && matches!(cmd.as_str(), "begin_frame" | "clear" | "rect" | "sprite") =>
+            {
+                Ty::Bool
+            }
+            // Structured dynamic data; keep as inference variable for now.
+            [render, cmd] if render == "render" && matches!(cmd.as_str(), "flush" | "stats") => {
+                self.infer.fresh()
+            }
+
+            _ => return None,
+        };
+        Some(ty)
     }
 
     pub fn new() -> Self {
@@ -2350,6 +2433,18 @@ impl TypeCk {
                     // Unknown function — emit error, return fresh var.
                     self.diag
                         .error(span, format!("call to undeclared function `{}`", name));
+                } else if let Expr::Path { segments, .. } = func {
+                    if Self::is_runtime_builtin_path_segments(segments) {
+                        if let Some(ty) =
+                            self.runtime_builtin_path_return_ty_from_segments(segments)
+                        {
+                            return ty;
+                        }
+                        return self.infer.fresh();
+                    }
+                    let fq = segments.join("::");
+                    self.diag
+                        .error(span, format!("call to undeclared function `{}`", fq));
                 } else {
                     self.diag.error(
                         span,
@@ -4357,6 +4452,26 @@ mod tests {
             "function identifier should resolve for calls: {:?}",
             ck.diag.items
         );
+    }
+
+    #[test]
+    fn test_runtime_builtin_path_call_has_stable_return_type() {
+        let mut ck = make_checker();
+        let mut env = TyEnv::new();
+        let span = dummy();
+
+        let open_call = Expr::Call {
+            span,
+            func: Box::new(Expr::Path {
+                span,
+                segments: vec!["window".into(), "open".into()],
+            }),
+            args: vec![Expr::IntLit { span, value: 1 }],
+            named: vec![],
+        };
+
+        let ty = ck.check_expr(&open_call, &mut env);
+        assert_eq!(ty, Ty::Bool);
     }
 
     // ── Diagnostic accumulation ────────────────────────────────────────────────

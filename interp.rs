@@ -28,7 +28,7 @@
 #![allow(clippy::match_single_binding, clippy::large_enum_variant)]
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -38,7 +38,7 @@ use crate::ast::{
     ParallelismHint, Pattern, PoolOp, Program, RecurrentCell, ScheduleKind, Stmt, SystemDecl,
     TrainDecl, UnOpKind, VecSize,
 };
-use crate::game_systems::{InputState, PhysicsShape, PhysicsWorld, RenderState};
+use crate::game_systems::{InputState, PhysicsShape, PhysicsWorld, RenderCommand, RenderState};
 use crate::lexer::Span;
 use crate::ml_engine::{ComputationGraph, Optimizer, OptimizerState};
 use matrixmultiply::sgemm;
@@ -1517,7 +1517,7 @@ impl SimWorldState {
         }
         let cell_size = (max_extent * 2.0).max(0.25);
 
-        let mut grid: HashMap<(i32, i32), Vec<i64>> = HashMap::new();
+        let mut grid: HashMap<(i32, i32), Vec<i64>> = HashMap::with_capacity(self.entities.len());
         let mut ids = self.entities.keys().copied().collect::<Vec<_>>();
         ids.sort_unstable();
         for id in &ids {
@@ -1531,7 +1531,6 @@ impl SimWorldState {
             bucket.sort_unstable();
         }
 
-        let mut processed: HashSet<(i64, i64)> = HashSet::new();
         for id in &ids {
             let e = match self.entities.get(id) {
                 Some(e) => e,
@@ -1546,28 +1545,28 @@ impl SimWorldState {
                             if other_id <= id {
                                 continue;
                             }
-                            let pair = (*id, *other_id);
-                            if processed.contains(&pair) {
-                                continue;
-                            }
-                            processed.insert(pair);
-                            let (a, b) = match (self.entities.get(id), self.entities.get(other_id))
-                            {
-                                (Some(a), Some(b)) => (a.clone(), b.clone()),
-                                _ => continue,
-                            };
-                            let overlap_x =
-                                (a.pos[0] - b.pos[0]).abs() <= (a.half_extents[0] + b.half_extents[0]);
-                            let overlap_y =
-                                (a.pos[1] - b.pos[1]).abs() <= (a.half_extents[1] + b.half_extents[1]);
+                            let (a_vx, a_vy, b_vx, b_vy, overlap_x, overlap_y) =
+                                match (self.entities.get(id), self.entities.get(other_id)) {
+                                    (Some(a), Some(b)) => {
+                                        let overlap_x = (a.pos[0] - b.pos[0]).abs()
+                                            <= (a.half_extents[0] + b.half_extents[0]);
+                                        let overlap_y = (a.pos[1] - b.pos[1]).abs()
+                                            <= (a.half_extents[1] + b.half_extents[1]);
+                                        (
+                                            a.vel[0], a.vel[1], b.vel[0], b.vel[1], overlap_x,
+                                            overlap_y,
+                                        )
+                                    }
+                                    _ => continue,
+                                };
                             if overlap_x && overlap_y {
                                 if let Some(a_mut) = self.entities.get_mut(id) {
-                                    a_mut.vel[0] = -a.vel[0];
-                                    a_mut.vel[1] = -a.vel[1];
+                                    a_mut.vel[0] = -a_vx;
+                                    a_mut.vel[1] = -a_vy;
                                 }
                                 if let Some(b_mut) = self.entities.get_mut(other_id) {
-                                    b_mut.vel[0] = -b.vel[0];
-                                    b_mut.vel[1] = -b.vel[1];
+                                    b_mut.vel[0] = -b_vx;
+                                    b_mut.vel[1] = -b_vy;
                                 }
                             }
                         }
@@ -1815,17 +1814,36 @@ impl Interpreter {
                 ..
             } => {
                 let iter_val = self.eval_expr(iter, env)?;
-                let items = self.value_to_iter(iter_val)?;
-                for item in items {
-                    env.push();
-                    self.bind_pattern(pattern, item, env);
-                    let r = self.eval_block(body, env)?;
-                    env.pop();
-                    match r {
-                        Value::Break(_) => break,
-                        Value::Continue => continue,
-                        v if v.is_signal() => return Ok(v),
-                        _ => {}
+                match iter_val {
+                    // Fast path: iterate string chars directly to avoid collecting a temporary Vec.
+                    Value::Str(s) => {
+                        for ch in s.chars() {
+                            env.push();
+                            self.bind_pattern(pattern, Value::Str(ch.to_string()), env);
+                            let r = self.eval_block(body, env)?;
+                            env.pop();
+                            match r {
+                                Value::Break(_) => break,
+                                Value::Continue => continue,
+                                v if v.is_signal() => return Ok(v),
+                                _ => {}
+                            }
+                        }
+                    }
+                    other => {
+                        let items = self.value_to_iter(other)?;
+                        for item in items {
+                            env.push();
+                            self.bind_pattern(pattern, item, env);
+                            let r = self.eval_block(body, env)?;
+                            env.pop();
+                            match r {
+                                Value::Break(_) => break,
+                                Value::Continue => continue,
+                                v if v.is_signal() => return Ok(v),
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 Ok(Value::Unit)
@@ -2641,6 +2659,10 @@ impl Interpreter {
             "math::lerp" => "mix",
             "math::smoothstep" => "smoothstep",
             "math::clamp01" => "math::clamp01",
+            "math::approach" => "math::approach",
+            "math::move_towards2" => "math::move_towards2",
+            "math::angle_to" => "math::angle_to",
+            "math::rand_unit2" => "math::rand_unit2",
             "tensor::zeros" => "zeros",
             "tensor::ones" => "ones",
             "tensor::random_seed" => "math::random_seed",
@@ -2659,30 +2681,135 @@ impl Interpreter {
             "debug::trace" => "dbg",
             "sim::world_new" => "sim::world",
             "window::new" => "window::create",
+            "render::begin_frame" => "render::begin_frame",
+            "render::clear" => "render::clear",
+            "render::rect" => "render::rect",
+            "render::sprite" => "render::sprite",
+            "render::flush" => "render::flush",
+            "render::stats" => "render::stats",
             _ => return Cow::Borrowed(name),
         };
         Cow::Borrowed(canonical)
     }
 
     fn stdlib_modules_value(&self) -> Value {
-        let modules: [(&str, &[&str]); 17] = [
-            ("core", &["Some", "None", "Ok", "Err", "unwrap", "is_some", "is_none", "is_ok", "is_err"]),
-            ("math", &["sin", "cos", "tan", "exp", "log", "sqrt", "tanh", "softmax", "random", "random_seed", "rand_int", "sigmoid", "relu", "lerp", "smoothstep", "dot2", "length2", "distance2", "remap", "clamp01"]),
-            ("tensor", &["zeros", "ones", "sum", "mean", "max", "softmax", "normalize"]),
-            ("nn", &["relu", "gelu", "sigmoid", "tanh", "cross_entropy", "mse"]),
+        let modules: [(&str, &[&str]); 18] = [
+            (
+                "core",
+                &[
+                    "Some", "None", "Ok", "Err", "unwrap", "is_some", "is_none", "is_ok", "is_err",
+                ],
+            ),
+            (
+                "math",
+                &[
+                    "sin",
+                    "cos",
+                    "tan",
+                    "exp",
+                    "log",
+                    "sqrt",
+                    "tanh",
+                    "softmax",
+                    "random",
+                    "random_seed",
+                    "rand_int",
+                    "sigmoid",
+                    "relu",
+                    "lerp",
+                    "smoothstep",
+                    "dot2",
+                    "length2",
+                    "distance2",
+                    "remap",
+                    "clamp01",
+                    "approach",
+                    "move_towards2",
+                    "angle_to",
+                    "rand_unit2",
+                ],
+            ),
+            (
+                "tensor",
+                &[
+                    "zeros",
+                    "ones",
+                    "sum",
+                    "mean",
+                    "max",
+                    "softmax",
+                    "normalize",
+                ],
+            ),
+            (
+                "nn",
+                &["relu", "gelu", "sigmoid", "tanh", "cross_entropy", "mse"],
+            ),
             ("train", &["optimizer::create", "optimizer::step"]),
             ("data", &["dataloader", "pipeline"]),
             ("io", &["read_file", "write_file", "append_file"]),
-            ("sys", &["sys::cwd", "sys::os", "sys::arch", "sys::list_dir"]),
+            (
+                "sys",
+                &["sys::cwd", "sys::os", "sys::arch", "sys::list_dir"],
+            ),
             ("error", &["Ok", "Err", "unwrap"]),
             ("diag", &["diag::warn", "diag::perf_hint"]),
             ("collections", &["HashMap::new", "len", "range"]),
             ("compute", &["compute::device", "compute::parallel_map"]),
             ("quant", &["quant::int8_export"]),
-            ("model", &["read_file", "write_file", "sys::read_bytes", "sys::write_bytes"]),
-            ("debug", &["dbg", "debug::tensor_shape", "debug::disable_jit"]),
-            ("sim", &["sim::world", "sim::spawn", "sim::step", "sim::get_state", "sim::state_tensor", "sim::apply", "sim::entity_count", "sim::nearest_entity", "sim::query_radius"]),
-            ("window", &["window::create", "window::open", "window::clear", "window::draw_rect", "window::present", "window::close", "window::input_key_down", "window::size", "window::title", "window::frames"]),
+            (
+                "model",
+                &[
+                    "read_file",
+                    "write_file",
+                    "sys::read_bytes",
+                    "sys::write_bytes",
+                ],
+            ),
+            (
+                "debug",
+                &["dbg", "debug::tensor_shape", "debug::disable_jit"],
+            ),
+            (
+                "sim",
+                &[
+                    "sim::world",
+                    "sim::spawn",
+                    "sim::step",
+                    "sim::get_state",
+                    "sim::state_tensor",
+                    "sim::apply",
+                    "sim::entity_count",
+                    "sim::nearest_entity",
+                    "sim::query_radius",
+                ],
+            ),
+            (
+                "window",
+                &[
+                    "window::create",
+                    "window::open",
+                    "window::clear",
+                    "window::draw_rect",
+                    "window::present",
+                    "window::close",
+                    "window::input_key_down",
+                    "window::size",
+                    "window::title",
+                    "window::frames",
+                ],
+            ),
+            (
+                "render",
+                &[
+                    "render::begin_frame",
+                    "render::clear",
+                    "render::rect",
+                    "render::sprite",
+                    "render::flush",
+                    "render::stats",
+                ],
+            ),
         ];
         let mut out = HashMap::new();
         for (module, names) in modules {
@@ -3002,6 +3129,27 @@ impl Interpreter {
                     rt_err!("math::clamp01(x) requires a number")
                 }
             }
+            "math::approach" => {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                ) {
+                    (Some(current), Some(target), Some(max_delta)) => {
+                        let d = (target - current).abs();
+                        if d <= max_delta.max(0.0) {
+                            Ok(Value::F32(target as f32))
+                        } else if target > current {
+                            Ok(Value::F32((current + max_delta.max(0.0)) as f32))
+                        } else {
+                            Ok(Value::F32((current - max_delta.max(0.0)) as f32))
+                        }
+                    }
+                    _ => {
+                        rt_err!("math::approach(current, target, max_delta) requires three numbers")
+                    }
+                }
+            }
             "math::dot2" => {
                 match (
                     args.get(0).and_then(|v| v.as_f64()),
@@ -3009,7 +3157,9 @@ impl Interpreter {
                     args.get(2).and_then(|v| v.as_f64()),
                     args.get(3).and_then(|v| v.as_f64()),
                 ) {
-                    (Some(ax), Some(ay), Some(bx), Some(by)) => Ok(Value::F32((ax * bx + ay * by) as f32)),
+                    (Some(ax), Some(ay), Some(bx), Some(by)) => {
+                        Ok(Value::F32((ax * bx + ay * by) as f32))
+                    }
                     _ => rt_err!("math::dot2(ax, ay, bx, by) requires four numbers"),
                 }
             }
@@ -3052,6 +3202,56 @@ impl Interpreter {
                     }
                     _ => rt_err!("math::remap(x, in0, in1, out0, out1) requires five numbers"),
                 }
+            }
+            "math::move_towards2" => {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                    args.get(3).and_then(|v| v.as_f64()),
+                    args.get(4).and_then(|v| v.as_f64()),
+                ) {
+                    (Some(cx), Some(cy), Some(tx), Some(ty), Some(max_delta)) => {
+                        let dx = tx - cx;
+                        let dy = ty - cy;
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        if dist <= max_delta.max(0.0) || dist <= 1e-12 {
+                            Ok(Value::Array(Arc::new(Mutex::new(vec![
+                                Value::F32(tx as f32),
+                                Value::F32(ty as f32),
+                            ]))))
+                        } else {
+                            let s = max_delta.max(0.0) / dist;
+                            Ok(Value::Array(Arc::new(Mutex::new(vec![
+                                Value::F32((cx + dx * s) as f32),
+                                Value::F32((cy + dy * s) as f32),
+                            ]))))
+                        }
+                    }
+                    _ => rt_err!(
+                        "math::move_towards2(cx, cy, tx, ty, max_delta) requires five numbers"
+                    ),
+                }
+            }
+            "math::angle_to" => {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                    args.get(3).and_then(|v| v.as_f64()),
+                ) {
+                    (Some(ax), Some(ay), Some(bx), Some(by)) => {
+                        Ok(Value::F32((by - ay).atan2(bx - ax) as f32))
+                    }
+                    _ => rt_err!("math::angle_to(ax, ay, bx, by) requires four numbers"),
+                }
+            }
+            "math::rand_unit2" => {
+                let theta = pseudo_rand() as f64 * (2.0 * consts::PI);
+                Ok(Value::Array(Arc::new(Mutex::new(vec![
+                    Value::F32(theta.cos() as f32),
+                    Value::F32(theta.sin() as f32),
+                ]))))
             }
             "std::modules" => Ok(self.stdlib_modules_value()),
 
@@ -3160,10 +3360,9 @@ impl Interpreter {
                     }
                     let mut s = 0.0f32;
                     for v in values.iter() {
-                        s += v
-                            .as_f64()
-                            .ok_or_else(|| RuntimeError::new("tensor::mean expects numeric array"))?
-                            as f32;
+                        s += v.as_f64().ok_or_else(|| {
+                            RuntimeError::new("tensor::mean expects numeric array")
+                        })? as f32;
                     }
                     Ok(Value::F32(s / values.len() as f32))
                 }
@@ -3172,7 +3371,11 @@ impl Interpreter {
             "tensor::max" => match args.first() {
                 Some(Value::Tensor(t)) => {
                     let tt = t.read().unwrap();
-                    let m = tt.cpu_data().iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let m = tt
+                        .cpu_data()
+                        .iter()
+                        .cloned()
+                        .fold(f32::NEG_INFINITY, f32::max);
                     Ok(Value::F32(m))
                 }
                 Some(Value::Array(a)) => {
@@ -3210,9 +3413,14 @@ impl Interpreter {
                         .iter()
                         .map(|v| v.as_f64().map(|x| x as f32))
                         .collect::<Option<Vec<f32>>>()
-                        .ok_or_else(|| RuntimeError::new("tensor::normalize expects numeric array"))?;
+                        .ok_or_else(|| {
+                            RuntimeError::new("tensor::normalize expects numeric array")
+                        })?;
                     let norm = nums.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-                    let out = nums.into_iter().map(|x| Value::F32(x / norm)).collect::<Vec<_>>();
+                    let out = nums
+                        .into_iter()
+                        .map(|x| Value::F32(x / norm))
+                        .collect::<Vec<_>>();
                     Ok(Value::Array(Arc::new(Mutex::new(out))))
                 }
                 _ => rt_err!("tensor::normalize expects Tensor or Array[number]"),
@@ -3310,7 +3518,9 @@ impl Interpreter {
             "compute::device" => Ok(Value::Str("cpu".to_string())),
             "compute::parallel_map" => {
                 if let Some(Value::Array(a)) = args.first() {
-                    Ok(Value::Array(Arc::new(Mutex::new(a.lock().unwrap().clone()))))
+                    Ok(Value::Array(Arc::new(Mutex::new(
+                        a.lock().unwrap().clone(),
+                    ))))
                 } else {
                     rt_err!("compute::parallel_map currently expects an array")
                 }
@@ -3383,10 +3593,9 @@ impl Interpreter {
                 Ok(Value::I64(id))
             }
             "sim::step" => {
-                let world_id = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("sim::step(world_id, dt?) requires world_id"))?;
+                let world_id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("sim::step(world_id, dt?) requires world_id")
+                })?;
                 let dt = args.get(1).and_then(|v| v.as_f64()).map(|v| v as f32);
                 let world = self
                     .sim_worlds
@@ -3415,10 +3624,9 @@ impl Interpreter {
                 Ok(Value::Bool(true))
             }
             "sim::apply" => {
-                let world_id = args
-                    .get(0)
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("sim::apply(world_id, entity_id, action) requires world_id"))?;
+                let world_id = args.get(0).and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("sim::apply(world_id, entity_id, action) requires world_id")
+                })?;
                 let entity_id = args
                     .get(1)
                     .and_then(|v| v.as_i64())
@@ -3441,10 +3649,9 @@ impl Interpreter {
                 Ok(Value::Bool(true))
             }
             "sim::get_state" => {
-                let world_id = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("sim::get_state(world_id) requires world_id"))?;
+                let world_id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("sim::get_state(world_id) requires world_id")
+                })?;
                 let world = self
                     .sim_worlds
                     .get(&world_id)
@@ -3458,11 +3665,17 @@ impl Interpreter {
                         row.insert("id".into(), Value::I64(id));
                         row.insert(
                             "position".into(),
-                            Value::Array(Arc::new(Mutex::new(vec![Value::F32(e.pos[0]), Value::F32(e.pos[1])]))),
+                            Value::Array(Arc::new(Mutex::new(vec![
+                                Value::F32(e.pos[0]),
+                                Value::F32(e.pos[1]),
+                            ]))),
                         );
                         row.insert(
                             "velocity".into(),
-                            Value::Array(Arc::new(Mutex::new(vec![Value::F32(e.vel[0]), Value::F32(e.vel[1])]))),
+                            Value::Array(Arc::new(Mutex::new(vec![
+                                Value::F32(e.vel[0]),
+                                Value::F32(e.vel[1]),
+                            ]))),
                         );
                         out.push(Value::HashMap(Arc::new(Mutex::new(row))));
                     }
@@ -3470,10 +3683,9 @@ impl Interpreter {
                 Ok(Value::Array(Arc::new(Mutex::new(out))))
             }
             "sim::state_tensor" => {
-                let world_id = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("sim::state_tensor(world_id) requires world_id"))?;
+                let world_id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("sim::state_tensor(world_id) requires world_id")
+                })?;
                 let world = self
                     .sim_worlds
                     .get(&world_id)
@@ -3490,10 +3702,9 @@ impl Interpreter {
                 Ok(Value::Tensor(Arc::new(RwLock::new(t))))
             }
             "sim::entity_count" => {
-                let world_id = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("sim::entity_count(world_id) requires world_id"))?;
+                let world_id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("sim::entity_count(world_id) requires world_id")
+                })?;
                 let world = self
                     .sim_worlds
                     .get(&world_id)
@@ -3501,21 +3712,28 @@ impl Interpreter {
                 Ok(Value::I64(world.entities.len() as i64))
             }
             "sim::nearest_entity" => {
-                let world_id = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("sim::nearest_entity(world_id, [x,y], radius?) requires world_id"))?;
+                let world_id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new(
+                        "sim::nearest_entity(world_id, [x,y], radius?) requires world_id",
+                    )
+                })?;
                 let pos = match args.get(1) {
                     Some(Value::Array(arr)) => {
                         let vals = arr.lock().unwrap();
                         if vals.len() < 2 {
                             return rt_err!("sim::nearest_entity requires [x,y] position");
                         }
-                        [vals[0].as_f64().unwrap_or(0.0) as f32, vals[1].as_f64().unwrap_or(0.0) as f32]
+                        [
+                            vals[0].as_f64().unwrap_or(0.0) as f32,
+                            vals[1].as_f64().unwrap_or(0.0) as f32,
+                        ]
                     }
                     _ => return rt_err!("sim::nearest_entity requires [x,y] position"),
                 };
-                let radius = args.get(2).and_then(|v| v.as_f64()).unwrap_or(f64::INFINITY) as f32;
+                let radius = args
+                    .get(2)
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(f64::INFINITY) as f32;
                 let radius2 = radius * radius;
                 let world = self
                     .sim_worlds
@@ -3537,17 +3755,21 @@ impl Interpreter {
                 Ok(Value::I64(best.map(|(id, _)| id).unwrap_or(-1)))
             }
             "sim::query_radius" => {
-                let world_id = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("sim::query_radius(world_id, [x,y], radius) requires world_id"))?;
+                let world_id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new(
+                        "sim::query_radius(world_id, [x,y], radius) requires world_id",
+                    )
+                })?;
                 let pos = match args.get(1) {
                     Some(Value::Array(arr)) => {
                         let vals = arr.lock().unwrap();
                         if vals.len() < 2 {
                             return rt_err!("sim::query_radius requires [x,y] position");
                         }
-                        [vals[0].as_f64().unwrap_or(0.0) as f32, vals[1].as_f64().unwrap_or(0.0) as f32]
+                        [
+                            vals[0].as_f64().unwrap_or(0.0) as f32,
+                            vals[1].as_f64().unwrap_or(0.0) as f32,
+                        ]
                     }
                     _ => return rt_err!("sim::query_radius requires [x,y] position"),
                 };
@@ -3592,10 +3814,9 @@ impl Interpreter {
                 Ok(Value::I64(id))
             }
             "window::open" => {
-                let id = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("window::open(window_id) requires window_id"))?;
+                let id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("window::open(window_id) requires window_id")
+                })?;
                 let is_open = self.windows.get(&id).map(|w| w.is_open).unwrap_or(false);
                 Ok(Value::Bool(is_open))
             }
@@ -3610,10 +3831,9 @@ impl Interpreter {
                 }
             }
             "window::present" => {
-                let id = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("window::present(window_id) requires window_id"))?;
+                let id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("window::present(window_id) requires window_id")
+                })?;
                 if let Some(w) = self.windows.get_mut(&id) {
                     w.frame_count = w.frame_count.saturating_add(1);
                     let _ = (w.width, w.height, w.title.len());
@@ -3627,10 +3847,9 @@ impl Interpreter {
                 }
             }
             "window::close" => {
-                let id = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("window::close(window_id) requires window_id"))?;
+                let id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("window::close(window_id) requires window_id")
+                })?;
                 if let Some(w) = self.windows.get_mut(&id) {
                     w.is_open = false;
                     Ok(Value::Bool(true))
@@ -3640,10 +3859,9 @@ impl Interpreter {
             }
             "window::input_key_down" => Ok(Value::Bool(false)),
             "window::size" => {
-                let id = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("window::size(window_id) requires window_id"))?;
+                let id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("window::size(window_id) requires window_id")
+                })?;
                 if let Some(w) = self.windows.get(&id) {
                     Ok(Value::Array(Arc::new(Mutex::new(vec![
                         Value::I64(w.width),
@@ -3654,10 +3872,9 @@ impl Interpreter {
                 }
             }
             "window::title" => {
-                let id = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("window::title(window_id) requires window_id"))?;
+                let id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("window::title(window_id) requires window_id")
+                })?;
                 if let Some(w) = self.windows.get(&id) {
                     Ok(Value::Str(w.title.clone()))
                 } else {
@@ -3665,10 +3882,9 @@ impl Interpreter {
                 }
             }
             "window::frames" => {
-                let id = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| RuntimeError::new("window::frames(window_id) requires window_id"))?;
+                let id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("window::frames(window_id) requires window_id")
+                })?;
                 if let Some(w) = self.windows.get(&id) {
                     Ok(Value::I64(w.frame_count as i64))
                 } else {
@@ -4259,6 +4475,22 @@ impl Interpreter {
                     rt_err!("graphics::create_material requires (r, g, b, a)")
                 }
             }
+            "graphics::create_sprite" => {
+                if let (Some(Value::Str(name)), Some(w), Some(h)) = (
+                    args.get(0),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                ) {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    let sprite_id =
+                        render.create_sprite(name.clone(), w.max(0.0) as f32, h.max(0.0) as f32);
+                    Ok(Value::I64(sprite_id as i64))
+                } else {
+                    rt_err!(
+                        "graphics::create_sprite(name, width, height) requires string + numbers"
+                    )
+                }
+            }
             "graphics::render_mesh" => {
                 if let (Some(mesh_id), Some(mat_id)) = (
                     args.get(0).and_then(|v| v.as_i64()),
@@ -4272,6 +4504,163 @@ impl Interpreter {
                 }
             }
             "graphics::clear" => Ok(Value::Bool(true)),
+
+            // ── Render command-buffer API (AoT/host friendly) ───────────────
+            "render::begin_frame" => {
+                if let (Some(w), Some(h)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                ) {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    render.begin_frame(w.max(1) as u32, h.max(1) as u32);
+                    Ok(Value::Bool(true))
+                } else {
+                    rt_err!("render::begin_frame(width, height) requires integer width/height")
+                }
+            }
+            "render::clear" => {
+                let r = args.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let g = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let b = args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let a = args.get(3).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                render.queue_clear([r, g, b, a]);
+                Ok(Value::Bool(true))
+            }
+            "render::rect" => {
+                if let (Some(x), Some(y), Some(w), Some(h)) = (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                    args.get(3).and_then(|v| v.as_f64()),
+                ) {
+                    let r = args.get(4).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                    let g = args.get(5).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                    let b = args.get(6).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                    let a = args.get(7).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                    let layer = args.get(8).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    render.queue_rect(
+                        x as f32,
+                        y as f32,
+                        w.max(0.0) as f32,
+                        h.max(0.0) as f32,
+                        [r, g, b, a],
+                        layer,
+                    );
+                    Ok(Value::Bool(true))
+                } else {
+                    rt_err!("render::rect(x, y, w, h, r?, g?, b?, a?, layer?) requires at least x/y/w/h")
+                }
+            }
+            "render::sprite" => {
+                if let (Some(sprite_id), Some(x), Some(y), Some(w), Some(h)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                    args.get(3).and_then(|v| v.as_f64()),
+                    args.get(4).and_then(|v| v.as_f64()),
+                ) {
+                    let rotation = args.get(5).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                    let layer = args.get(6).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    match render.queue_sprite(
+                        sprite_id as u32,
+                        x as f32,
+                        y as f32,
+                        w.max(0.0) as f32,
+                        h.max(0.0) as f32,
+                        rotation,
+                        layer,
+                    ) {
+                        Ok(()) => Ok(Value::Bool(true)),
+                        Err(e) => rt_err!("render::sprite failed: {}", e),
+                    }
+                } else {
+                    rt_err!("render::sprite(sprite_id, x, y, w, h, rotation_deg?, layer?) requires sprite_id/x/y/w/h")
+                }
+            }
+            "render::flush" => {
+                let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                let mut out = Vec::with_capacity(render.command_buffer.len());
+                for cmd in render.command_buffer.drain(..) {
+                    let mut entry = HashMap::with_capacity(8);
+                    match cmd {
+                        RenderCommand::Clear { color } => {
+                            entry.insert("kind".into(), Value::Str("clear".into()));
+                            entry.insert(
+                                "color".into(),
+                                Value::Array(Arc::new(Mutex::new(vec![
+                                    Value::F32(color[0]),
+                                    Value::F32(color[1]),
+                                    Value::F32(color[2]),
+                                    Value::F32(color[3]),
+                                ]))),
+                            );
+                        }
+                        RenderCommand::Rect {
+                            x,
+                            y,
+                            w,
+                            h,
+                            color,
+                            layer,
+                        } => {
+                            entry.insert("kind".into(), Value::Str("rect".into()));
+                            entry.insert("x".into(), Value::F32(x));
+                            entry.insert("y".into(), Value::F32(y));
+                            entry.insert("w".into(), Value::F32(w));
+                            entry.insert("h".into(), Value::F32(h));
+                            entry.insert("layer".into(), Value::I64(layer as i64));
+                            entry.insert(
+                                "color".into(),
+                                Value::Array(Arc::new(Mutex::new(vec![
+                                    Value::F32(color[0]),
+                                    Value::F32(color[1]),
+                                    Value::F32(color[2]),
+                                    Value::F32(color[3]),
+                                ]))),
+                            );
+                        }
+                        RenderCommand::Sprite {
+                            sprite_id,
+                            x,
+                            y,
+                            w,
+                            h,
+                            rotation_deg,
+                            layer,
+                        } => {
+                            entry.insert("kind".into(), Value::Str("sprite".into()));
+                            entry.insert("sprite_id".into(), Value::I64(sprite_id as i64));
+                            entry.insert("x".into(), Value::F32(x));
+                            entry.insert("y".into(), Value::F32(y));
+                            entry.insert("w".into(), Value::F32(w));
+                            entry.insert("h".into(), Value::F32(h));
+                            entry.insert("rotation_deg".into(), Value::F32(rotation_deg));
+                            entry.insert("layer".into(), Value::I64(layer as i64));
+                        }
+                    }
+                    out.push(Value::HashMap(Arc::new(Mutex::new(entry))));
+                }
+                Ok(Value::Array(Arc::new(Mutex::new(out))))
+            }
+            "render::stats" => {
+                let render = self.render_state.as_ref().unwrap().lock().unwrap();
+                let mut map = HashMap::new();
+                map.insert("width".into(), Value::I64(render.width as i64));
+                map.insert("height".into(), Value::I64(render.height as i64));
+                map.insert(
+                    "queued_commands".into(),
+                    Value::I64(render.command_buffer.len() as i64),
+                );
+                map.insert("sprites".into(), Value::I64(render.sprites.len() as i64));
+                map.insert(
+                    "materials".into(),
+                    Value::I64(render.materials.len() as i64),
+                );
+                Ok(Value::HashMap(Arc::new(Mutex::new(map))))
+            }
 
             // ── Input functions ───────────────────────────────────────────────────
             "input::is_key_pressed" => {
@@ -5495,6 +5884,30 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
         }
     }
 
+    // Fast-path integer comparisons to avoid numeric widening/conversion.
+    let int_cmp = match (&l, &r, op) {
+        (Value::I64(a), Value::I64(b), BinOpKind::Lt) => Some(*a < *b),
+        (Value::I64(a), Value::I64(b), BinOpKind::Le) => Some(*a <= *b),
+        (Value::I64(a), Value::I64(b), BinOpKind::Gt) => Some(*a > *b),
+        (Value::I64(a), Value::I64(b), BinOpKind::Ge) => Some(*a >= *b),
+        (Value::I32(a), Value::I32(b), BinOpKind::Lt) => Some(*a < *b),
+        (Value::I32(a), Value::I32(b), BinOpKind::Le) => Some(*a <= *b),
+        (Value::I32(a), Value::I32(b), BinOpKind::Gt) => Some(*a > *b),
+        (Value::I32(a), Value::I32(b), BinOpKind::Ge) => Some(*a >= *b),
+        (Value::I64(a), Value::I32(b), BinOpKind::Lt) => Some(*a < *b as i64),
+        (Value::I64(a), Value::I32(b), BinOpKind::Le) => Some(*a <= *b as i64),
+        (Value::I64(a), Value::I32(b), BinOpKind::Gt) => Some(*a > *b as i64),
+        (Value::I64(a), Value::I32(b), BinOpKind::Ge) => Some(*a >= *b as i64),
+        (Value::I32(a), Value::I64(b), BinOpKind::Lt) => Some((*a as i64) < *b),
+        (Value::I32(a), Value::I64(b), BinOpKind::Le) => Some((*a as i64) <= *b),
+        (Value::I32(a), Value::I64(b), BinOpKind::Gt) => Some((*a as i64) > *b),
+        (Value::I32(a), Value::I64(b), BinOpKind::Ge) => Some((*a as i64) >= *b),
+        _ => None,
+    };
+    if let Some(b) = int_cmp {
+        return Ok(Value::Bool(b));
+    }
+
     // Comparison operators — always return Bool.
     let cmp_result = match op {
         BinOpKind::Eq => Some(value_eq(&l, &r)),
@@ -5509,6 +5922,15 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
         return Ok(Value::Bool(b));
     }
 
+    // Fast-path integer arithmetic for common loop-heavy workloads.
+    match (&l, &r) {
+        (Value::I64(a), Value::I64(b)) => return Ok(Value::I64(arith_i64(op, *a, *b)?)),
+        (Value::I32(a), Value::I32(b)) => return Ok(Value::I32(arith_i32(op, *a, *b)?)),
+        (Value::I64(a), Value::I32(b)) => return Ok(Value::I64(arith_i64(op, *a, *b as i64)?)),
+        (Value::I32(a), Value::I64(b)) => return Ok(Value::I64(arith_i64(op, *a as i64, *b)?)),
+        _ => {}
+    }
+
     // Numeric arithmetic — promote to widest common type.
     match (&l, &r) {
         (Value::F64(a), _) | (_, Value::F64(a)) => {
@@ -5520,11 +5942,6 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
             let b = r.as_f64().or_else(|| l.as_f64()).unwrap_or(*a as f64);
             let a = l.as_f64().unwrap_or(*a as f64);
             Ok(Value::F32(arith_f64(op, a, b)? as f32))
-        }
-        (Value::I64(_), _) | (_, Value::I64(_)) => {
-            let a = l.as_i64().unwrap_or(0);
-            let b = r.as_i64().unwrap_or(0);
-            Ok(Value::I64(arith_i64(op, a, b)?))
         }
         _ => {
             let a = l.as_i64().unwrap_or(0);
@@ -5557,6 +5974,32 @@ fn arith_f64(op: BinOpKind, a: f64, b: f64) -> Result<f64, RuntimeError> {
 }
 
 fn arith_i64(op: BinOpKind, a: i64, b: i64) -> Result<i64, RuntimeError> {
+    Ok(match op {
+        BinOpKind::Add => a.wrapping_add(b),
+        BinOpKind::Sub => a.wrapping_sub(b),
+        BinOpKind::Mul => a.wrapping_mul(b),
+        BinOpKind::Div => {
+            if b == 0 {
+                return rt_err!("division by zero");
+            }
+            a / b
+        }
+        BinOpKind::Rem => {
+            if b == 0 {
+                return rt_err!("modulo by zero");
+            }
+            a % b
+        }
+        BinOpKind::BitAnd => a & b,
+        BinOpKind::BitOr => a | b,
+        BinOpKind::BitXor => a ^ b,
+        BinOpKind::Shl => a << (b as u32),
+        BinOpKind::Shr => a >> (b as u32),
+        _ => return rt_err!("operator not defined for integers"),
+    })
+}
+
+fn arith_i32(op: BinOpKind, a: i32, b: i32) -> Result<i32, RuntimeError> {
     Ok(match op {
         BinOpKind::Add => a.wrapping_add(b),
         BinOpKind::Sub => a.wrapping_sub(b),
@@ -6640,11 +7083,22 @@ mod tests {
             assert!(m.contains_key("tensor"));
             assert!(m.contains_key("nn"));
             assert!(m.contains_key("train"));
+            assert!(m.contains_key("render"));
             if let Some(Value::Array(math_mod)) = m.get("math") {
                 let vals = math_mod.lock().unwrap();
-                assert!(vals.iter().any(|v| matches!(v, Value::Str(s) if s == "distance2")));
+                assert!(vals
+                    .iter()
+                    .any(|v| matches!(v, Value::Str(s) if s == "distance2")));
             } else {
                 panic!("expected math module list");
+            }
+            if let Some(Value::Array(render_mod)) = m.get("render") {
+                let vals = render_mod.lock().unwrap();
+                assert!(vals
+                    .iter()
+                    .any(|v| matches!(v, Value::Str(s) if s == "render::flush")));
+            } else {
+                panic!("expected render module list");
             }
         } else {
             panic!("expected hashmap from std::modules");
@@ -6704,7 +7158,10 @@ mod tests {
         let e = interp
             .eval_builtin(
                 "sim::spawn",
-                vec![Value::I64(world_id), Value::HashMap(Arc::new(Mutex::new(entity)))],
+                vec![
+                    Value::I64(world_id),
+                    Value::HashMap(Arc::new(Mutex::new(entity))),
+                ],
             )
             .unwrap();
         let entity_id = match e {
@@ -6742,7 +7199,9 @@ mod tests {
             _ => panic!("expected window id"),
         };
         assert!(matches!(
-            interp.eval_builtin("window::open", vec![Value::I64(win_id)]).unwrap(),
+            interp
+                .eval_builtin("window::open", vec![Value::I64(win_id)])
+                .unwrap(),
             Value::Bool(true)
         ));
         interp
@@ -6767,7 +7226,9 @@ mod tests {
             .eval_builtin("window::close", vec![Value::I64(win_id)])
             .unwrap();
         assert!(matches!(
-            interp.eval_builtin("window::open", vec![Value::I64(win_id)]).unwrap(),
+            interp
+                .eval_builtin("window::open", vec![Value::I64(win_id)])
+                .unwrap(),
             Value::Bool(false)
         ));
     }
@@ -6804,8 +7265,14 @@ mod tests {
             .unwrap();
         if let Value::Array(arr) = norm {
             let vals = arr.lock().unwrap();
-            let a = match vals[0] { Value::F32(v) => v, _ => 0.0 };
-            let b = match vals[1] { Value::F32(v) => v, _ => 0.0 };
+            let a = match vals[0] {
+                Value::F32(v) => v,
+                _ => 0.0,
+            };
+            let b = match vals[1] {
+                Value::F32(v) => v,
+                _ => 0.0,
+            };
             assert!((a - 0.6).abs() < 1e-5);
             assert!((b - 0.8).abs() < 1e-5);
         } else {
@@ -6818,19 +7285,27 @@ mod tests {
                 vec![Value::I32(320), Value::I32(200), Value::Str("T".into())],
             )
             .unwrap();
-        let id = match w { Value::I64(i) => i, _ => panic!("expected id") };
+        let id = match w {
+            Value::I64(i) => i,
+            _ => panic!("expected id"),
+        };
         interp
             .eval_builtin("window::present", vec![Value::I64(id)])
             .unwrap();
         assert!(matches!(
-            interp.eval_builtin("window::frames", vec![Value::I64(id)]).unwrap(),
+            interp
+                .eval_builtin("window::frames", vec![Value::I64(id)])
+                .unwrap(),
             Value::I64(1)
         ));
         assert!(matches!(
             interp.eval_builtin("window::title", vec![Value::I64(id)]).unwrap(),
             Value::Str(ref s) if s == "T"
         ));
-        if let Value::Array(sz) = interp.eval_builtin("window::size", vec![Value::I64(id)]).unwrap() {
+        if let Value::Array(sz) = interp
+            .eval_builtin("window::size", vec![Value::I64(id)])
+            .unwrap()
+        {
             let s = sz.lock().unwrap();
             assert!(matches!(s[0], Value::I64(320)));
             assert!(matches!(s[1], Value::I64(200)));
@@ -6860,12 +7335,18 @@ mod tests {
             );
             entity.insert(
                 "velocity".into(),
-                Value::Array(Arc::new(Mutex::new(vec![Value::F32(0.2), Value::F32(-0.1)]))),
+                Value::Array(Arc::new(Mutex::new(vec![
+                    Value::F32(0.2),
+                    Value::F32(-0.1),
+                ]))),
             );
             let _ = interp
                 .eval_builtin(
                     "sim::spawn",
-                    vec![Value::I64(world_id), Value::HashMap(Arc::new(Mutex::new(entity)))],
+                    vec![
+                        Value::I64(world_id),
+                        Value::HashMap(Arc::new(Mutex::new(entity))),
+                    ],
                 )
                 .unwrap();
         }
@@ -6889,12 +7370,109 @@ mod tests {
     }
 
     #[test]
+    fn test_render_command_buffer_api() {
+        let mut interp = mk_interp();
+        interp
+            .eval_builtin(
+                "render::begin_frame",
+                vec![Value::I64(1280), Value::I64(720)],
+            )
+            .unwrap();
+        interp
+            .eval_builtin(
+                "render::clear",
+                vec![
+                    Value::F32(0.1),
+                    Value::F32(0.2),
+                    Value::F32(0.3),
+                    Value::F32(1.0),
+                ],
+            )
+            .unwrap();
+        interp
+            .eval_builtin(
+                "render::rect",
+                vec![
+                    Value::F32(20.0),
+                    Value::F32(30.0),
+                    Value::F32(64.0),
+                    Value::F32(16.0),
+                    Value::F32(1.0),
+                    Value::F32(0.0),
+                    Value::F32(0.0),
+                    Value::F32(1.0),
+                    Value::I64(2),
+                ],
+            )
+            .unwrap();
+        let sprite_id = match interp
+            .eval_builtin(
+                "graphics::create_sprite",
+                vec![
+                    Value::Str("hero".into()),
+                    Value::F32(32.0),
+                    Value::F32(32.0),
+                ],
+            )
+            .unwrap()
+        {
+            Value::I64(id) => id,
+            _ => panic!("expected sprite id"),
+        };
+        interp
+            .eval_builtin(
+                "render::sprite",
+                vec![
+                    Value::I64(sprite_id),
+                    Value::F32(48.0),
+                    Value::F32(64.0),
+                    Value::F32(32.0),
+                    Value::F32(32.0),
+                    Value::F32(45.0),
+                    Value::I64(3),
+                ],
+            )
+            .unwrap();
+
+        let stats = interp.eval_builtin("render::stats", vec![]).unwrap();
+        if let Value::HashMap(m) = stats {
+            let m = m.lock().unwrap();
+            assert!(matches!(m.get("width"), Some(Value::I64(1280))));
+            assert!(matches!(m.get("height"), Some(Value::I64(720))));
+            assert!(matches!(m.get("queued_commands"), Some(Value::I64(3))));
+        } else {
+            panic!("expected render::stats map");
+        }
+
+        let flushed = interp.eval_builtin("render::flush", vec![]).unwrap();
+        if let Value::Array(cmds) = flushed {
+            let cmds = cmds.lock().unwrap();
+            assert_eq!(cmds.len(), 3);
+        } else {
+            panic!("expected command list from render::flush");
+        }
+
+        let stats_after = interp.eval_builtin("render::stats", vec![]).unwrap();
+        if let Value::HashMap(m) = stats_after {
+            let m = m.lock().unwrap();
+            assert!(matches!(m.get("queued_commands"), Some(Value::I64(0))));
+        } else {
+            panic!("expected render::stats map");
+        }
+    }
+
+    #[test]
     fn test_game_math_helpers() {
         let mut interp = mk_interp();
         let dot = interp
             .eval_builtin(
                 "math::dot2",
-                vec![Value::F32(1.0), Value::F32(2.0), Value::F32(3.0), Value::F32(4.0)],
+                vec![
+                    Value::F32(1.0),
+                    Value::F32(2.0),
+                    Value::F32(3.0),
+                    Value::F32(4.0),
+                ],
             )
             .unwrap();
         assert!(matches!(dot, Value::F32(v) if (v - 11.0).abs() < 1e-6));
@@ -6902,7 +7480,12 @@ mod tests {
         let dist = interp
             .eval_builtin(
                 "math::distance2",
-                vec![Value::F32(0.0), Value::F32(0.0), Value::F32(3.0), Value::F32(4.0)],
+                vec![
+                    Value::F32(0.0),
+                    Value::F32(0.0),
+                    Value::F32(3.0),
+                    Value::F32(4.0),
+                ],
             )
             .unwrap();
         assert!(matches!(dist, Value::F32(v) if (v - 5.0).abs() < 1e-6));
@@ -6920,6 +7503,75 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(remap, Value::F32(v) if v.abs() < 1e-6));
+
+        let approach = interp
+            .eval_builtin(
+                "math::approach",
+                vec![Value::F32(0.0), Value::F32(10.0), Value::F32(3.0)],
+            )
+            .unwrap();
+        assert!(matches!(approach, Value::F32(v) if (v - 3.0).abs() < 1e-6));
+
+        let move_towards = interp
+            .eval_builtin(
+                "math::move_towards2",
+                vec![
+                    Value::F32(0.0),
+                    Value::F32(0.0),
+                    Value::F32(3.0),
+                    Value::F32(4.0),
+                    Value::F32(2.5),
+                ],
+            )
+            .unwrap();
+        if let Value::Array(v) = move_towards {
+            let v = v.lock().unwrap();
+            let x = match v[0] {
+                Value::F32(n) => n,
+                _ => panic!("x should be f32"),
+            };
+            let y = match v[1] {
+                Value::F32(n) => n,
+                _ => panic!("y should be f32"),
+            };
+            assert!((x - 1.5).abs() < 1e-6);
+            assert!((y - 2.0).abs() < 1e-6);
+        } else {
+            panic!("expected [x, y] from move_towards2");
+        }
+
+        let angle = interp
+            .eval_builtin(
+                "math::angle_to",
+                vec![
+                    Value::F32(0.0),
+                    Value::F32(0.0),
+                    Value::F32(0.0),
+                    Value::F32(1.0),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(angle, Value::F32(v) if (v - std::f32::consts::FRAC_PI_2).abs() < 1e-6));
+
+        interp
+            .eval_builtin("math::random_seed", vec![Value::I64(123)])
+            .unwrap();
+        let unit = interp.eval_builtin("math::rand_unit2", vec![]).unwrap();
+        if let Value::Array(v) = unit {
+            let v = v.lock().unwrap();
+            let x = match v[0] {
+                Value::F32(n) => n,
+                _ => panic!("x should be f32"),
+            };
+            let y = match v[1] {
+                Value::F32(n) => n,
+                _ => panic!("y should be f32"),
+            };
+            let len = (x * x + y * y).sqrt();
+            assert!((len - 1.0).abs() < 1e-5);
+        } else {
+            panic!("expected unit vector");
+        }
     }
 
     #[test]
@@ -7299,6 +7951,73 @@ mod tests {
         assert!(
             matches!(result, Value::I32(10)),
             "0+1+2+3+4 = 10, got {result}"
+        );
+    }
+
+    #[test]
+    fn test_interp_string_for_loop() {
+        let mut i = mk_interp();
+        let mut env = Env::new();
+        let block = Block {
+            span: sp(),
+            stmts: vec![
+                Stmt::Let {
+                    span: sp(),
+                    pattern: Pattern::Ident {
+                        span: sp(),
+                        name: "acc".into(),
+                        mutable: true,
+                    },
+                    ty: None,
+                    init: Some(Expr::IntLit {
+                        span: sp(),
+                        value: 0,
+                    }),
+                    mutable: true,
+                },
+                Stmt::ForIn {
+                    span: sp(),
+                    pattern: Pattern::Ident {
+                        span: sp(),
+                        name: "ch".into(),
+                        mutable: false,
+                    },
+                    iter: Expr::StrLit {
+                        span: sp(),
+                        value: "abc".into(),
+                    },
+                    body: Block {
+                        span: sp(),
+                        stmts: vec![Stmt::Expr {
+                            span: sp(),
+                            has_semi: true,
+                            expr: Expr::Assign {
+                                span: sp(),
+                                op: AssignOpKind::AddAssign,
+                                target: Box::new(Expr::Ident {
+                                    span: sp(),
+                                    name: "acc".into(),
+                                }),
+                                value: Box::new(Expr::IntLit {
+                                    span: sp(),
+                                    value: 1,
+                                }),
+                            },
+                        }],
+                        tail: None,
+                    },
+                    label: None,
+                },
+            ],
+            tail: Some(Box::new(Expr::Ident {
+                span: sp(),
+                name: "acc".into(),
+            })),
+        };
+        let result = i.eval_block(&block, &mut env).unwrap();
+        assert!(
+            matches!(result, Value::I32(3)),
+            "expected 3 chars, got {result}"
         );
     }
 

@@ -28,6 +28,10 @@ path = "micro-benchmark.rs"
 name = "bench-chess-ml"
 path = "tools/bench_chess_ml.rs"
 
+[[bin]]
+name = "bench-interp-vs-rust"
+path = "tools/bench_interp_vs_rust.rs"
+
 [dependencies]
 pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 numpy = { version = "0.21", optional = true }
