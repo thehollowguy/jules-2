@@ -27,7 +27,8 @@
 
 #![allow(clippy::match_single_binding, clippy::large_enum_variant)]
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -1458,6 +1459,134 @@ impl fmt::Debug for FnClosure {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SimEntityState {
+    pos: [f32; 2],
+    vel: [f32; 2],
+    half_extents: [f32; 2],
+}
+
+#[derive(Debug, Clone)]
+struct SimWorldState {
+    dt: f32,
+    entities: HashMap<i64, SimEntityState>,
+    next_entity_id: i64,
+    seed: u64,
+    step_count: u64,
+}
+
+impl SimWorldState {
+    fn new(dt: f32, seed: u64) -> Self {
+        Self {
+            dt,
+            entities: HashMap::new(),
+            next_entity_id: 1,
+            seed,
+            step_count: 0,
+        }
+    }
+
+    fn spawn(&mut self, pos: [f32; 2], vel: [f32; 2], half_extents: [f32; 2]) -> i64 {
+        let id = self.next_entity_id;
+        self.next_entity_id += 1;
+        self.entities.insert(
+            id,
+            SimEntityState {
+                pos,
+                vel,
+                half_extents,
+            },
+        );
+        id
+    }
+
+    fn step(&mut self, dt_override: Option<f32>) {
+        let dt = dt_override.unwrap_or(self.dt).max(0.0);
+        self.step_count = self.step_count.wrapping_add(1);
+        self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        for e in self.entities.values_mut() {
+            e.pos[0] += e.vel[0] * dt;
+            e.pos[1] += e.vel[1] * dt;
+        }
+
+        // Deterministic broadphase via uniform grid + local-neighborhood checks.
+        // This keeps behavior deterministic while reducing pair checks in dense worlds.
+        let mut max_extent = 0.5_f32;
+        for e in self.entities.values() {
+            max_extent = max_extent.max(e.half_extents[0]).max(e.half_extents[1]);
+        }
+        let cell_size = (max_extent * 2.0).max(0.25);
+
+        let mut grid: HashMap<(i32, i32), Vec<i64>> = HashMap::new();
+        let mut ids = self.entities.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        for id in &ids {
+            if let Some(e) = self.entities.get(id) {
+                let cx = (e.pos[0] / cell_size).floor() as i32;
+                let cy = (e.pos[1] / cell_size).floor() as i32;
+                grid.entry((cx, cy)).or_default().push(*id);
+            }
+        }
+        for bucket in grid.values_mut() {
+            bucket.sort_unstable();
+        }
+
+        let mut processed: HashSet<(i64, i64)> = HashSet::new();
+        for id in &ids {
+            let e = match self.entities.get(id) {
+                Some(e) => e,
+                None => continue,
+            };
+            let cx = (e.pos[0] / cell_size).floor() as i32;
+            let cy = (e.pos[1] / cell_size).floor() as i32;
+            for ox in -1..=1 {
+                for oy in -1..=1 {
+                    if let Some(candidates) = grid.get(&(cx + ox, cy + oy)) {
+                        for other_id in candidates {
+                            if other_id <= id {
+                                continue;
+                            }
+                            let pair = (*id, *other_id);
+                            if processed.contains(&pair) {
+                                continue;
+                            }
+                            processed.insert(pair);
+                            let (a, b) = match (self.entities.get(id), self.entities.get(other_id))
+                            {
+                                (Some(a), Some(b)) => (a.clone(), b.clone()),
+                                _ => continue,
+                            };
+                            let overlap_x =
+                                (a.pos[0] - b.pos[0]).abs() <= (a.half_extents[0] + b.half_extents[0]);
+                            let overlap_y =
+                                (a.pos[1] - b.pos[1]).abs() <= (a.half_extents[1] + b.half_extents[1]);
+                            if overlap_x && overlap_y {
+                                if let Some(a_mut) = self.entities.get_mut(id) {
+                                    a_mut.vel[0] = -a.vel[0];
+                                    a_mut.vel[1] = -a.vel[1];
+                                }
+                                if let Some(b_mut) = self.entities.get_mut(other_id) {
+                                    b_mut.vel[0] = -b.vel[0];
+                                    b_mut.vel[1] = -b.vel[1];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WindowState {
+    width: i64,
+    height: i64,
+    title: String,
+    is_open: bool,
+    frame_count: u64,
+}
+
 // =============================================================================
 // §9  INTERPRETER
 // =============================================================================
@@ -1490,6 +1619,12 @@ pub struct Interpreter {
     pub computation_graph: Option<Arc<Mutex<ComputationGraph>>>,
     /// Active optimizers indexed by ID (ML integration)
     pub optimizers: HashMap<String, (Optimizer, OptimizerState)>,
+    /// Deterministic simulation worlds (`sim` module)
+    sim_worlds: HashMap<i64, SimWorldState>,
+    next_sim_world_id: i64,
+    /// Headless window state handles (`window` module)
+    windows: HashMap<i64, WindowState>,
+    next_window_id: i64,
 }
 
 impl Interpreter {
@@ -1508,6 +1643,10 @@ impl Interpreter {
             input_state: Some(Arc::new(Mutex::new(InputState::new()))),
             computation_graph: Some(Arc::new(Mutex::new(ComputationGraph::new()))),
             optimizers: HashMap::new(),
+            sim_worlds: HashMap::new(),
+            next_sim_world_id: 1,
+            windows: HashMap::new(),
+            next_window_id: 1,
         }
     }
 
@@ -2477,8 +2616,89 @@ impl Interpreter {
 
     // ── Built-in function dispatch ────────────────────────────────────────────
 
+    fn canonical_builtin_name<'a>(&self, name: &'a str) -> Cow<'a, str> {
+        let canonical = match name {
+            // stdlib module aliases (core/math/tensor/nn/train/data/io/collections/...)
+            "core::some" | "core::Some" => "Some",
+            "core::none" | "core::None" => "None",
+            "core::ok" | "core::Ok" => "Ok",
+            "core::err" | "core::Err" => "Err",
+            "core::unwrap" => "unwrap",
+            "core::is_some" => "is_some",
+            "core::is_none" => "is_none",
+            "core::is_ok" => "is_ok",
+            "core::is_err" => "is_err",
+            "collections::map_new" => "HashMap::new",
+            "collections::len" => "len",
+            "collections::range" => "range",
+            "math::sin" => "sin",
+            "math::cos" => "cos",
+            "math::tan" => "tan",
+            "math::exp" => "exp",
+            "math::log" => "log",
+            "math::sqrt" => "sqrt",
+            "math::tanh" => "tanh",
+            "math::lerp" => "mix",
+            "math::smoothstep" => "smoothstep",
+            "math::clamp01" => "math::clamp01",
+            "tensor::zeros" => "zeros",
+            "tensor::ones" => "ones",
+            "tensor::random_seed" => "math::random_seed",
+            "nn::cross_entropy" => "loss::cross_entropy",
+            "nn::mse" => "loss::mse",
+            "train::optimizer_create" => "optimizer::create",
+            "train::optimizer_step" => "optimizer::step",
+            "data::dataloader" => "dataloader",
+            "data::pipeline" => "pipeline",
+            "io::read_text" => "read_file",
+            "io::write_text" => "write_file",
+            "model::load_ir" => "read_file",
+            "model::save_ir" => "write_file",
+            "model::load_weights" => "sys::read_bytes",
+            "model::save_weights" => "sys::write_bytes",
+            "debug::trace" => "dbg",
+            "sim::world_new" => "sim::world",
+            "window::new" => "window::create",
+            _ => return Cow::Borrowed(name),
+        };
+        Cow::Borrowed(canonical)
+    }
+
+    fn stdlib_modules_value(&self) -> Value {
+        let modules: [(&str, &[&str]); 17] = [
+            ("core", &["Some", "None", "Ok", "Err", "unwrap", "is_some", "is_none", "is_ok", "is_err"]),
+            ("math", &["sin", "cos", "tan", "exp", "log", "sqrt", "tanh", "softmax", "random", "random_seed", "rand_int", "sigmoid", "relu", "lerp", "smoothstep", "dot2", "length2", "distance2", "remap", "clamp01"]),
+            ("tensor", &["zeros", "ones", "sum", "mean", "max", "softmax", "normalize"]),
+            ("nn", &["relu", "gelu", "sigmoid", "tanh", "cross_entropy", "mse"]),
+            ("train", &["optimizer::create", "optimizer::step"]),
+            ("data", &["dataloader", "pipeline"]),
+            ("io", &["read_file", "write_file", "append_file"]),
+            ("sys", &["sys::cwd", "sys::os", "sys::arch", "sys::list_dir"]),
+            ("error", &["Ok", "Err", "unwrap"]),
+            ("diag", &["diag::warn", "diag::perf_hint"]),
+            ("collections", &["HashMap::new", "len", "range"]),
+            ("compute", &["compute::device", "compute::parallel_map"]),
+            ("quant", &["quant::int8_export"]),
+            ("model", &["read_file", "write_file", "sys::read_bytes", "sys::write_bytes"]),
+            ("debug", &["dbg", "debug::tensor_shape", "debug::disable_jit"]),
+            ("sim", &["sim::world", "sim::spawn", "sim::step", "sim::get_state", "sim::state_tensor", "sim::apply", "sim::entity_count", "sim::nearest_entity", "sim::query_radius"]),
+            ("window", &["window::create", "window::open", "window::clear", "window::draw_rect", "window::present", "window::close", "window::input_key_down", "window::size", "window::title", "window::frames"]),
+        ];
+        let mut out = HashMap::new();
+        for (module, names) in modules {
+            let vals = names
+                .iter()
+                .map(|n| Value::Str((*n).to_string()))
+                .collect::<Vec<_>>();
+            out.insert(module.to_string(), Value::Array(Arc::new(Mutex::new(vals))));
+        }
+        Value::HashMap(Arc::new(Mutex::new(out)))
+    }
+
     fn eval_builtin(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         use std::f64::consts;
+        let canonical = self.canonical_builtin_name(name);
+        let name = canonical.as_ref();
 
         match name {
             // ── Math functions ────────────────────────────────────────────────
@@ -2734,6 +2954,106 @@ impl Interpreter {
                     _ => rt_err!("mix() requires three numbers"),
                 }
             }
+            "tanh" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.tanh() as f32))
+                } else {
+                    rt_err!("tanh() requires a number")
+                }
+            }
+            "math::random_seed" => {
+                if let Some(seed) = args.first().and_then(|v| v.as_i64()) {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    RAND_STATE.store(seed as u64, Relaxed);
+                    Ok(Value::Bool(true))
+                } else {
+                    rt_err!("math::random_seed(seed) requires integer seed")
+                }
+            }
+            "math::random" => Ok(Value::F32(pseudo_rand())),
+            "math::rand_int" => {
+                let lo = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+                let hi = args.get(1).and_then(|v| v.as_i64()).unwrap_or(lo + 1);
+                if hi <= lo {
+                    return rt_err!("math::rand_int(lo, hi) requires hi > lo");
+                }
+                let r = pseudo_rand();
+                let span = (hi - lo) as f32;
+                Ok(Value::I64(lo + (r * span).floor() as i64))
+            }
+            "math::sigmoid" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32((1.0 / (1.0 + (-x).exp())) as f32))
+                } else {
+                    rt_err!("math::sigmoid(x) requires a number")
+                }
+            }
+            "math::relu" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32((x.max(0.0)) as f32))
+                } else {
+                    rt_err!("math::relu(x) requires a number")
+                }
+            }
+            "math::clamp01" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.clamp(0.0, 1.0) as f32))
+                } else {
+                    rt_err!("math::clamp01(x) requires a number")
+                }
+            }
+            "math::dot2" => {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                    args.get(3).and_then(|v| v.as_f64()),
+                ) {
+                    (Some(ax), Some(ay), Some(bx), Some(by)) => Ok(Value::F32((ax * bx + ay * by) as f32)),
+                    _ => rt_err!("math::dot2(ax, ay, bx, by) requires four numbers"),
+                }
+            }
+            "math::length2" => {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                ) {
+                    (Some(x), Some(y)) => Ok(Value::F32((x * x + y * y).sqrt() as f32)),
+                    _ => rt_err!("math::length2(x, y) requires two numbers"),
+                }
+            }
+            "math::distance2" => {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                    args.get(3).and_then(|v| v.as_f64()),
+                ) {
+                    (Some(ax), Some(ay), Some(bx), Some(by)) => {
+                        let dx = ax - bx;
+                        let dy = ay - by;
+                        Ok(Value::F32((dx * dx + dy * dy).sqrt() as f32))
+                    }
+                    _ => rt_err!("math::distance2(ax, ay, bx, by) requires four numbers"),
+                }
+            }
+            "math::remap" => {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                    args.get(3).and_then(|v| v.as_f64()),
+                    args.get(4).and_then(|v| v.as_f64()),
+                ) {
+                    (Some(x), Some(in0), Some(in1), Some(out0), Some(out1)) => {
+                        let denom = (in1 - in0).abs().max(1e-12);
+                        let t = (x - in0) / denom;
+                        Ok(Value::F32((out0 + (out1 - out0) * t) as f32))
+                    }
+                    _ => rt_err!("math::remap(x, in0, in1, out0, out1) requires five numbers"),
+                }
+            }
+            "std::modules" => Ok(self.stdlib_modules_value()),
 
             "range" => {
                 let start = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -2791,6 +3111,112 @@ impl Interpreter {
                 let v = vec![Value::F32(1.0); len];
                 Ok(Value::Array(Arc::new(Mutex::new(v))))
             }
+            "math::softmax" | "tensor::softmax" => {
+                if let Some(Value::Array(a)) = args.first() {
+                    let values = a.lock().unwrap();
+                    let nums: Vec<f32> = values
+                        .iter()
+                        .map(|v| v.as_f64().map(|x| x as f32))
+                        .collect::<Option<Vec<f32>>>()
+                        .ok_or_else(|| RuntimeError::new("softmax requires numeric array"))?;
+                    let max = nums.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
+                    let exps: Vec<f32> = nums.iter().map(|x| (x - max).exp()).collect();
+                    let sum: f32 = exps.iter().sum();
+                    let out = exps
+                        .into_iter()
+                        .map(|x| Value::F32(x / sum.max(1e-12)))
+                        .collect::<Vec<_>>();
+                    Ok(Value::Array(Arc::new(Mutex::new(out))))
+                } else if let Some(Value::Tensor(t)) = args.first() {
+                    let out = t.read().unwrap().apply_activation(&Activation::Softmax);
+                    Ok(Value::Tensor(Arc::new(RwLock::new(out))))
+                } else {
+                    rt_err!("softmax requires Array[number] or Tensor")
+                }
+            }
+            "tensor::sum" => match args.first() {
+                Some(Value::Tensor(t)) => Ok(Value::F32(t.read().unwrap().sum_all())),
+                Some(Value::Array(a)) => {
+                    let mut s = 0.0f32;
+                    for v in a.lock().unwrap().iter() {
+                        s += v
+                            .as_f64()
+                            .ok_or_else(|| RuntimeError::new("tensor::sum expects numeric array"))?
+                            as f32;
+                    }
+                    Ok(Value::F32(s))
+                }
+                _ => rt_err!("tensor::sum expects Tensor or Array[number]"),
+            },
+            "tensor::mean" => match args.first() {
+                Some(Value::Tensor(t)) => {
+                    let tt = t.read().unwrap();
+                    Ok(Value::F32(tt.sum_all() / tt.numel().max(1) as f32))
+                }
+                Some(Value::Array(a)) => {
+                    let values = a.lock().unwrap();
+                    if values.is_empty() {
+                        return Ok(Value::F32(0.0));
+                    }
+                    let mut s = 0.0f32;
+                    for v in values.iter() {
+                        s += v
+                            .as_f64()
+                            .ok_or_else(|| RuntimeError::new("tensor::mean expects numeric array"))?
+                            as f32;
+                    }
+                    Ok(Value::F32(s / values.len() as f32))
+                }
+                _ => rt_err!("tensor::mean expects Tensor or Array[number]"),
+            },
+            "tensor::max" => match args.first() {
+                Some(Value::Tensor(t)) => {
+                    let tt = t.read().unwrap();
+                    let m = tt.cpu_data().iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    Ok(Value::F32(m))
+                }
+                Some(Value::Array(a)) => {
+                    let mut max_v = f32::NEG_INFINITY;
+                    for v in a.lock().unwrap().iter() {
+                        let x = v
+                            .as_f64()
+                            .ok_or_else(|| RuntimeError::new("tensor::max expects numeric array"))?
+                            as f32;
+                        max_v = max_v.max(x);
+                    }
+                    Ok(Value::F32(max_v))
+                }
+                _ => rt_err!("tensor::max expects Tensor or Array[number]"),
+            },
+            "tensor::normalize" => match args.first() {
+                Some(Value::Tensor(t)) => {
+                    let src = t.read().unwrap();
+                    let norm = src
+                        .cpu_data()
+                        .iter()
+                        .map(|x| x * x)
+                        .sum::<f32>()
+                        .sqrt()
+                        .max(1e-12);
+                    let data = src.cpu_data().iter().map(|x| x / norm).collect::<Vec<_>>();
+                    Ok(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(
+                        src.shape.clone(),
+                        data,
+                    )))))
+                }
+                Some(Value::Array(a)) => {
+                    let values = a.lock().unwrap();
+                    let nums = values
+                        .iter()
+                        .map(|v| v.as_f64().map(|x| x as f32))
+                        .collect::<Option<Vec<f32>>>()
+                        .ok_or_else(|| RuntimeError::new("tensor::normalize expects numeric array"))?;
+                    let norm = nums.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                    let out = nums.into_iter().map(|x| Value::F32(x / norm)).collect::<Vec<_>>();
+                    Ok(Value::Array(Arc::new(Mutex::new(out))))
+                }
+                _ => rt_err!("tensor::normalize expects Tensor or Array[number]"),
+            },
             "dataloader" | "pipeline" => {
                 let source = args.get(0).ok_or_else(|| {
                     RuntimeError::new("dataloader() requires a source array or tensor")
@@ -2864,6 +3290,390 @@ impl Interpreter {
             "dbg" => {
                 println!("[DEBUG] {:?}", args);
                 Ok(args.first().cloned().unwrap_or(Value::Unit))
+            }
+            "diag::warn" => {
+                if let Some(msg) = args.first().map(|v| v.to_string()) {
+                    eprintln!("[diag::warn] {}", msg);
+                    Ok(Value::Bool(true))
+                } else {
+                    rt_err!("diag::warn(message) requires a message")
+                }
+            }
+            "diag::perf_hint" => {
+                if let Some(msg) = args.first().map(|v| v.to_string()) {
+                    eprintln!("[diag::perf_hint] {}", msg);
+                    Ok(Value::Bool(true))
+                } else {
+                    rt_err!("diag::perf_hint(message) requires a message")
+                }
+            }
+            "compute::device" => Ok(Value::Str("cpu".to_string())),
+            "compute::parallel_map" => {
+                if let Some(Value::Array(a)) = args.first() {
+                    Ok(Value::Array(Arc::new(Mutex::new(a.lock().unwrap().clone()))))
+                } else {
+                    rt_err!("compute::parallel_map currently expects an array")
+                }
+            }
+            "debug::tensor_shape" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    let shape_vals = t
+                        .read()
+                        .unwrap()
+                        .shape
+                        .iter()
+                        .map(|d| Value::I64(*d as i64))
+                        .collect::<Vec<_>>();
+                    Ok(Value::Array(Arc::new(Mutex::new(shape_vals))))
+                } else {
+                    rt_err!("debug::tensor_shape requires a Tensor")
+                }
+            }
+            "debug::disable_jit" => Ok(Value::Bool(true)),
+            "quant::int8_export" => Ok(Value::Bool(true)),
+            "sim::world" => {
+                let dt = args
+                    .first()
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+                    .unwrap_or(0.016);
+                let seed = args.get(1).and_then(|v| v.as_i64()).unwrap_or(12345) as u64;
+                let world_id = self.next_sim_world_id;
+                self.next_sim_world_id += 1;
+                self.sim_worlds
+                    .insert(world_id, SimWorldState::new(dt.max(0.0), seed));
+                Ok(Value::I64(world_id))
+            }
+            "sim::spawn" => {
+                let world_id = args.get(0).and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("sim::spawn(world_id, entity) requires world_id")
+                })?;
+                let world = self
+                    .sim_worlds
+                    .get_mut(&world_id)
+                    .ok_or_else(|| RuntimeError::new("sim::spawn: unknown world id"))?;
+                let mut pos = [0.0_f32, 0.0_f32];
+                let mut vel = [0.0_f32, 0.0_f32];
+                let mut size = [0.5_f32, 0.5_f32];
+                if let Some(Value::HashMap(map)) = args.get(1) {
+                    let m = map.lock().unwrap();
+                    if let Some(Value::Array(arr)) = m.get("position") {
+                        let vals = arr.lock().unwrap();
+                        if vals.len() >= 2 {
+                            pos[0] = vals[0].as_f64().unwrap_or(0.0) as f32;
+                            pos[1] = vals[1].as_f64().unwrap_or(0.0) as f32;
+                        }
+                    }
+                    if let Some(Value::Array(arr)) = m.get("velocity") {
+                        let vals = arr.lock().unwrap();
+                        if vals.len() >= 2 {
+                            vel[0] = vals[0].as_f64().unwrap_or(0.0) as f32;
+                            vel[1] = vals[1].as_f64().unwrap_or(0.0) as f32;
+                        }
+                    }
+                    if let Some(Value::Array(arr)) = m.get("size") {
+                        let vals = arr.lock().unwrap();
+                        if vals.len() >= 2 {
+                            size[0] = vals[0].as_f64().unwrap_or(0.5) as f32 * 0.5;
+                            size[1] = vals[1].as_f64().unwrap_or(0.5) as f32 * 0.5;
+                        }
+                    }
+                }
+                let id = world.spawn(pos, vel, size);
+                Ok(Value::I64(id))
+            }
+            "sim::step" => {
+                let world_id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("sim::step(world_id, dt?) requires world_id"))?;
+                let dt = args.get(1).and_then(|v| v.as_f64()).map(|v| v as f32);
+                let world = self
+                    .sim_worlds
+                    .get_mut(&world_id)
+                    .ok_or_else(|| RuntimeError::new("sim::step: unknown world id"))?;
+                world.step(dt);
+                Ok(Value::Bool(true))
+            }
+            "sim::reset" => {
+                let world_id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("sim::reset(world_id) requires world_id"))?;
+                let seed = self
+                    .sim_worlds
+                    .get(&world_id)
+                    .map(|w| w.seed)
+                    .unwrap_or(12345);
+                let dt = self
+                    .sim_worlds
+                    .get(&world_id)
+                    .map(|w| w.dt)
+                    .unwrap_or(0.016);
+                self.sim_worlds
+                    .insert(world_id, SimWorldState::new(dt, seed));
+                Ok(Value::Bool(true))
+            }
+            "sim::apply" => {
+                let world_id = args
+                    .get(0)
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("sim::apply(world_id, entity_id, action) requires world_id"))?;
+                let entity_id = args
+                    .get(1)
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("sim::apply requires entity_id"))?;
+                let world = self
+                    .sim_worlds
+                    .get_mut(&world_id)
+                    .ok_or_else(|| RuntimeError::new("sim::apply: unknown world id"))?;
+                let ent = world
+                    .entities
+                    .get_mut(&entity_id)
+                    .ok_or_else(|| RuntimeError::new("sim::apply: unknown entity id"))?;
+                if let Some(Value::Array(action)) = args.get(2) {
+                    let a = action.lock().unwrap();
+                    if a.len() >= 2 {
+                        ent.vel[0] += a[0].as_f64().unwrap_or(0.0) as f32;
+                        ent.vel[1] += a[1].as_f64().unwrap_or(0.0) as f32;
+                    }
+                }
+                Ok(Value::Bool(true))
+            }
+            "sim::get_state" => {
+                let world_id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("sim::get_state(world_id) requires world_id"))?;
+                let world = self
+                    .sim_worlds
+                    .get(&world_id)
+                    .ok_or_else(|| RuntimeError::new("sim::get_state: unknown world id"))?;
+                let mut ids = world.entities.keys().copied().collect::<Vec<_>>();
+                ids.sort_unstable();
+                let mut out = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(e) = world.entities.get(&id) {
+                        let mut row = HashMap::new();
+                        row.insert("id".into(), Value::I64(id));
+                        row.insert(
+                            "position".into(),
+                            Value::Array(Arc::new(Mutex::new(vec![Value::F32(e.pos[0]), Value::F32(e.pos[1])]))),
+                        );
+                        row.insert(
+                            "velocity".into(),
+                            Value::Array(Arc::new(Mutex::new(vec![Value::F32(e.vel[0]), Value::F32(e.vel[1])]))),
+                        );
+                        out.push(Value::HashMap(Arc::new(Mutex::new(row))));
+                    }
+                }
+                Ok(Value::Array(Arc::new(Mutex::new(out))))
+            }
+            "sim::state_tensor" => {
+                let world_id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("sim::state_tensor(world_id) requires world_id"))?;
+                let world = self
+                    .sim_worlds
+                    .get(&world_id)
+                    .ok_or_else(|| RuntimeError::new("sim::state_tensor: unknown world id"))?;
+                let mut ids = world.entities.keys().copied().collect::<Vec<_>>();
+                ids.sort_unstable();
+                let mut data = Vec::with_capacity(ids.len() * 4);
+                for id in ids {
+                    if let Some(e) = world.entities.get(&id) {
+                        data.extend_from_slice(&[e.pos[0], e.pos[1], e.vel[0], e.vel[1]]);
+                    }
+                }
+                let t = Tensor::from_data(vec![world.entities.len(), 4], data);
+                Ok(Value::Tensor(Arc::new(RwLock::new(t))))
+            }
+            "sim::entity_count" => {
+                let world_id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("sim::entity_count(world_id) requires world_id"))?;
+                let world = self
+                    .sim_worlds
+                    .get(&world_id)
+                    .ok_or_else(|| RuntimeError::new("sim::entity_count: unknown world id"))?;
+                Ok(Value::I64(world.entities.len() as i64))
+            }
+            "sim::nearest_entity" => {
+                let world_id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("sim::nearest_entity(world_id, [x,y], radius?) requires world_id"))?;
+                let pos = match args.get(1) {
+                    Some(Value::Array(arr)) => {
+                        let vals = arr.lock().unwrap();
+                        if vals.len() < 2 {
+                            return rt_err!("sim::nearest_entity requires [x,y] position");
+                        }
+                        [vals[0].as_f64().unwrap_or(0.0) as f32, vals[1].as_f64().unwrap_or(0.0) as f32]
+                    }
+                    _ => return rt_err!("sim::nearest_entity requires [x,y] position"),
+                };
+                let radius = args.get(2).and_then(|v| v.as_f64()).unwrap_or(f64::INFINITY) as f32;
+                let radius2 = radius * radius;
+                let world = self
+                    .sim_worlds
+                    .get(&world_id)
+                    .ok_or_else(|| RuntimeError::new("sim::nearest_entity: unknown world id"))?;
+                let mut best: Option<(i64, f32)> = None;
+                for (id, e) in &world.entities {
+                    let dx = e.pos[0] - pos[0];
+                    let dy = e.pos[1] - pos[1];
+                    let d2 = dx * dx + dy * dy;
+                    if d2 > radius2 {
+                        continue;
+                    }
+                    match best {
+                        Some((_, bd2)) if d2 >= bd2 => {}
+                        _ => best = Some((*id, d2)),
+                    }
+                }
+                Ok(Value::I64(best.map(|(id, _)| id).unwrap_or(-1)))
+            }
+            "sim::query_radius" => {
+                let world_id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("sim::query_radius(world_id, [x,y], radius) requires world_id"))?;
+                let pos = match args.get(1) {
+                    Some(Value::Array(arr)) => {
+                        let vals = arr.lock().unwrap();
+                        if vals.len() < 2 {
+                            return rt_err!("sim::query_radius requires [x,y] position");
+                        }
+                        [vals[0].as_f64().unwrap_or(0.0) as f32, vals[1].as_f64().unwrap_or(0.0) as f32]
+                    }
+                    _ => return rt_err!("sim::query_radius requires [x,y] position"),
+                };
+                let radius = args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let radius2 = radius.max(0.0) * radius.max(0.0);
+                let world = self
+                    .sim_worlds
+                    .get(&world_id)
+                    .ok_or_else(|| RuntimeError::new("sim::query_radius: unknown world id"))?;
+                let mut ids = Vec::new();
+                for (id, e) in &world.entities {
+                    let dx = e.pos[0] - pos[0];
+                    let dy = e.pos[1] - pos[1];
+                    let d2 = dx * dx + dy * dy;
+                    if d2 <= radius2 {
+                        ids.push(*id);
+                    }
+                }
+                ids.sort_unstable();
+                let vals = ids.into_iter().map(Value::I64).collect::<Vec<_>>();
+                Ok(Value::Array(Arc::new(Mutex::new(vals))))
+            }
+            "window::create" => {
+                let width = args.get(0).and_then(|v| v.as_i64()).unwrap_or(800).max(1);
+                let height = args.get(1).and_then(|v| v.as_i64()).unwrap_or(600).max(1);
+                let title = args
+                    .get(2)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "Jules".to_string());
+                let id = self.next_window_id;
+                self.next_window_id += 1;
+                self.windows.insert(
+                    id,
+                    WindowState {
+                        width,
+                        height,
+                        title,
+                        is_open: true,
+                        frame_count: 0,
+                    },
+                );
+                Ok(Value::I64(id))
+            }
+            "window::open" => {
+                let id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("window::open(window_id) requires window_id"))?;
+                let is_open = self.windows.get(&id).map(|w| w.is_open).unwrap_or(false);
+                Ok(Value::Bool(is_open))
+            }
+            "window::clear" | "window::draw_rect" => {
+                let id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    RuntimeError::new("window::clear/draw_rect requires window_id")
+                })?;
+                if self.windows.contains_key(&id) {
+                    Ok(Value::Bool(true))
+                } else {
+                    rt_err!("window: unknown window id")
+                }
+            }
+            "window::present" => {
+                let id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("window::present(window_id) requires window_id"))?;
+                if let Some(w) = self.windows.get_mut(&id) {
+                    w.frame_count = w.frame_count.saturating_add(1);
+                    let _ = (w.width, w.height, w.title.len());
+                    // Keep deterministic upper bound to avoid accidental infinite loops in headless mode.
+                    if w.frame_count > 120_000 {
+                        w.is_open = false;
+                    }
+                    Ok(Value::Bool(true))
+                } else {
+                    rt_err!("window::present: unknown window id")
+                }
+            }
+            "window::close" => {
+                let id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("window::close(window_id) requires window_id"))?;
+                if let Some(w) = self.windows.get_mut(&id) {
+                    w.is_open = false;
+                    Ok(Value::Bool(true))
+                } else {
+                    rt_err!("window::close: unknown window id")
+                }
+            }
+            "window::input_key_down" => Ok(Value::Bool(false)),
+            "window::size" => {
+                let id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("window::size(window_id) requires window_id"))?;
+                if let Some(w) = self.windows.get(&id) {
+                    Ok(Value::Array(Arc::new(Mutex::new(vec![
+                        Value::I64(w.width),
+                        Value::I64(w.height),
+                    ]))))
+                } else {
+                    rt_err!("window::size: unknown window id")
+                }
+            }
+            "window::title" => {
+                let id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("window::title(window_id) requires window_id"))?;
+                if let Some(w) = self.windows.get(&id) {
+                    Ok(Value::Str(w.title.clone()))
+                } else {
+                    rt_err!("window::title: unknown window id")
+                }
+            }
+            "window::frames" => {
+                let id = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| RuntimeError::new("window::frames(window_id) requires window_id"))?;
+                if let Some(w) = self.windows.get(&id) {
+                    Ok(Value::I64(w.frame_count as i64))
+                } else {
+                    rt_err!("window::frames: unknown window id")
+                }
             }
 
             // ── Type conversion ───────────────────────────────────────────────
@@ -5815,6 +6625,367 @@ mod tests {
             assert_eq!(values, vec![1.0, 1.0]);
         } else {
             panic!("expected array from ones");
+        }
+    }
+
+    #[test]
+    fn test_stdlib_module_aliases_and_catalog() {
+        let mut interp = mk_interp();
+
+        let modules = interp.eval_builtin("std::modules", vec![]).unwrap();
+        if let Value::HashMap(map) = modules {
+            let m = map.lock().unwrap();
+            assert!(m.contains_key("core"));
+            assert!(m.contains_key("math"));
+            assert!(m.contains_key("tensor"));
+            assert!(m.contains_key("nn"));
+            assert!(m.contains_key("train"));
+            if let Some(Value::Array(math_mod)) = m.get("math") {
+                let vals = math_mod.lock().unwrap();
+                assert!(vals.iter().any(|v| matches!(v, Value::Str(s) if s == "distance2")));
+            } else {
+                panic!("expected math module list");
+            }
+        } else {
+            panic!("expected hashmap from std::modules");
+        }
+
+        let seeded = interp
+            .eval_builtin("math::random_seed", vec![Value::I64(1234)])
+            .unwrap();
+        assert!(matches!(seeded, Value::Bool(true)));
+        let r1 = interp.eval_builtin("math::random", vec![]).unwrap();
+        interp
+            .eval_builtin("math::random_seed", vec![Value::I64(1234)])
+            .unwrap();
+        let r2 = interp.eval_builtin("math::random", vec![]).unwrap();
+        match (r1, r2) {
+            (Value::F32(a), Value::F32(b)) => assert!((a - b).abs() < 1e-12),
+            _ => panic!("expected random values"),
+        }
+
+        let zeroes = interp
+            .eval_builtin("tensor::zeros", vec![Value::I32(4)])
+            .unwrap();
+        assert!(matches!(zeroes, Value::Array(_)));
+        let s = interp
+            .eval_builtin(
+                "tensor::sum",
+                vec![Value::Array(Arc::new(Mutex::new(vec![
+                    Value::I32(1),
+                    Value::I32(2),
+                    Value::I32(3),
+                ])))],
+            )
+            .unwrap();
+        assert!(matches!(s, Value::F32(v) if (v - 6.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_sim_and_window_minimal_loop() {
+        let mut interp = mk_interp();
+        let world = interp
+            .eval_builtin("sim::world", vec![Value::F32(0.1), Value::I64(7)])
+            .unwrap();
+        let world_id = match world {
+            Value::I64(id) => id,
+            _ => panic!("expected world id"),
+        };
+
+        let mut entity = HashMap::new();
+        entity.insert(
+            "position".into(),
+            Value::Array(Arc::new(Mutex::new(vec![Value::F32(0.0), Value::F32(0.0)]))),
+        );
+        entity.insert(
+            "velocity".into(),
+            Value::Array(Arc::new(Mutex::new(vec![Value::F32(1.0), Value::F32(0.0)]))),
+        );
+        let e = interp
+            .eval_builtin(
+                "sim::spawn",
+                vec![Value::I64(world_id), Value::HashMap(Arc::new(Mutex::new(entity)))],
+            )
+            .unwrap();
+        let entity_id = match e {
+            Value::I64(id) => id,
+            _ => panic!("expected entity id"),
+        };
+
+        interp
+            .eval_builtin("sim::step", vec![Value::I64(world_id), Value::F32(0.1)])
+            .unwrap();
+        let state = interp
+            .eval_builtin("sim::get_state", vec![Value::I64(world_id)])
+            .unwrap();
+        if let Value::Array(rows) = state {
+            let rows = rows.lock().unwrap();
+            assert_eq!(rows.len(), 1);
+            if let Value::HashMap(map) = &rows[0] {
+                let m = map.lock().unwrap();
+                assert!(matches!(m.get("id"), Some(Value::I64(id)) if *id == entity_id));
+            } else {
+                panic!("expected state row hashmap");
+            }
+        } else {
+            panic!("expected sim state array");
+        }
+
+        let win = interp
+            .eval_builtin(
+                "window::create",
+                vec![Value::I32(640), Value::I32(360), Value::Str("Sim".into())],
+            )
+            .unwrap();
+        let win_id = match win {
+            Value::I64(id) => id,
+            _ => panic!("expected window id"),
+        };
+        assert!(matches!(
+            interp.eval_builtin("window::open", vec![Value::I64(win_id)]).unwrap(),
+            Value::Bool(true)
+        ));
+        interp
+            .eval_builtin("window::clear", vec![Value::I64(win_id)])
+            .unwrap();
+        interp
+            .eval_builtin(
+                "window::draw_rect",
+                vec![
+                    Value::I64(win_id),
+                    Value::F32(0.0),
+                    Value::F32(0.0),
+                    Value::F32(10.0),
+                    Value::F32(10.0),
+                ],
+            )
+            .unwrap();
+        interp
+            .eval_builtin("window::present", vec![Value::I64(win_id)])
+            .unwrap();
+        interp
+            .eval_builtin("window::close", vec![Value::I64(win_id)])
+            .unwrap();
+        assert!(matches!(
+            interp.eval_builtin("window::open", vec![Value::I64(win_id)]).unwrap(),
+            Value::Bool(false)
+        ));
+    }
+
+    #[test]
+    fn test_expanded_stdlib_helpers() {
+        let mut interp = mk_interp();
+
+        interp
+            .eval_builtin("math::random_seed", vec![Value::I64(99)])
+            .unwrap();
+        let r = interp
+            .eval_builtin("math::rand_int", vec![Value::I64(10), Value::I64(20)])
+            .unwrap();
+        assert!(matches!(r, Value::I64(v) if (10..20).contains(&v)));
+
+        assert!(matches!(
+            interp.eval_builtin("math::clamp01", vec![Value::F32(2.5)]).unwrap(),
+            Value::F32(v) if (v - 1.0).abs() < 1e-6
+        ));
+        assert!(matches!(
+            interp.eval_builtin("math::sigmoid", vec![Value::F32(0.0)]).unwrap(),
+            Value::F32(v) if (v - 0.5).abs() < 1e-6
+        ));
+
+        let norm = interp
+            .eval_builtin(
+                "tensor::normalize",
+                vec![Value::Array(Arc::new(Mutex::new(vec![
+                    Value::F32(3.0),
+                    Value::F32(4.0),
+                ])))],
+            )
+            .unwrap();
+        if let Value::Array(arr) = norm {
+            let vals = arr.lock().unwrap();
+            let a = match vals[0] { Value::F32(v) => v, _ => 0.0 };
+            let b = match vals[1] { Value::F32(v) => v, _ => 0.0 };
+            assert!((a - 0.6).abs() < 1e-5);
+            assert!((b - 0.8).abs() < 1e-5);
+        } else {
+            panic!("expected normalized array");
+        }
+
+        let w = interp
+            .eval_builtin(
+                "window::create",
+                vec![Value::I32(320), Value::I32(200), Value::Str("T".into())],
+            )
+            .unwrap();
+        let id = match w { Value::I64(i) => i, _ => panic!("expected id") };
+        interp
+            .eval_builtin("window::present", vec![Value::I64(id)])
+            .unwrap();
+        assert!(matches!(
+            interp.eval_builtin("window::frames", vec![Value::I64(id)]).unwrap(),
+            Value::I64(1)
+        ));
+        assert!(matches!(
+            interp.eval_builtin("window::title", vec![Value::I64(id)]).unwrap(),
+            Value::Str(ref s) if s == "T"
+        ));
+        if let Value::Array(sz) = interp.eval_builtin("window::size", vec![Value::I64(id)]).unwrap() {
+            let s = sz.lock().unwrap();
+            assert!(matches!(s[0], Value::I64(320)));
+            assert!(matches!(s[1], Value::I64(200)));
+        } else {
+            panic!("expected window size array");
+        }
+    }
+
+    #[test]
+    fn test_sim_step_many_entities_stable() {
+        let mut interp = mk_interp();
+        let world = interp
+            .eval_builtin("sim::world", vec![Value::F32(0.016), Value::I64(123)])
+            .unwrap();
+        let world_id = match world {
+            Value::I64(id) => id,
+            _ => panic!("expected world id"),
+        };
+
+        for i in 0..128 {
+            let mut entity = HashMap::new();
+            let x = (i % 16) as f32 * 0.4;
+            let y = (i / 16) as f32 * 0.4;
+            entity.insert(
+                "position".into(),
+                Value::Array(Arc::new(Mutex::new(vec![Value::F32(x), Value::F32(y)]))),
+            );
+            entity.insert(
+                "velocity".into(),
+                Value::Array(Arc::new(Mutex::new(vec![Value::F32(0.2), Value::F32(-0.1)]))),
+            );
+            let _ = interp
+                .eval_builtin(
+                    "sim::spawn",
+                    vec![Value::I64(world_id), Value::HashMap(Arc::new(Mutex::new(entity)))],
+                )
+                .unwrap();
+        }
+
+        for _ in 0..50 {
+            interp
+                .eval_builtin("sim::step", vec![Value::I64(world_id)])
+                .unwrap();
+        }
+
+        let state = interp
+            .eval_builtin("sim::state_tensor", vec![Value::I64(world_id)])
+            .unwrap();
+        if let Value::Tensor(t) = state {
+            let tt = t.read().unwrap();
+            assert_eq!(tt.shape, vec![128, 4]);
+            assert_eq!(tt.numel(), 512);
+        } else {
+            panic!("expected tensor from sim::state_tensor");
+        }
+    }
+
+    #[test]
+    fn test_game_math_helpers() {
+        let mut interp = mk_interp();
+        let dot = interp
+            .eval_builtin(
+                "math::dot2",
+                vec![Value::F32(1.0), Value::F32(2.0), Value::F32(3.0), Value::F32(4.0)],
+            )
+            .unwrap();
+        assert!(matches!(dot, Value::F32(v) if (v - 11.0).abs() < 1e-6));
+
+        let dist = interp
+            .eval_builtin(
+                "math::distance2",
+                vec![Value::F32(0.0), Value::F32(0.0), Value::F32(3.0), Value::F32(4.0)],
+            )
+            .unwrap();
+        assert!(matches!(dist, Value::F32(v) if (v - 5.0).abs() < 1e-6));
+
+        let remap = interp
+            .eval_builtin(
+                "math::remap",
+                vec![
+                    Value::F32(0.5),
+                    Value::F32(0.0),
+                    Value::F32(1.0),
+                    Value::F32(-1.0),
+                    Value::F32(1.0),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(remap, Value::F32(v) if v.abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_sim_spatial_queries() {
+        let mut interp = mk_interp();
+        let world_id = match interp
+            .eval_builtin("sim::world", vec![Value::F32(0.016), Value::I64(123)])
+            .unwrap()
+        {
+            Value::I64(id) => id,
+            _ => panic!("expected world id"),
+        };
+
+        let mk_ent = |x: f32, y: f32| {
+            let mut entity = HashMap::new();
+            entity.insert(
+                "position".into(),
+                Value::Array(Arc::new(Mutex::new(vec![Value::F32(x), Value::F32(y)]))),
+            );
+            entity.insert(
+                "velocity".into(),
+                Value::Array(Arc::new(Mutex::new(vec![Value::F32(0.0), Value::F32(0.0)]))),
+            );
+            Value::HashMap(Arc::new(Mutex::new(entity)))
+        };
+        let _ = interp
+            .eval_builtin("sim::spawn", vec![Value::I64(world_id), mk_ent(0.0, 0.0)])
+            .unwrap();
+        let e2 = match interp
+            .eval_builtin("sim::spawn", vec![Value::I64(world_id), mk_ent(2.0, 0.0)])
+            .unwrap()
+        {
+            Value::I64(id) => id,
+            _ => panic!("expected entity id"),
+        };
+
+        let count = interp
+            .eval_builtin("sim::entity_count", vec![Value::I64(world_id)])
+            .unwrap();
+        assert!(matches!(count, Value::I64(2)));
+
+        let near = interp
+            .eval_builtin(
+                "sim::nearest_entity",
+                vec![
+                    Value::I64(world_id),
+                    Value::Array(Arc::new(Mutex::new(vec![Value::F32(1.8), Value::F32(0.0)]))),
+                    Value::F32(10.0),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(near, Value::I64(id) if id == e2));
+
+        let qr = interp
+            .eval_builtin(
+                "sim::query_radius",
+                vec![
+                    Value::I64(world_id),
+                    Value::Array(Arc::new(Mutex::new(vec![Value::F32(0.0), Value::F32(0.0)]))),
+                    Value::F32(1.0),
+                ],
+            )
+            .unwrap();
+        match qr {
+            Value::Array(ids) => assert_eq!(ids.lock().unwrap().len(), 1),
+            _ => panic!("expected id array"),
         }
     }
 

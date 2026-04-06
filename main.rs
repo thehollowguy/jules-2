@@ -39,6 +39,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 
 // ── Public API (used by lib.rs re-exports) ────────────────────────────────────
@@ -632,6 +633,11 @@ pub struct CliArgs {
     pub estimate_steps: usize,
     pub estimate_envs: usize,
     pub estimate_device: String,
+    pub ml_backend: String,
+    pub jax_ir: Option<PathBuf>,
+    pub jax_dataset: Option<PathBuf>,
+    pub jax_out: PathBuf,
+    pub jax_script: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -660,6 +666,9 @@ impl CliArgs {
             estimate_steps: 64,
             estimate_envs: 1,
             estimate_device: "cpu".into(),
+            ml_backend: "jules".into(),
+            jax_out: PathBuf::from("artifacts/jax"),
+            jax_script: PathBuf::from("scripts/jules_jax_backend.py"),
             ..Default::default()
         };
 
@@ -761,6 +770,30 @@ impl CliArgs {
                         return Err("--device must be `cpu` or `gpu`".into());
                     }
                 }
+                "--ml-backend" => {
+                    out.ml_backend = it.next()
+                        .ok_or("--ml-backend requires `jules` or `jax`")?
+                        .to_ascii_lowercase();
+                    if out.ml_backend != "jules" && out.ml_backend != "jax" {
+                        return Err("--ml-backend must be `jules` or `jax`".into());
+                    }
+                }
+                "--jax-ir" => {
+                    out.jax_ir = Some(PathBuf::from(it.next()
+                        .ok_or("--jax-ir requires a path")?));
+                }
+                "--jax-dataset" => {
+                    out.jax_dataset = Some(PathBuf::from(it.next()
+                        .ok_or("--jax-dataset requires a path")?));
+                }
+                "--jax-out" => {
+                    out.jax_out = PathBuf::from(it.next()
+                        .ok_or("--jax-out requires a path")?);
+                }
+                "--jax-script" => {
+                    out.jax_script = PathBuf::from(it.next()
+                        .ok_or("--jax-script requires a path")?);
+                }
                 s if s.starts_with('-') => {
                     return Err(format!("unknown flag `{s}`; try `jules help`"));
                 }
@@ -829,11 +862,17 @@ fn cmd_help() {
     println!("    --steps <N>        (estimate) max steps per episode");
     println!("    --envs <N>         (estimate) parallel environments");
     println!("    --device <cpu|gpu> (estimate) execution device");
+    println!("    --ml-backend <jules|jax>  (train) choose trainer backend");
+    println!("    --jax-ir <file.json>      (train+jax) model IR path (optional)");
+    println!("    --jax-dataset <file.npz>  (train+jax) dataset with x_train/y_train");
+    println!("    --jax-out <dir>           (train+jax) output dir (default artifacts/jax)");
+    println!("    --jax-script <path.py>    (train+jax) backend script path");
     println!("\nEXAMPLES:");
     println!("    jules run examples/physics.jules");
     println!("    jules check src/agent.jules -W");
     println!("    jules fix broken.jules");
     println!("    jules train examples/warden.jules");
+    println!("    jules train examples/warden.jules --ml-backend jax --jax-dataset train.npz --jax-out artifacts/jax");
     println!("    jules estimate --params 40000000 --batch 128 --episodes 300000 --steps 128 --envs 8 --device gpu");
     println!("    jules repl");
 }
@@ -842,6 +881,11 @@ fn cmd_help() {
 struct TrainEstimate {
     total_steps: u64,
     estimated_steps_per_sec: f64,
+    estimated_sim_steps_per_sec: f64,
+    estimated_model_steps_per_sec: f64,
+    bottleneck: &'static str,
+    confidence_low_steps_per_sec: f64,
+    confidence_high_steps_per_sec: f64,
     estimated_duration: Duration,
     estimated_memory_bytes: u64,
 }
@@ -887,13 +931,18 @@ fn cmd_estimate(args: &CliArgs) -> i32 {
         &args.estimate_device,
     );
     println!(
-        "  estimated: steps={} steps/s≈{:.0} time≈{} memory≈{:.2} GiB",
+        "  estimated: steps={} steps/s≈{:.0} (range {:.0}..{:.0}, sim≈{:.0}, model≈{:.0}, bottleneck={}) time≈{} memory≈{:.2} GiB",
         est.total_steps,
         est.estimated_steps_per_sec,
+        est.confidence_low_steps_per_sec,
+        est.confidence_high_steps_per_sec,
+        est.estimated_sim_steps_per_sec,
+        est.estimated_model_steps_per_sec,
+        est.bottleneck,
         format_duration(est.estimated_duration),
         bytes_to_gib(est.estimated_memory_bytes),
     );
-    print_speed_suggestions(est, args);
+    print_speed_suggestions(est, args, resources);
     0
 }
 
@@ -909,17 +958,31 @@ fn estimate_training(
     let batch = batch.max(1);
     let envs = envs.max(1);
     let total_steps = episodes as u64 * steps as u64 * envs as u64;
-    let base_steps_per_sec = if device == "gpu" { 20_000_000.0 } else { 7_500_000.0 };
+    let base_sim_steps_per_sec = if device == "gpu" { 20_000_000.0 } else { 7_500_000.0 };
+    let base_model_steps_per_sec = if device == "gpu" { 16_000_000.0 } else { 4_200_000.0 };
     let param_scale = (params as f64 / EST_BASELINE_PARAMS as f64).max(1e-9);
-    let env_gain = 1.0 + (envs as f64).log2().max(0.0) * 0.35;
-    let batch_gain = if batch <= 64 { 1.0 } else if batch <= 256 { 1.12 } else { 1.08 };
-    let estimated_steps_per_sec = (base_steps_per_sec * env_gain * batch_gain
-        / param_scale.powf(0.9))
+    let env_gain = 1.0 + (envs as f64).log2().max(0.0) * 0.40;
+    let batch_gain = if batch <= 64 { 1.0 } else if batch <= 256 { 1.18 } else { 1.10 };
+    let sim_steps_per_sec = (base_sim_steps_per_sec * env_gain).max(1.0);
+    let model_steps_per_sec = (base_model_steps_per_sec * batch_gain
+        / param_scale.powf(0.92))
         .max(1.0);
+    let (estimated_steps_per_sec, bottleneck) = if sim_steps_per_sec <= model_steps_per_sec {
+        (sim_steps_per_sec, "sim")
+    } else {
+        (model_steps_per_sec, "model")
+    };
     let secs = total_steps as f64 / estimated_steps_per_sec;
+    // Baseline model is intentionally conservative; expose an uncertainty range.
+    let (conf_low, conf_high) = if device == "gpu" { (0.65, 1.25) } else { (0.70, 1.20) };
     TrainEstimate {
         total_steps,
         estimated_steps_per_sec,
+        estimated_sim_steps_per_sec: sim_steps_per_sec,
+        estimated_model_steps_per_sec: model_steps_per_sec,
+        bottleneck,
+        confidence_low_steps_per_sec: (estimated_steps_per_sec * conf_low).max(1.0),
+        confidence_high_steps_per_sec: (estimated_steps_per_sec * conf_high).max(1.0),
         estimated_duration: Duration::from_secs_f64(secs.max(0.0)),
         estimated_memory_bytes: estimate_memory_bytes(params, batch, envs),
     }
@@ -933,7 +996,8 @@ fn estimate_memory_bytes(params: usize, batch: usize, envs: usize) -> u64 {
     let activations = params
         .saturating_mul(batch.saturating_add(envs).max(1))
         .saturating_mul(F32_BYTES / 2 + 1);
-    (model_state + activations).saturating_mul(13) / 10
+    // Keep memory estimator slightly pessimistic to avoid OOM surprises.
+    (model_state + activations).saturating_mul(14) / 10 + 64 * 1024 * 1024
 }
 
 fn detect_resources(device: &str) -> ResourceSnapshot {
@@ -972,7 +1036,67 @@ fn read_available_gpu_bytes() -> Option<u64> {
     if total_mib == 0 { None } else { Some(total_mib.saturating_mul(1024 * 1024)) }
 }
 
-fn print_speed_suggestions(est: TrainEstimate, args: &CliArgs) {
+fn build_speed_actions(est: TrainEstimate, args: &CliArgs, resources: ResourceSnapshot) -> Vec<String> {
+    let mut out = Vec::new();
+    if est.bottleneck == "model" {
+        let reduced_params = ((args.estimate_params as f64) * 0.7).max(1.0) as usize;
+        let projected = estimate_training(
+            reduced_params,
+            args.estimate_batch,
+            args.estimate_episodes,
+            args.estimate_steps,
+            args.estimate_envs,
+            &args.estimate_device,
+        );
+        out.push(format!(
+            "model-bound: reduce params {} -> {} (projected speedup ≈{:.2}x)",
+            args.estimate_params,
+            reduced_params,
+            projected.estimated_steps_per_sec / est.estimated_steps_per_sec
+        ));
+        if args.estimate_device == "cpu" && args.estimate_batch > 256 {
+            out.push(format!(
+                "CPU batch may be too high for cache locality: try batch {} -> 128",
+                args.estimate_batch
+            ));
+        } else if args.estimate_batch < 128 {
+            out.push(format!(
+                "model-bound: try larger batch for better compute utilization ({} -> 128)",
+                args.estimate_batch
+            ));
+        }
+    } else {
+        let raised_envs = (args.estimate_envs.max(1) * 2).min(64);
+        let projected = estimate_training(
+            args.estimate_params,
+            args.estimate_batch,
+            args.estimate_episodes,
+            args.estimate_steps,
+            raised_envs,
+            &args.estimate_device,
+        );
+        out.push(format!(
+            "sim-bound: increase envs {} -> {} (projected speedup ≈{:.2}x)",
+            args.estimate_envs,
+            raised_envs,
+            projected.estimated_steps_per_sec / est.estimated_steps_per_sec
+        ));
+        out.push("sim-bound: reduce per-step world complexity (agents/sensors/colliders)".to_string());
+    }
+
+    if let Some(ram) = resources.ram_available_bytes {
+        if est.estimated_memory_bytes > ram.saturating_mul(85) / 100 {
+            out.push(format!(
+                "memory risk: estimate {:.2} GiB is near available {:.2} GiB; reduce batch/params",
+                bytes_to_gib(est.estimated_memory_bytes),
+                bytes_to_gib(ram),
+            ));
+        }
+    }
+    out
+}
+
+fn print_speed_suggestions(est: TrainEstimate, args: &CliArgs, resources: ResourceSnapshot) {
     if est.estimated_duration < Duration::from_secs(30 * 60) {
         println!("  suggestion: ETA is under 30 minutes; no urgency tuning needed.");
         return;
@@ -993,15 +1117,13 @@ fn print_speed_suggestions(est: TrainEstimate, args: &CliArgs) {
         args.estimate_params,
         (args.estimate_params as f64 * 0.75).max(1.0) as usize
     );
-    if args.estimate_envs == 1 {
-        println!("    • envs: 1 -> 8 (CPU) or 32+ (GPU)");
-    } else {
-        println!("    • tune envs upward if CPU/GPU utilization is low");
+    for action in build_speed_actions(est, args, resources) {
+        println!("    • {action}");
     }
     if args.estimate_device != "gpu" {
         println!("    • switch to --device gpu if available");
     }
-    println!("    • try batch sizes 64/128/256 and keep highest measured steps/s");
+    println!("    • sample batch sizes 64/128/256 and keep the fastest measured setting");
 }
 
 fn bytes_to_gib(bytes: u64) -> f64 {
@@ -1032,10 +1154,21 @@ fn apply_safe_syntax_fixes(source: &str, diags: &[Diag]) -> Option<String> {
     let mut out = source.to_string();
     let mut changed = false;
 
-    let fn_fixed = out.replace("fun ", "fn ").replace("func ", "fn ");
-    if fn_fixed != out {
-        out = fn_fixed;
-        changed = true;
+    let typo_rewrites = [
+        ("fun ", "fn "),
+        ("func ", "fn "),
+        ("pritn(", "print("),
+        ("prnit(", "print("),
+        ("flase", "false"),
+        ("fasle", "false"),
+        ("treu", "true"),
+        ("ture", "true"),
+    ];
+    for (from, to) in typo_rewrites {
+        if out.contains(from) {
+            out = out.replace(from, to);
+            changed = true;
+        }
     }
 
     let mut semicolon_lines = std::collections::BTreeSet::<u32>::new();
@@ -1110,7 +1243,109 @@ fn apply_safe_syntax_fixes(source: &str, diags: &[Diag]) -> Option<String> {
         out = lines.join("\n");
     }
 
+    // Conservative delimiter balancing at EOF.
+    let mut open_paren = 0_i32;
+    let mut open_bracket = 0_i32;
+    let mut open_brace = 0_i32;
+    for ch in out.chars() {
+        match ch {
+            '(' => open_paren += 1,
+            ')' => open_paren -= 1,
+            '[' => open_bracket += 1,
+            ']' => open_bracket -= 1,
+            '{' => open_brace += 1,
+            '}' => open_brace -= 1,
+            _ => {}
+        }
+    }
+    while open_paren > 0 {
+        out.push(')');
+        open_paren -= 1;
+        changed = true;
+    }
+    while open_bracket > 0 {
+        out.push(']');
+        open_bracket -= 1;
+        changed = true;
+    }
+    while open_brace > 0 {
+        out.push('}');
+        open_brace -= 1;
+        changed = true;
+    }
+
     changed.then_some(out)
+}
+
+fn detect_silent_issues(source: &str) -> Vec<Diag> {
+    let mut out = Vec::new();
+
+    fn has_float_equality(trimmed: &str) -> bool {
+        if !trimmed.contains("==") {
+            return false;
+        }
+        let mut prev_was_digit = false;
+        for ch in trimmed.chars() {
+            if ch == '.' && prev_was_digit {
+                return true;
+            }
+            prev_was_digit = ch.is_ascii_digit();
+        }
+        false
+    }
+
+    for (idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let span = Span {
+            line: (idx + 1) as u32,
+            col: (line.find(trimmed).unwrap_or(0) + 1) as u32,
+            start: 0,
+            end: 0,
+        };
+
+        if has_float_equality(trimmed) {
+            out.push(
+                Diag::warning(
+                    span,
+                    "possible silent logic issue: float equality comparison can be unstable",
+                )
+                .with_code("W-SILENT-FLOAT-EQ")
+                .with_hint("compare with epsilon: `abs(a - b) < 1e-6`"),
+            );
+        }
+
+        if (trimmed.starts_with("if ") || trimmed.starts_with("while "))
+            && trimmed.contains(" = ")
+            && !trimmed.contains("==")
+            && !trimmed.contains(">=")
+            && !trimmed.contains("<=")
+            && !trimmed.contains("!=")
+        {
+            out.push(
+                Diag::warning(
+                    span,
+                    "possible silent logic issue: assignment used in condition",
+                )
+                .with_code("W-SILENT-ASSIGN-COND")
+                .with_hint("did you mean `==`?"),
+            );
+        }
+
+        if trimmed.starts_with("while true") {
+            out.push(
+                Diag::warning(
+                    span,
+                    "possible silent runtime issue: `while true` may never terminate",
+                )
+                .with_code("W-SILENT-INFINITE-LOOP")
+                .with_hint("ensure a reachable `break`/`return` path"),
+            );
+        }
+    }
+    out
 }
 
 fn cmd_fix(args: &CliArgs) -> i32 {
@@ -1134,19 +1369,34 @@ fn cmd_fix(args: &CliArgs) -> i32 {
         return 0;
     }
 
-    match apply_safe_syntax_fixes(&source, &unit.diags) {
-        Some(fixed) if fixed != source => {
-            if let Err(e) = fs::write(path, fixed) {
-                eprintln!("jules fix: failed writing `{}`: {e}", path.display());
-                return 2;
+    let mut current = source.clone();
+    let mut changed = false;
+    for _ in 0..3 {
+        match apply_safe_syntax_fixes(&current, &unit.diags) {
+            Some(next) if next != current => {
+                current = next;
+                changed = true;
+                let mut rerun = CompileUnit::new(filename.as_ref(), &current);
+                let _ = pipeline.run(&mut rerun);
+                unit = rerun;
+                if unit.diags.is_empty() {
+                    break;
+                }
             }
-            println!("jules fix: applied safe fixes to {}", path.display());
-            0
+            _ => break,
         }
-        _ => {
-            println!("jules fix: no safe automatic fix could be applied");
-            1
+    }
+
+    if changed && current != source {
+        if let Err(e) = fs::write(path, current) {
+            eprintln!("jules fix: failed writing `{}`: {e}", path.display());
+            return 2;
         }
+        println!("jules fix: applied safe fixes to {}", path.display());
+        0
+    } else {
+        println!("jules fix: no safe automatic fix could be applied");
+        1
     }
 }
 
@@ -1170,6 +1420,7 @@ fn cmd_check(args: &CliArgs) -> i32 {
     pipeline.warn_as_error = args.warn_as_error;
     pipeline.quiet         = args.quiet;
     let result = pipeline.run(&mut unit);
+    unit.diags.extend(detect_silent_issues(&source));
 
     emit_diagnostics(&unit.diags, &source, &filename, &cfg, args.json_diag);
     print_summary(&unit, &cfg);
@@ -1208,6 +1459,7 @@ fn cmd_run(args: &CliArgs) -> i32 {
     }
 
     let result = pipeline.run(&mut unit);
+    unit.diags.extend(detect_silent_issues(&source));
 
     emit_diagnostics(&unit.diags, &source, &filename, &cfg, args.json_diag);
     print_summary(&unit, &cfg);
@@ -1238,6 +1490,204 @@ fn cmd_run(args: &CliArgs) -> i32 {
 
 // ── jules train ────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
+struct JaxModelIr {
+    model_name: String,
+    input_dim: u64,
+    layers: Vec<u64>,
+    activation: &'static str,
+    task: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct BackendCapability {
+    model_name: String,
+    jules_supported: bool,
+    jax_supported: bool,
+    jax_reason: Option<String>,
+}
+
+fn activation_name_for_jax(a: &crate::ast::Activation) -> &'static str {
+    match a {
+        crate::ast::Activation::Relu | crate::ast::Activation::LeakyRelu => "relu",
+        crate::ast::Activation::Tanh => "tanh",
+        crate::ast::Activation::Silu | crate::ast::Activation::Swish => "silu",
+        crate::ast::Activation::Gelu => "gelu",
+        _ => "gelu",
+    }
+}
+
+fn build_jax_ir_from_model(model: &crate::ast::ModelDecl) -> Result<JaxModelIr, String> {
+    let mut input_dim = None;
+    let mut layers = Vec::new();
+    let mut activation = "gelu";
+    let mut task = "classification";
+
+    for layer in &model.layers {
+        match layer {
+            crate::ast::ModelLayer::Input { size, .. } => {
+                input_dim = Some(*size);
+            }
+            crate::ast::ModelLayer::Dense {
+                units,
+                activation: act,
+                ..
+            } => {
+                layers.push(*units);
+                activation = activation_name_for_jax(act);
+            }
+            crate::ast::ModelLayer::Output {
+                units,
+                activation: act,
+                ..
+            } => {
+                layers.push(*units);
+                if matches!(act, crate::ast::Activation::Linear) {
+                    task = "regression";
+                }
+            }
+            crate::ast::ModelLayer::Dropout { .. } | crate::ast::ModelLayer::Norm { .. } => {
+                // Ignored for export because the bridge currently trains dense MLPs.
+            }
+            other => {
+                return Err(format!(
+                    "unsupported layer for JAX bridge export: {other:?}"
+                ));
+            }
+        }
+    }
+
+    let input_dim = input_dim
+        .ok_or_else(|| "missing required `input` layer".to_string())?;
+    if layers.is_empty() {
+        return Err("missing required dense/output layers".to_string());
+    }
+
+    Ok(JaxModelIr {
+        model_name: model.name.clone(),
+        input_dim,
+        layers,
+        activation,
+        task,
+    })
+}
+
+fn feature_capability_matrix(program: &crate::ast::Program) -> Vec<BackendCapability> {
+    program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            crate::ast::Item::Model(m) => Some(m),
+            _ => None,
+        })
+        .map(|m| match build_jax_ir_from_model(m) {
+            Ok(_) => BackendCapability {
+                model_name: m.name.clone(),
+                jules_supported: true,
+                jax_supported: true,
+                jax_reason: None,
+            },
+            Err(reason) => BackendCapability {
+                model_name: m.name.clone(),
+                jules_supported: true,
+                jax_supported: false,
+                jax_reason: Some(reason),
+            },
+        })
+        .collect()
+}
+
+fn print_feature_capability_matrix(program: &crate::ast::Program) {
+    let rows = feature_capability_matrix(program);
+    if rows.is_empty() {
+        return;
+    }
+    println!("feature capability matrix:");
+    for row in rows {
+        let jules = if row.jules_supported { "✅" } else { "❌" };
+        let jax = if row.jax_supported { "✅" } else { "❌" };
+        match row.jax_reason {
+            Some(reason) => println!(
+                "  {}: Jules {}  JAX {} (why: {})",
+                row.model_name, jules, jax, reason
+            ),
+            None => println!("  {}: Jules {}  JAX {}", row.model_name, jules, jax),
+        }
+    }
+}
+
+fn build_jax_ir_from_program(program: &crate::ast::Program) -> Result<JaxModelIr, String> {
+    let train_model = program
+        .items
+        .iter()
+        .find_map(|item| match item {
+            crate::ast::Item::Train(t) => t.model.as_deref(),
+            _ => None,
+        });
+
+    let model = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            crate::ast::Item::Model(m) => Some(m),
+            _ => None,
+        })
+        .find(|m| train_model.map_or(true, |name| m.name == name))
+        .ok_or_else(|| {
+            if let Some(name) = train_model {
+                format!("jax backend: model `{name}` referenced by train block not found")
+            } else {
+                "jax backend: no `model` declaration found in Jules source".to_string()
+            }
+        })?;
+    build_jax_ir_from_model(model)
+        .map_err(|why| format!("jax backend: model `{}` is not supported ({why})", model.name))
+}
+
+fn write_jax_ir_file(ir: &JaxModelIr) -> Result<PathBuf, String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::env::temp_dir()
+        .join(format!("jules_jax_ir_{}_{}.json", process::id(), ts));
+    let layers = ir.layers.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ");
+    let content = format!(
+        "{{\n  \"schema_version\": 1,\n  \"model_name\": \"{}\",\n  \"input_dim\": {},\n  \"layers\": [{}],\n  \"activation\": \"{}\",\n  \"task\": \"{}\"\n}}\n",
+        ir.model_name, ir.input_dim, layers, ir.activation, ir.task
+    );
+    fs::write(&path, content)
+        .map_err(|e| format!("jax backend: failed to write generated IR `{}`: {e}", path.display()))?;
+    Ok(path)
+}
+
+fn check_jax_backend_env(script: &Path) -> Result<(), String> {
+    if !script.exists() {
+        return Err(format!(
+            "jax backend: script not found at `{}` (use --jax-script to override)",
+            script.display()
+        ));
+    }
+
+    let check = ProcessCommand::new("python3")
+        .arg("-c")
+        .arg("import jax, optax, numpy; print('ok')")
+        .output()
+        .map_err(|e| format!("jax backend: failed to run python3 preflight check: {e}"))?;
+    if !check.status.success() {
+        let stderr = String::from_utf8_lossy(&check.stderr);
+        return Err(format!(
+            "jax backend dependencies are missing.\n\
+             Install them with:\n\
+               pip install --upgrade pip\n\
+               pip install jax optax numpy\n\
+             python3 preflight error:\n{}",
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
 fn cmd_train(args: &CliArgs) -> i32 {
     let path = match &args.file {
         Some(p) => p,
@@ -1263,6 +1713,58 @@ fn cmd_train(args: &CliArgs) -> i32 {
     if unit.has_errors() { return 1; }
 
     if let PipelineResult::Ok(program) = result {
+        if !args.quiet {
+            print_feature_capability_matrix(&program);
+        }
+        if args.ml_backend == "jax" {
+            let dataset = match &args.jax_dataset {
+                Some(p) => p.clone(),
+                None => {
+                    eprintln!(
+                        "jules train: `--ml-backend jax` requires `--jax-dataset <train.npz>`\n\
+                         example: jules train model.jules --ml-backend jax --jax-dataset train.npz"
+                    );
+                    return 2;
+                }
+            };
+            if let Err(msg) = check_jax_backend_env(&args.jax_script) {
+                eprintln!("{msg}");
+                return 2;
+            }
+            let mut generated_ir = None;
+            let ir_path = if let Some(p) = &args.jax_ir {
+                p.clone()
+            } else {
+                match build_jax_ir_from_program(&program).and_then(|ir| write_jax_ir_file(&ir)) {
+                    Ok(p) => {
+                        generated_ir = Some(p.clone());
+                        p
+                    }
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        return 2;
+                    }
+                }
+            };
+
+            let mut cmd = ProcessCommand::new("python3");
+            cmd.arg(&args.jax_script)
+                .arg("--ir").arg(&ir_path)
+                .arg("--dataset").arg(&dataset)
+                .arg("--out").arg(&args.jax_out);
+            let status = match cmd.status() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("jules train: failed to launch JAX backend via python3: {e}");
+                    return 2;
+                }
+            };
+            if let Some(p) = generated_ir {
+                let _ = fs::remove_file(p);
+            }
+            return if status.success() { 0 } else { 1 };
+        }
+
         match crate::interp::jules_train(&program) {
             Ok(all_stats) => {
                 for (i, stats) in all_stats.iter().enumerate() {
@@ -1987,11 +2489,162 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_train_jax_flags() {
+        let a = parse(&[
+            "train",
+            "model.jules",
+            "--ml-backend", "jax",
+            "--jax-dataset", "train.npz",
+            "--jax-out", "artifacts/custom",
+            "--jax-script", "scripts/custom.py",
+        ]).unwrap();
+        assert_eq!(a.command, Command::Train);
+        assert_eq!(a.ml_backend, "jax");
+        assert_eq!(a.jax_dataset.as_deref(), Some(Path::new("train.npz")));
+        assert_eq!(a.jax_out, PathBuf::from("artifacts/custom"));
+        assert_eq!(a.jax_script, PathBuf::from("scripts/custom.py"));
+    }
+
+    #[test]
+    fn test_build_jax_ir_from_model_supported_dense() {
+        let sp = Span::dummy();
+        let model = crate::ast::ModelDecl {
+            span: sp,
+            attrs: vec![],
+            name: "PolicyNet".to_string(),
+            layers: vec![
+                crate::ast::ModelLayer::Input { span: sp, size: 128 },
+                crate::ast::ModelLayer::Dense {
+                    span: sp,
+                    units: 256,
+                    activation: crate::ast::Activation::Relu,
+                    bias: true,
+                },
+                crate::ast::ModelLayer::Output {
+                    span: sp,
+                    units: 10,
+                    activation: crate::ast::Activation::Softmax,
+                },
+            ],
+            device: crate::ast::ModelDevice::Auto,
+            optimizer: None,
+        };
+
+        let ir = build_jax_ir_from_model(&model).unwrap();
+        assert_eq!(ir.model_name, "PolicyNet");
+        assert_eq!(ir.input_dim, 128);
+        assert_eq!(ir.layers, vec![256, 10]);
+        assert_eq!(ir.activation, "relu");
+        assert_eq!(ir.task, "classification");
+    }
+
+    #[test]
+    fn test_feature_capability_matrix_reports_unsupported_layer() {
+        let sp = Span::dummy();
+        let model = crate::ast::ModelDecl {
+            span: sp,
+            attrs: vec![],
+            name: "VisionNet".to_string(),
+            layers: vec![
+                crate::ast::ModelLayer::Input { span: sp, size: 64 },
+                crate::ast::ModelLayer::Conv2d {
+                    span: sp,
+                    filters: 32,
+                    kernel_h: 3,
+                    kernel_w: 3,
+                    stride: 1,
+                    padding: crate::ast::Padding::Same,
+                    activation: crate::ast::Activation::Relu,
+                },
+            ],
+            device: crate::ast::ModelDevice::Auto,
+            optimizer: None,
+        };
+        let program = crate::ast::Program {
+            span: sp,
+            items: vec![crate::ast::Item::Model(model)],
+        };
+        let rows = feature_capability_matrix(&program);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].jules_supported);
+        assert!(!rows[0].jax_supported);
+        assert!(rows[0].jax_reason.as_deref().unwrap().contains("unsupported layer"));
+    }
+
+    #[test]
     fn test_estimate_training_param_scaling() {
         let small = estimate_training(1_000_000, 64, 100_000, 64, 1, "cpu");
         let large = estimate_training(40_000_000, 64, 100_000, 64, 1, "cpu");
         assert!(large.estimated_steps_per_sec < small.estimated_steps_per_sec);
         assert!(large.estimated_duration > small.estimated_duration);
+    }
+
+    #[test]
+    fn test_estimate_training_reports_bottleneck() {
+        let est = estimate_training(80_000_000, 128, 1_000, 128, 8, "cpu");
+        assert!(matches!(est.bottleneck, "sim" | "model"));
+        assert!(est.estimated_model_steps_per_sec > 0.0);
+        assert!(est.estimated_sim_steps_per_sec > 0.0);
+        assert!(
+            (est.estimated_steps_per_sec
+                - est.estimated_model_steps_per_sec.min(est.estimated_sim_steps_per_sec))
+                .abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn test_build_speed_actions_model_bound_contains_param_guidance() {
+        let args = CliArgs {
+            estimate_params: 80_000_000,
+            estimate_batch: 128,
+            estimate_episodes: 100_000,
+            estimate_steps: 64,
+            estimate_envs: 2,
+            estimate_device: "cpu".to_string(),
+            ..Default::default()
+        };
+        let est = estimate_training(
+            args.estimate_params,
+            args.estimate_batch,
+            args.estimate_episodes,
+            args.estimate_steps,
+            args.estimate_envs,
+            &args.estimate_device,
+        );
+        let actions = build_speed_actions(
+            est,
+            &args,
+            ResourceSnapshot { ram_available_bytes: Some(u64::MAX / 2), gpu_available_bytes: None },
+        );
+        assert!(actions.iter().any(|a| a.contains("reduce params")));
+    }
+
+    #[test]
+    fn test_build_speed_actions_memory_warning() {
+        let args = CliArgs {
+            estimate_params: 120_000_000,
+            estimate_batch: 512,
+            estimate_episodes: 100_000,
+            estimate_steps: 64,
+            estimate_envs: 8,
+            estimate_device: "cpu".to_string(),
+            ..Default::default()
+        };
+        let est = estimate_training(
+            args.estimate_params,
+            args.estimate_batch,
+            args.estimate_episodes,
+            args.estimate_steps,
+            args.estimate_envs,
+            &args.estimate_device,
+        );
+        let actions = build_speed_actions(
+            est,
+            &args,
+            ResourceSnapshot { ram_available_bytes: Some(1_000_000_000), gpu_available_bytes: None },
+        );
+        assert!(actions.iter().any(|a| a.contains("memory risk")));
     }
 
     #[test]
@@ -2036,6 +2689,21 @@ mod tests {
             .with_hint("separate items with `,`")];
         let fixed = apply_safe_syntax_fixes("foo(a b)", &diags).unwrap();
         assert_eq!(fixed, "foo(a, b)");
+    }
+
+    #[test]
+    fn test_apply_safe_syntax_fixes_common_typos_and_balancing() {
+        let fixed = apply_safe_syntax_fixes("pritn(\"x\"\nflase", &[]).unwrap();
+        assert_eq!(fixed, "print(\"x\"\nfalse)");
+    }
+
+    #[test]
+    fn test_detect_silent_issues_heuristics() {
+        let src = "if a = b {}\nwhile true {}\nif x == 0.1 {}";
+        let diags = detect_silent_issues(src);
+        assert!(diags.iter().any(|d| d.code == Some("W-SILENT-ASSIGN-COND")));
+        assert!(diags.iter().any(|d| d.code == Some("W-SILENT-INFINITE-LOOP")));
+        assert!(diags.iter().any(|d| d.code == Some("W-SILENT-FLOAT-EQ")));
     }
 
     // ── Diagnostic construction ────────────────────────────────────────────────

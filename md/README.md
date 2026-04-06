@@ -71,6 +71,36 @@ as well (transpose + blocked kernel + threaded row chunks), following the same
 core ideas used by high-performance JIT stacks: contiguous access, tiling, and
 parallel work partitioning.
 
+
+
+## Standard built-in library modules
+
+Jules now exposes a structured built-in stdlib with module namespaces (`core`, `math`,
+`tensor`, `nn`, `train`, `data`, `io`, `sys`, `error`, `diag`, `collections`,
+`compute`, `quant`, `model`, `debug`, `sim`, `window`) and runtime discovery via `std::modules()`.
+See `md/STDLIB.md` for module details and philosophy.
+
+## JAX backend for optimized ML training
+
+For the highest-throughput ML training path, use the JAX bridge script:
+
+```bash
+python scripts/jules_jax_backend.py --ir model_ir.json --dataset train.npz --out artifacts/jax
+```
+
+This path uses XLA-compiled training (`jax.jit`) and exports INT8-per-channel weights
+compatible with Jules low-byte inference. Full guide: `md/JAX_BACKEND.md`.
+
+You can also choose backend directly from Jules CLI:
+
+```bash
+# Native Jules training runtime (default)
+jules train my_agent.jules --ml-backend jules
+
+# JAX training backend, reusing model syntax from the same .jules file
+jules train my_agent.jules --ml-backend jax --jax-dataset train.npz --jax-out artifacts/jax
+```
+
 ## Automated syntax fix flow
 
 Use:
@@ -83,6 +113,27 @@ jules fix path/to/file.jules
 (e.g. missing `;`, missing `)`, `]`, `}`, missing `,`, assignment/operator
 replacement like `==`→`=`, return arrow insertion, block opener insertion,
 and common `fun`/`func` → `fn` keyword typo recovery).
+
+## ML calculator (`jules estimate`)
+
+`jules estimate` computes an approximate training ETA by modeling two independent
+throughput limits:
+
+- **sim throughput** (environment stepping rate, scaled by env count + device)
+- **model throughput** (forward/backward/update rate, scaled by params + batch)
+
+Final `steps/s` is the lower of the two (the current bottleneck). Output now includes:
+
+- `sim≈...`
+- `model≈...`
+- `bottleneck=sim|model`
+
+This keeps the calculator simple while making bottlenecks explicit for tuning.
+It also emits actionable suggestions, e.g.:
+
+- model-bound: reduce params by ~30% (with projected speedup)
+- sim-bound: increase env count (with projected speedup)
+- memory-risk warnings when estimated usage approaches available RAM
 
 ## System-level runtime built-ins
 
@@ -132,4 +183,12 @@ To benchmark script execution vs Python baseline:
 
 ```bash
 cargo run --release --bin bench-jules-ml-chess -- ml_chess.jules
+```
+
+## Jules-native ant simulation with online AI
+
+An RL-style ant colony simulation with online linear-Q learning is available at `ant_ai_sim.jules`.
+
+```bash
+cargo run --offline --bin jules -- run ant_ai_sim.jules
 ```
