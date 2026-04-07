@@ -23,7 +23,7 @@ Jules follows a **small-core, composable, deterministic-friendly, ML-aware** sta
 - `compute`: `compute::device`, `compute::parallel_map`
 - `quant`: `quant::int8_export`
 - `model`: `load_ir`, `save_ir`, `load_weights`, `save_weights`
-- `debug`: `dbg`, `debug::tensor_shape`, `debug::disable_jit`
+- `debug`: `dbg`, `debug::tensor_shape`, `debug::disable_jit`, `debug::enable_jit`, `debug::set_advance_jit`, `debug::jit_state`, `debug::runtime_profile`, `debug::runtime_hotspots`, `debug::runtime_profile_reset`
 - `sim`: `sim::world`, `sim::spawn`, `sim::step`, `sim::reset`, `sim::get_state`, `sim::state_tensor`, `sim::apply`, `sim::entity_count`, `sim::nearest_entity`, `sim::query_radius`
 - `window`: `window::create`, `window::open`, `window::clear`, `window::draw_rect`, `window::present`, `window::close`, `window::input_key_down`, `window::size`, `window::title`, `window::frames`
 - `render`: `render::begin_frame`, `render::clear`, `render::rect`, `render::sprite`, `render::flush`, `render::stats`
