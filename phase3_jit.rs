@@ -173,7 +173,6 @@ impl ExecMem {
         Some(Self {
             ptr: ptr.cast::<u8>(),
             len,
-            arena_backed: false,
         })
     }
     fn entry(&self) -> unsafe extern "C" fn(*mut i64) -> i64 {
@@ -799,68 +798,6 @@ fn is_straight_line_dead_def(instrs: &[Instr], pc: usize, slot: u16) -> bool {
     true
 }
 
-#[inline]
-fn slot_read_after(instrs: &[Instr], from_pc: usize, slot: u16) -> bool {
-    instrs
-        .iter()
-        .skip(from_pc)
-        .any(|ins| instr_reads_slot(ins, slot))
-}
-
-/// Experimental "research" superoptimizer pass on bytecode IR.
-///
-/// Goal: shorten temporary live ranges before linear-scan allocation by
-/// eliminating pointless move chains and remapping defs directly to final
-/// destinations when the temp is proven dead afterwards.
-fn research_superopt_bytecode(instrs: &[Instr]) -> Vec<Instr> {
-    let mut out = instrs.to_vec();
-    let mut pc = 0usize;
-    while pc + 1 < out.len() {
-        match (&out[pc], &out[pc + 1]) {
-            // BinOp(tmp, ..) ; Move(dst, tmp)  =>  BinOp(dst, ..)
-            // only if tmp is not read later.
-            (Instr::BinOp(tmp, op, l, r), Instr::Move(dst, src)) if tmp == src => {
-                if !slot_read_after(&out, pc + 2, *tmp) {
-                    out[pc] = Instr::BinOp(*dst, *op, *l, *r);
-                    out[pc + 1] = Instr::Nop;
-                }
-            }
-
-            // LoadImm(tmp, c) ; Move(dst, tmp) => LoadImm(dst, c)
-            // only if tmp is not read later.
-            (Instr::LoadI32(tmp, v), Instr::Move(dst, src)) if tmp == src => {
-                if !slot_read_after(&out, pc + 2, *tmp) {
-                    out[pc] = Instr::LoadI32(*dst, *v);
-                    out[pc + 1] = Instr::Nop;
-                }
-            }
-            (Instr::LoadI64(tmp, v), Instr::Move(dst, src)) if tmp == src => {
-                if !slot_read_after(&out, pc + 2, *tmp) {
-                    out[pc] = Instr::LoadI64(*dst, *v);
-                    out[pc + 1] = Instr::Nop;
-                }
-            }
-            (Instr::LoadBool(tmp, v), Instr::Move(dst, src)) if tmp == src => {
-                if !slot_read_after(&out, pc + 2, *tmp) {
-                    out[pc] = Instr::LoadBool(*dst, *v);
-                    out[pc + 1] = Instr::Nop;
-                }
-            }
-            (Instr::LoadUnit(tmp), Instr::Move(dst, src)) if tmp == src => {
-                if !slot_read_after(&out, pc + 2, *tmp) {
-                    out[pc] = Instr::LoadUnit(*dst);
-                    out[pc + 1] = Instr::Nop;
-                }
-            }
-            _ => {}
-        }
-        pc += 1;
-    }
-    out.into_iter()
-        .filter(|i| !matches!(i, Instr::Nop))
-        .collect()
-}
-
 /// Returns true when `op` is in the set we know how to emit.
 #[inline(always)]
 fn is_supported_binop(op: BinOpKind) -> bool {
@@ -1029,9 +966,6 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         return None;
     }
 
-    // Research superoptimizer pre-pass: reduce temp lifetimes before RA.
-    let optimized_instrs = research_superopt_bytecode(&compiled.instrs);
-
     // Gate: bail out early if any instruction is outside our supported set.
     for instr in &optimized_instrs {
         match instr {
@@ -1053,7 +987,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
     }
 
-    let instrs = &optimized_instrs;
+    let instrs = &compiled.instrs;
     let slot_count = compiled.slot_count as usize;
 
     // ── Pass 1: liveness + linear-scan register allocation ───────────────
