@@ -6,6 +6,8 @@ Jules is a game-dev + ML-oriented language/runtime with:
 - C ABI for embedding in external engines
 - lexical borrow-checking pass for reference alias safety (`&` / `&mut`)
 
+For a consolidated list of implemented optimization techniques, see `md/OPTIMIZATIONS.md`.
+
 ## Engine / Host Integrations
 
 ### C++

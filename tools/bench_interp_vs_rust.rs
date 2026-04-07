@@ -5,6 +5,12 @@ use std::time::Instant;
 
 use jules::{CompileUnit, Pipeline, PipelineResult};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BenchMode {
+    Full,
+    AotTime,
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n: usize = args
@@ -12,9 +18,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(2_000_000);
     let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(15);
+    let mode = parse_mode(args.get(3).map(String::as_str));
     let samples: usize = 10;
 
-    println!("bench-interp-vs-rust n={n} iters={iters}");
+    println!("bench-interp-vs-rust n={n} iters={iters} mode={mode:?}");
 
     let jules_src = format!(
         r#"
@@ -55,6 +62,25 @@ fn main() {{
         jules_compile_s += compile_start.elapsed().as_secs_f64();
     }
     jules_compile_s /= samples as f64;
+
+    if mode == BenchMode::AotTime {
+        let rust_compile_s = rustc_compile_baseline(n);
+        println!(
+            "Jules AoT compile(avg {samples}): {:.6}s total ({:.6}s/iter)",
+            jules_compile_s,
+            jules_compile_s / iters as f64
+        );
+        if let Some(rc) = rust_compile_s {
+            println!("Rust AoT compile:            {:.6}s total (rustc -O)", rc);
+            println!(
+                "AoT compile ratio (Jules/Rust): {:.2}x",
+                jules_compile_s / rc.max(1e-9)
+            );
+        } else {
+            println!("Rust AoT compile:            skipped (rustc unavailable)");
+        }
+        return;
+    }
 
     // Jules runtime benchmark (interpreter)
     let mut interp = jules::interp::Interpreter::new();
@@ -116,6 +142,13 @@ fn main() {{
         "Runtime ratio (Jules interp / Rust native): {:.2}x",
         jules_runtime_s / rust_runtime_s.max(1e-9)
     );
+}
+
+fn parse_mode(raw: Option<&str>) -> BenchMode {
+    match raw {
+        Some("aot") | Some("aot-time") => BenchMode::AotTime,
+        _ => BenchMode::Full,
+    }
 }
 
 fn rust_kernel(n: usize) -> i64 {
