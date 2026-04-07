@@ -82,6 +82,18 @@ Jules now ships additional game-loop-friendly built-ins in `math`:
 - `math::angle_to(ax, ay, bx, by)` for heading/orientation calculations
 - `math::rand_unit2()` for random normalized directions
 
+## Game simulation optimization focus
+
+Jules is now tuned for game simulation workloads around deterministic stepping and
+high-frequency spatial queries. The current game-sim optimization profile includes:
+
+- deterministic entity iteration order in `sim` worlds for stable replay/debug behavior
+- uniform-grid broadphase collision filtering in `sim::step` to reduce pair checks
+- sorted/stable nearest/radius entity query behavior for gameplay logic consistency
+- fixed-step-friendly movement helpers (`math::approach`, `math::move_towards2`)
+- command-buffered rendering API (`render::*`) for predictable frame submission
+- strict ML memory cap controls (`M_min + ΔM`) for mixed game+ML runtime stability
+
 ## Rendering API with AoT-friendly command streams
 
 Jules now includes a `render::*` API that records frame commands into a structured

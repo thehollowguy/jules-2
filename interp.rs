@@ -48,7 +48,7 @@
 )]
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -2544,7 +2544,7 @@ struct SimEntityState {
 #[derive(Debug, Clone)]
 struct SimWorldState {
     dt: f32,
-    entities: HashMap<i64, SimEntityState>,
+    entities: BTreeMap<i64, SimEntityState>,
     next_entity_id: i64,
     seed: u64,
     step_count: u64,
@@ -2554,7 +2554,7 @@ impl SimWorldState {
     fn new(dt: f32, seed: u64) -> Self {
         Self {
             dt,
-            entities: HashMap::new(),
+            entities: BTreeMap::new(),
             next_entity_id: 1,
             seed,
             step_count: 0,
@@ -2593,17 +2593,13 @@ impl SimWorldState {
         let cell_size = (max_extent * 2.0).max(0.25);
 
         let mut grid: HashMap<(i32, i32), Vec<i64>> = HashMap::with_capacity(self.entities.len());
-        let mut ids = self.entities.keys().copied().collect::<Vec<_>>();
-        ids.sort_unstable();
+        let ids = self.entities.keys().copied().collect::<Vec<_>>();
         for id in &ids {
             if let Some(e) = self.entities.get(id) {
                 let cx = (e.pos[0] / cell_size).floor() as i32;
                 let cy = (e.pos[1] / cell_size).floor() as i32;
                 grid.entry((cx, cy)).or_default().push(*id);
             }
-        }
-        for bucket in grid.values_mut() {
-            bucket.sort_unstable();
         }
 
         for id in &ids {
