@@ -5,8 +5,13 @@ Jules is a game-dev + ML-oriented language/runtime with:
 - ML tensor engine (CPU + GPU hooks)
 - C ABI for embedding in external engines
 - lexical borrow-checking pass for reference alias safety (`&` / `&mut`)
+- incremental compilation so rebuilds only recompile changed code paths, for faster iteration loops than full rebuild workflows
 
 For a consolidated list of implemented optimization techniques, see `md/OPTIMIZATIONS.md`.
+
+`jules check` now uses an incremental on-disk cache (`.jules_cache/check`) and
+returns immediately when the source hash is unchanged and the previous check had
+no diagnostics.
 
 ## Engine / Host Integrations
 
@@ -81,6 +86,18 @@ Jules now ships additional game-loop-friendly built-ins in `math`:
 - `math::move_towards2(cx, cy, tx, ty, max_delta)` for fixed-step 2D follow behavior
 - `math::angle_to(ax, ay, bx, by)` for heading/orientation calculations
 - `math::rand_unit2()` for random normalized directions
+
+## Game simulation optimization focus
+
+Jules is now tuned for game simulation workloads around deterministic stepping and
+high-frequency spatial queries. The current game-sim optimization profile includes:
+
+- deterministic entity iteration order in `sim` worlds for stable replay/debug behavior
+- uniform-grid broadphase collision filtering in `sim::step` to reduce pair checks
+- sorted/stable nearest/radius entity query behavior for gameplay logic consistency
+- fixed-step-friendly movement helpers (`math::approach`, `math::move_towards2`)
+- command-buffered rendering API (`render::*`) for predictable frame submission
+- strict ML memory cap controls (`M_min + ΔM`) for mixed game+ML runtime stability
 
 ## Rendering API with AoT-friendly command streams
 
