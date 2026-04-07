@@ -41,7 +41,11 @@ fn main() {
         }
         let elapsed = t0.elapsed();
         let sps = steps as f64 / elapsed.as_secs_f64().max(1e-12);
-        println!("baseline elapsed: {:.3}s ({:.1} steps/s)", elapsed.as_secs_f64(), sps);
+        println!(
+            "baseline elapsed: {:.3}s ({:.1} steps/s)",
+            elapsed.as_secs_f64(),
+            sps
+        );
     }
 
     if mode == "soa-linear" || mode == "both" || mode == "rust-compare" {
@@ -95,12 +99,39 @@ fn main() {
         let tc = Instant::now();
         for _ in 0..steps {
             let _ = world_chunked.integrate_vec3_chunked_precomputed("pos", "vel", dt, 64);
-            let _ = world_chunked.integrate_vec3_and_health_chunked("pos", "vel", "health", "damage", dt, 64);
+            let _ = world_chunked
+                .integrate_vec3_and_health_chunked("pos", "vel", "health", "damage", dt, 64);
         }
         let elapsed = tc.elapsed().as_secs_f64();
         chunked_elapsed_s = Some(elapsed);
         let sps = steps as f64 / elapsed.max(1e-12);
-        println!("chunked-fused elapsed: {:.3}s ({:.1} steps/s)", elapsed, sps);
+        println!(
+            "chunked-fused elapsed: {:.3}s ({:.1} steps/s)",
+            elapsed, sps
+        );
+    }
+
+    let mut superopt_elapsed_s = None;
+    if mode == "superoptimizer" || mode == "both" || mode == "rust-compare" {
+        let mut world_superopt = EcsWorld::default();
+        for _ in 0..n {
+            let id = world_superopt.spawn();
+            world_superopt.insert_component(id, "pos", Value::Vec3([0.0, 0.0, 0.0]));
+            world_superopt.insert_component(id, "vel", Value::Vec3([1.0, 0.0, 0.0]));
+            world_superopt.insert_component(id, "health", Value::F32(100.0));
+            world_superopt.insert_component(id, "damage", Value::F32(0.25));
+        }
+        let ts = Instant::now();
+        for _ in 0..steps {
+            let _ = world_superopt.integrate_vec3_superoptimizer("pos", "vel", dt, 64);
+        }
+        let elapsed = ts.elapsed().as_secs_f64();
+        superopt_elapsed_s = Some(elapsed);
+        let sps = steps as f64 / elapsed.max(1e-12);
+        println!(
+            "superoptimizer elapsed: {:.3}s ({:.1} steps/s)",
+            elapsed, sps
+        );
     }
 
     let mut aot_elapsed_s = None;
@@ -165,6 +196,12 @@ fn main() {
             println!(
                 "chunked-vs-rust ratio (chunked/rust): {:.2}x",
                 chunked_s / elapsed.max(1e-12)
+            );
+        }
+        if let Some(superopt_s) = superopt_elapsed_s {
+            println!(
+                "superoptimizer-vs-rust ratio (superoptimizer/rust): {:.2}x",
+                superopt_s / elapsed.max(1e-12)
             );
         }
     }
@@ -234,13 +271,26 @@ impl StepHotspot {
     fn total_ns(&self) -> u128 {
         self.query_ns + self.fetch_ns + self.math_ns + self.write_ns
     }
-    fn weight_query(&self) -> f64 { self.query_ns as f64 / self.total_ns().max(1) as f64 }
-    fn weight_fetch(&self) -> f64 { self.fetch_ns as f64 / self.total_ns().max(1) as f64 }
-    fn weight_math(&self) -> f64 { self.math_ns as f64 / self.total_ns().max(1) as f64 }
-    fn weight_write(&self) -> f64 { self.write_ns as f64 / self.total_ns().max(1) as f64 }
+    fn weight_query(&self) -> f64 {
+        self.query_ns as f64 / self.total_ns().max(1) as f64
+    }
+    fn weight_fetch(&self) -> f64 {
+        self.fetch_ns as f64 / self.total_ns().max(1) as f64
+    }
+    fn weight_math(&self) -> f64 {
+        self.math_ns as f64 / self.total_ns().max(1) as f64
+    }
+    fn weight_write(&self) -> f64 {
+        self.write_ns as f64 / self.total_ns().max(1) as f64
+    }
 }
 
-fn run_step_aot_hash(world: &mut EcsWorld, dt: f32, cache: &AotStepCache, hotspot: &mut StepHotspot) {
+fn run_step_aot_hash(
+    world: &mut EcsWorld,
+    dt: f32,
+    cache: &AotStepCache,
+    hotspot: &mut StepHotspot,
+) {
     let t_query = Instant::now();
     let mut hasher = DefaultHasher::new();
     cache.ids.hash(&mut hasher);
@@ -292,7 +342,9 @@ fn run_step(world: &mut EcsWorld, dt: f32) {
         let pos_val = world.get_component(id, "pos").unwrap().clone();
         let vel_val = world.get_component(id, "vel").unwrap().clone();
         let new_pos = match (pos_val, vel_val) {
-            (Value::Vec3(p), Value::Vec3(v)) => Value::Vec3([p[0] + v[0] * dt, p[1] + v[1] * dt, p[2] + v[2] * dt]),
+            (Value::Vec3(p), Value::Vec3(v)) => {
+                Value::Vec3([p[0] + v[0] * dt, p[1] + v[1] * dt, p[2] + v[2] * dt])
+            }
             _ => continue,
         };
         world.insert_component(id, "pos", new_pos);
