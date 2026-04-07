@@ -81,7 +81,10 @@ impl ExecMem {
             return None;
         }
         unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), ptr.cast::<u8>(), code.len()) };
-        Some(Self { ptr: ptr.cast::<u8>(), len })
+        Some(Self {
+            ptr: ptr.cast::<u8>(),
+            len,
+        })
     }
     fn entry(&self) -> unsafe extern "C" fn(*mut i64) -> i64 {
         unsafe { std::mem::transmute(self.ptr) }
@@ -101,16 +104,32 @@ struct Emitter {
 }
 
 impl Emitter {
-    fn new() -> Self { Self { buf: Vec::with_capacity(4096) } }
-    fn pos(&self) -> usize { self.buf.len() }
-    fn b(&mut self, v: u8) { self.buf.push(v); }
-    fn d(&mut self, v: i32) { self.buf.extend_from_slice(&v.to_le_bytes()); }
-    fn q(&mut self, v: i64) { self.buf.extend_from_slice(&v.to_le_bytes()); }
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(4096),
+        }
+    }
+    fn pos(&self) -> usize {
+        self.buf.len()
+    }
+    fn b(&mut self, v: u8) {
+        self.buf.push(v);
+    }
+    fn d(&mut self, v: i32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn q(&mut self, v: i64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
 
     // ── Immediate loads ──────────────────────────────────────────────────────
 
     /// Full 64-bit immediate into rax (10 bytes).
-    fn mov_rax_imm64(&mut self, v: i64) { self.b(0x48); self.b(0xB8); self.q(v); }
+    fn mov_rax_imm64(&mut self, v: i64) {
+        self.b(0x48);
+        self.b(0xB8);
+        self.q(v);
+    }
 
     /// Optimal immediate into rax.
     ///  v ≥ 0 and fits i32 → MOV EAX, imm32 (5 B, zero-extends)
@@ -119,9 +138,13 @@ impl Emitter {
     fn mov_rax_imm_opt(&mut self, v: i64) {
         if let Ok(v32) = i32::try_from(v) {
             if v32 >= 0 {
-                self.b(0xB8); self.d(v32);                      // MOV EAX, imm32
+                self.b(0xB8);
+                self.d(v32); // MOV EAX, imm32
             } else {
-                self.b(0x48); self.b(0xC7); self.b(0xC0); self.d(v32); // MOV RAX, sx(imm32)
+                self.b(0x48);
+                self.b(0xC7);
+                self.b(0xC0);
+                self.d(v32); // MOV RAX, sx(imm32)
             }
         } else {
             self.mov_rax_imm64(v);
@@ -138,9 +161,9 @@ impl Emitter {
 
     /// mov reg64, [rdi + disp32]
     fn load_reg_mem(&mut self, reg: u8, disp: i32) {
-        self.b(0x48 | ((reg & 8) >> 1));           // REX.W | REX.R
+        self.b(0x48 | ((reg & 8) >> 1)); // REX.W | REX.R
         self.b(0x8B);
-        self.b(0x87 | ((reg & 7) << 3));           // mod=10, reg, rm=7(rdi)
+        self.b(0x87 | ((reg & 7) << 3)); // mod=10, reg, rm=7(rdi)
         self.d(disp);
     }
 
@@ -154,7 +177,9 @@ impl Emitter {
 
     /// mov dst64, src64  — no-op when dst == src.
     fn mov_rr(&mut self, dst: u8, src: u8) {
-        if dst == src { return; }
+        if dst == src {
+            return;
+        }
         // MOV r64, r/m64 (0x8B): REX.R extends dst, REX.B extends src
         self.b(0x48 | ((dst & 8) >> 1) | ((src & 8) >> 3));
         self.b(0x8B);
@@ -163,52 +188,172 @@ impl Emitter {
 
     // ── Arithmetic (rax / rcx) ───────────────────────────────────────────────
 
-    fn add_rax_rcx(&mut self)        { self.b(0x48); self.b(0x01); self.b(0xC8); }
-    fn sub_rax_rcx(&mut self)        { self.b(0x48); self.b(0x29); self.b(0xC8); }
-    fn imul_rax_rcx(&mut self)       { self.b(0x48); self.b(0x0F); self.b(0xAF); self.b(0xC1); }
-    fn add_rax_imm32(&mut self, v: i32) { self.b(0x48); self.b(0x05); self.d(v); }
-    fn sub_rax_imm32(&mut self, v: i32) { self.b(0x48); self.b(0x2D); self.d(v); }
-    fn imul_rax_imm32(&mut self, v: i32){ self.b(0x48); self.b(0x69); self.b(0xC0); self.d(v); }
-    fn inc_rax(&mut self)            { self.b(0x48); self.b(0xFF); self.b(0xC0); }
-    fn dec_rax(&mut self)            { self.b(0x48); self.b(0xFF); self.b(0xC8); }
-    fn neg_rax(&mut self)            { self.b(0x48); self.b(0xF7); self.b(0xD8); }
-    fn shl_rax_imm8(&mut self, v: u8){ self.b(0x48); self.b(0xC1); self.b(0xE0); self.b(v); }
-    fn xor_rax_rax(&mut self)        { self.b(0x48); self.b(0x31); self.b(0xC0); }
+    fn add_rax_rcx(&mut self) {
+        self.b(0x48);
+        self.b(0x01);
+        self.b(0xC8);
+    }
+    fn sub_rax_rcx(&mut self) {
+        self.b(0x48);
+        self.b(0x29);
+        self.b(0xC8);
+    }
+    fn imul_rax_rcx(&mut self) {
+        self.b(0x48);
+        self.b(0x0F);
+        self.b(0xAF);
+        self.b(0xC1);
+    }
+    fn add_rax_imm32(&mut self, v: i32) {
+        self.b(0x48);
+        self.b(0x05);
+        self.d(v);
+    }
+    fn sub_rax_imm32(&mut self, v: i32) {
+        self.b(0x48);
+        self.b(0x2D);
+        self.d(v);
+    }
+    fn imul_rax_imm32(&mut self, v: i32) {
+        self.b(0x48);
+        self.b(0x69);
+        self.b(0xC0);
+        self.d(v);
+    }
+    fn inc_rax(&mut self) {
+        self.b(0x48);
+        self.b(0xFF);
+        self.b(0xC0);
+    }
+    fn dec_rax(&mut self) {
+        self.b(0x48);
+        self.b(0xFF);
+        self.b(0xC8);
+    }
+    fn neg_rax(&mut self) {
+        self.b(0x48);
+        self.b(0xF7);
+        self.b(0xD8);
+    }
+    fn shl_rax_imm8(&mut self, v: u8) {
+        self.b(0x48);
+        self.b(0xC1);
+        self.b(0xE0);
+        self.b(v);
+    }
+    fn xor_rax_rax(&mut self) {
+        self.b(0x48);
+        self.b(0x31);
+        self.b(0xC0);
+    }
 
     // LEA ×N patterns on rax only (rax = rax*N via SIB with base=rax, index=rax).
     // SIB for [rax + rax*K]: scale_bits<<6 | index=rax(0)<<3 | base=rax(0)
-    fn lea_rax_rax_mul3(&mut self) { self.b(0x48); self.b(0x8D); self.b(0x04); self.b(0x40); }
-    fn lea_rax_rax_mul5(&mut self) { self.b(0x48); self.b(0x8D); self.b(0x04); self.b(0x80); }
-    fn lea_rax_rax_mul9(&mut self) { self.b(0x48); self.b(0x8D); self.b(0x04); self.b(0xC0); }
+    fn lea_rax_rax_mul3(&mut self) {
+        self.b(0x48);
+        self.b(0x8D);
+        self.b(0x04);
+        self.b(0x40);
+    }
+    fn lea_rax_rax_mul5(&mut self) {
+        self.b(0x48);
+        self.b(0x8D);
+        self.b(0x04);
+        self.b(0x80);
+    }
+    fn lea_rax_rax_mul9(&mut self) {
+        self.b(0x48);
+        self.b(0x8D);
+        self.b(0x04);
+        self.b(0xC0);
+    }
 
     /// lea rax, [rcx + rax*scale]   scale ∈ {2,4,8}
     /// Used by Mul+Add→LEA fusion: rax = multiplicand, rcx = addend.
     /// Result: rax*scale + rcx.
     fn lea_rax_rax_scale_plus_rcx(&mut self, scale: u8) {
         // SIB: ss<<6 | index=rax(0)<<3 | base=rcx(1)
-        let ss: u8 = match scale { 4 => 2, 8 => 3, _ => 1 };
-        self.b(0x48); self.b(0x8D); self.b(0x04); self.b((ss << 6) | 1);
+        let ss: u8 = match scale {
+            4 => 2,
+            8 => 3,
+            _ => 1,
+        };
+        self.b(0x48);
+        self.b(0x8D);
+        self.b(0x04);
+        self.b((ss << 6) | 1);
     }
 
     // ── Division ─────────────────────────────────────────────────────────────
 
-    fn cqo(&mut self)        { self.b(0x48); self.b(0x99); }
-    fn idiv_rcx(&mut self)   { self.b(0x48); self.b(0xF7); self.b(0xF9); }
-    fn mov_rax_rdx(&mut self){ self.b(0x48); self.b(0x89); self.b(0xD0); }
+    fn cqo(&mut self) {
+        self.b(0x48);
+        self.b(0x99);
+    }
+    fn idiv_rcx(&mut self) {
+        self.b(0x48);
+        self.b(0xF7);
+        self.b(0xF9);
+    }
+    fn mov_rax_rdx(&mut self) {
+        self.b(0x48);
+        self.b(0x89);
+        self.b(0xD0);
+    }
 
     // ── Compare / branch ─────────────────────────────────────────────────────
 
-    fn cmp_rax_rcx(&mut self)          { self.b(0x48); self.b(0x39); self.b(0xC8); }
-    fn cmp_rax_imm32(&mut self, v: i32){ self.b(0x48); self.b(0x3D); self.d(v); }
-    fn test_rax_rax(&mut self)         { self.b(0x48); self.b(0x85); self.b(0xC0); }
-    fn setcc_al(&mut self, cc: u8)     { self.b(0x0F); self.b(cc); self.b(0xC0); }
-    fn movzx_rax_al(&mut self)         { self.b(0x48); self.b(0x0F); self.b(0xB6); self.b(0xC0); }
+    fn cmp_rax_rcx(&mut self) {
+        self.b(0x48);
+        self.b(0x39);
+        self.b(0xC8);
+    }
+    fn cmp_rax_imm32(&mut self, v: i32) {
+        self.b(0x48);
+        self.b(0x3D);
+        self.d(v);
+    }
+    fn test_rax_rax(&mut self) {
+        self.b(0x48);
+        self.b(0x85);
+        self.b(0xC0);
+    }
+    fn setcc_al(&mut self, cc: u8) {
+        self.b(0x0F);
+        self.b(cc);
+        self.b(0xC0);
+    }
+    fn movzx_rax_al(&mut self) {
+        self.b(0x48);
+        self.b(0x0F);
+        self.b(0xB6);
+        self.b(0xC0);
+    }
 
-    fn jmp_rel32_placeholder(&mut self) -> usize { self.b(0xE9); let p=self.pos(); self.d(0); p }
-    fn jz_rel32_placeholder(&mut self)  -> usize { self.b(0x0F); self.b(0x84); let p=self.pos(); self.d(0); p }
-    fn jnz_rel32_placeholder(&mut self) -> usize { self.b(0x0F); self.b(0x85); let p=self.pos(); self.d(0); p }
+    fn jmp_rel32_placeholder(&mut self) -> usize {
+        self.b(0xE9);
+        let p = self.pos();
+        self.d(0);
+        p
+    }
+    fn jz_rel32_placeholder(&mut self) -> usize {
+        self.b(0x0F);
+        self.b(0x84);
+        let p = self.pos();
+        self.d(0);
+        p
+    }
+    fn jnz_rel32_placeholder(&mut self) -> usize {
+        self.b(0x0F);
+        self.b(0x85);
+        let p = self.pos();
+        self.d(0);
+        p
+    }
 
-    fn ret(&mut self) { self.b(0xC3); }
+    fn ret(&mut self) {
+        self.b(0xC3);
+    }
 
     // ── Callee-saved save/restore ────────────────────────────────────────────
     //
@@ -216,11 +361,15 @@ impl Emitter {
     // r8-r15 require REX.B prefix (0x41).
 
     fn push_reg(&mut self, reg: u8) {
-        if reg >= 8 { self.b(0x41); }
+        if reg >= 8 {
+            self.b(0x41);
+        }
         self.b(0x50 + (reg & 7));
     }
     fn pop_reg(&mut self, reg: u8) {
-        if reg >= 8 { self.b(0x41); }
+        if reg >= 8 {
+            self.b(0x41);
+        }
         self.b(0x58 + (reg & 7));
     }
 }
@@ -239,7 +388,7 @@ impl Emitter {
 ///   rdi(7)  — slot-array base pointer (function argument)
 ///   rsp(4) / rbp(5) — stack management
 const ALLOC_POOL: &[u8] = &[
-    8, 9, 10, 11, 6,   // r8-r11, rsi  (caller-saved — free)
+    8, 9, 10, 11, 6, // r8-r11, rsi  (caller-saved — free)
     12, 13, 14, 15, 3, // r12-r15, rbx (callee-saved — require push/pop)
 ];
 
@@ -271,31 +420,67 @@ impl RegAlloc {
 // ── Live intervals ────────────────────────────────────────────────────────────
 
 struct LiveInterval {
-    slot:  u16,
+    slot: u16,
     first: usize, // index of first instruction that defines or uses this slot
-    last:  usize, // index of last instruction that uses this slot
+    last: usize,  // index of last instruction that uses this slot
 }
 
 fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterval> {
     const UNDEF: usize = usize::MAX;
     let cap = slot_count + 1;
     let mut first_def = vec![UNDEF; cap];
-    let mut last_use  = vec![UNDEF; cap];
+    let mut last_use = vec![UNDEF; cap];
 
     // Ensure slot fits in our vecs; grow if needed (shouldn't happen with correct slot_count).
-    macro_rules! ensure { ($s:expr) => { let s = $s as usize; if s >= first_def.len() { first_def.resize(s+1, UNDEF); last_use.resize(s+1, UNDEF); } }; }
-    macro_rules! def  { ($s:expr, $pc:expr) => { ensure!($s); let s=$s as usize; if first_def[s]==UNDEF { first_def[s]=$pc; } }; }
-    macro_rules! use_ { ($s:expr, $pc:expr) => { ensure!($s); last_use[$s as usize]=$pc; }; }
+    macro_rules! ensure {
+        ($s:expr) => {
+            let s = $s as usize;
+            if s >= first_def.len() {
+                first_def.resize(s + 1, UNDEF);
+                last_use.resize(s + 1, UNDEF);
+            }
+        };
+    }
+    macro_rules! def {
+        ($s:expr, $pc:expr) => {
+            ensure!($s);
+            let s = $s as usize;
+            if first_def[s] == UNDEF {
+                first_def[s] = $pc;
+            }
+        };
+    }
+    macro_rules! use_ {
+        ($s:expr, $pc:expr) => {
+            ensure!($s);
+            last_use[$s as usize] = $pc;
+        };
+    }
 
     for (pc, instr) in instrs.iter().enumerate() {
         match instr {
-            Instr::LoadI32(d,_)|Instr::LoadI64(d,_)|Instr::LoadBool(d,_)|Instr::LoadUnit(d) => {
+            Instr::LoadI32(d, _)
+            | Instr::LoadI64(d, _)
+            | Instr::LoadBool(d, _)
+            | Instr::LoadUnit(d) => {
                 def!(*d, pc);
             }
-            Instr::Move(d,s)|Instr::Load(d,s) => { use_!(*s, pc); def!(*d, pc); }
-            Instr::Store(slot,s)               => { use_!(*s, pc); def!(*slot, pc); }
-            Instr::BinOp(d,_,l,r) => { use_!(*l, pc); use_!(*r, pc); def!(*d, pc); }
-            Instr::JumpFalse(s,_)|Instr::JumpTrue(s,_)|Instr::Return(s) => { use_!(*s, pc); }
+            Instr::Move(d, s) | Instr::Load(d, s) => {
+                use_!(*s, pc);
+                def!(*d, pc);
+            }
+            Instr::Store(slot, s) => {
+                use_!(*s, pc);
+                def!(*slot, pc);
+            }
+            Instr::BinOp(d, _, l, r) => {
+                use_!(*l, pc);
+                use_!(*r, pc);
+                def!(*d, pc);
+            }
+            Instr::JumpFalse(s, _) | Instr::JumpTrue(s, _) | Instr::Return(s) => {
+                use_!(*s, pc);
+            }
             _ => {}
         }
     }
@@ -305,10 +490,16 @@ fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterv
     for slot in 0..first_def.len() {
         let lu = last_use[slot];
         let fd = first_def[slot];
-        if fd == UNDEF && lu == UNDEF { continue; }
+        if fd == UNDEF && lu == UNDEF {
+            continue;
+        }
         let first = if fd == UNDEF { 0 } else { fd };
-        let last  = if lu == UNDEF { first } else { lu };
-        intervals.push(LiveInterval { slot: slot as u16, first, last });
+        let last = if lu == UNDEF { first } else { lu };
+        intervals.push(LiveInterval {
+            slot: slot as u16,
+            first,
+            last,
+        });
     }
     intervals.sort_unstable_by_key(|i| (i.first, i.slot));
     intervals
@@ -319,9 +510,7 @@ fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterv
 fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
     // Pre-fill slots with their default Spill locations (slot * 8 offset).
     let cap = slot_count + 1;
-    let mut slots: Vec<RegLoc> = (0..cap)
-        .map(|s| RegLoc::Spill((s as i32) * 8))
-        .collect();
+    let mut slots: Vec<RegLoc> = (0..cap).map(|s| RegLoc::Spill((s as i32) * 8)).collect();
 
     // Grow helper in case any slot exceeds slot_count (shouldn't happen normally).
     let ensure_slot = |slots: &mut Vec<RegLoc>, slot: u16| {
@@ -340,7 +529,9 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
     let mut callee_saved_mask: u16 = 0;
 
     #[inline(always)]
-    fn is_callee_saved(reg: u8) -> bool { matches!(reg, 3 | 12..=15) }
+    fn is_callee_saved(reg: u8) -> bool {
+        matches!(reg, 3 | 12..=15)
+    }
 
     for iv in intervals {
         // Expire intervals ended strictly before this one's start — no temp Vec needed.
@@ -390,7 +581,10 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
         }
     }
 
-    RegAlloc { slots, used_callee_saved }
+    RegAlloc {
+        slots,
+        used_callee_saved,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -402,14 +596,24 @@ fn fold_binop(op: BinOpKind, l: i64, r: i64) -> Option<i64> {
         BinOpKind::Add => l.wrapping_add(r),
         BinOpKind::Sub => l.wrapping_sub(r),
         BinOpKind::Mul => l.wrapping_mul(r),
-        BinOpKind::Div => { if r == 0 { return None; } l.wrapping_div(r) }
-        BinOpKind::Rem => { if r == 0 { return None; } l.wrapping_rem(r) }
-        BinOpKind::Eq  => i64::from(l == r),
-        BinOpKind::Ne  => i64::from(l != r),
-        BinOpKind::Lt  => i64::from(l <  r),
-        BinOpKind::Le  => i64::from(l <= r),
-        BinOpKind::Gt  => i64::from(l >  r),
-        BinOpKind::Ge  => i64::from(l >= r),
+        BinOpKind::Div => {
+            if r == 0 {
+                return None;
+            }
+            l.wrapping_div(r)
+        }
+        BinOpKind::Rem => {
+            if r == 0 {
+                return None;
+            }
+            l.wrapping_rem(r)
+        }
+        BinOpKind::Eq => i64::from(l == r),
+        BinOpKind::Ne => i64::from(l != r),
+        BinOpKind::Lt => i64::from(l < r),
+        BinOpKind::Le => i64::from(l <= r),
+        BinOpKind::Gt => i64::from(l > r),
+        BinOpKind::Ge => i64::from(l >= r),
         _ => return None,
     })
 }
@@ -425,7 +629,7 @@ fn fold_binop(op: BinOpKind, l: i64, r: i64) -> Option<i64> {
 #[inline(always)]
 fn load_rax(em: &mut Emitter, slot: u16, ra: &RegAlloc) {
     match ra.location(slot) {
-        RegLoc::Reg(r)    => em.mov_rr(0, r),
+        RegLoc::Reg(r) => em.mov_rr(0, r),
         RegLoc::Spill(off) => em.load_reg_mem(0, off),
     }
 }
@@ -433,7 +637,7 @@ fn load_rax(em: &mut Emitter, slot: u16, ra: &RegAlloc) {
 #[inline(always)]
 fn load_rcx(em: &mut Emitter, slot: u16, ra: &RegAlloc) {
     match ra.location(slot) {
-        RegLoc::Reg(r)    => em.mov_rr(1, r),
+        RegLoc::Reg(r) => em.mov_rr(1, r),
         RegLoc::Spill(off) => em.load_reg_mem(1, off),
     }
 }
@@ -441,9 +645,68 @@ fn load_rcx(em: &mut Emitter, slot: u16, ra: &RegAlloc) {
 #[inline(always)]
 fn store_rax(em: &mut Emitter, slot: u16, ra: &RegAlloc) {
     match ra.location(slot) {
-        RegLoc::Reg(r)    => em.mov_rr(r, 0),
+        RegLoc::Reg(r) => em.mov_rr(r, 0),
         RegLoc::Spill(off) => em.store_mem_reg(off, 0),
     }
+}
+
+#[inline(always)]
+fn instr_reads_slot(instr: &Instr, slot: u16) -> bool {
+    match instr {
+        Instr::Move(_, s) | Instr::Load(_, s) | Instr::Store(_, s) | Instr::Return(s) => *s == slot,
+        Instr::BinOp(_, _, l, r) => *l == slot || *r == slot,
+        Instr::JumpFalse(s, _) | Instr::JumpTrue(s, _) => *s == slot,
+        _ => false,
+    }
+}
+
+#[inline(always)]
+fn instr_writes_slot(instr: &Instr, slot: u16) -> bool {
+    match instr {
+        Instr::LoadI32(d, _)
+        | Instr::LoadI64(d, _)
+        | Instr::LoadBool(d, _)
+        | Instr::LoadUnit(d)
+        | Instr::Move(d, _)
+        | Instr::Load(d, _)
+        | Instr::Store(d, _)
+        | Instr::BinOp(d, _, _, _) => *d == slot,
+        _ => false,
+    }
+}
+
+#[inline(always)]
+fn is_control_flow_barrier(instr: &Instr) -> bool {
+    matches!(
+        instr,
+        Instr::Jump(_)
+            | Instr::JumpFalse(_, _)
+            | Instr::JumpTrue(_, _)
+            | Instr::Return(_)
+            | Instr::ReturnUnit
+    )
+}
+
+/// Local straight-line dead-definition check.
+///
+/// Returns true when a write to `slot` at `pc` is overwritten before any read
+/// and before any control-flow barrier.
+fn is_straight_line_dead_def(instrs: &[Instr], pc: usize, slot: u16) -> bool {
+    let mut i = pc + 1;
+    while i < instrs.len() {
+        let next = &instrs[i];
+        if is_control_flow_barrier(next) {
+            return false;
+        }
+        if instr_reads_slot(next, slot) {
+            return false;
+        }
+        if instr_writes_slot(next, slot) {
+            return true;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Returns true when `op` is in the set we know how to emit.
@@ -451,11 +714,17 @@ fn store_rax(em: &mut Emitter, slot: u16, ra: &RegAlloc) {
 fn is_supported_binop(op: BinOpKind) -> bool {
     matches!(
         op,
-        BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul |
-        BinOpKind::Div | BinOpKind::Rem |
-        BinOpKind::Eq  | BinOpKind::Ne  |
-        BinOpKind::Lt  | BinOpKind::Le  |
-        BinOpKind::Gt  | BinOpKind::Ge
+        BinOpKind::Add
+            | BinOpKind::Sub
+            | BinOpKind::Mul
+            | BinOpKind::Div
+            | BinOpKind::Rem
+            | BinOpKind::Eq
+            | BinOpKind::Ne
+            | BinOpKind::Lt
+            | BinOpKind::Le
+            | BinOpKind::Gt
+            | BinOpKind::Ge
     )
 }
 
@@ -467,14 +736,45 @@ fn emit_binop_rax_rcx(em: &mut Emitter, op: BinOpKind) -> bool {
         BinOpKind::Add => em.add_rax_rcx(),
         BinOpKind::Sub => em.sub_rax_rcx(),
         BinOpKind::Mul => em.imul_rax_rcx(),
-        BinOpKind::Div => { em.cqo(); em.idiv_rcx(); }
-        BinOpKind::Rem => { em.cqo(); em.idiv_rcx(); em.mov_rax_rdx(); }
-        BinOpKind::Eq  => { em.cmp_rax_rcx(); em.setcc_al(0x94); em.movzx_rax_al(); }
-        BinOpKind::Ne  => { em.cmp_rax_rcx(); em.setcc_al(0x95); em.movzx_rax_al(); }
-        BinOpKind::Lt  => { em.cmp_rax_rcx(); em.setcc_al(0x9C); em.movzx_rax_al(); }
-        BinOpKind::Le  => { em.cmp_rax_rcx(); em.setcc_al(0x9E); em.movzx_rax_al(); }
-        BinOpKind::Gt  => { em.cmp_rax_rcx(); em.setcc_al(0x9F); em.movzx_rax_al(); }
-        BinOpKind::Ge  => { em.cmp_rax_rcx(); em.setcc_al(0x9D); em.movzx_rax_al(); }
+        BinOpKind::Div => {
+            em.cqo();
+            em.idiv_rcx();
+        }
+        BinOpKind::Rem => {
+            em.cqo();
+            em.idiv_rcx();
+            em.mov_rax_rdx();
+        }
+        BinOpKind::Eq => {
+            em.cmp_rax_rcx();
+            em.setcc_al(0x94);
+            em.movzx_rax_al();
+        }
+        BinOpKind::Ne => {
+            em.cmp_rax_rcx();
+            em.setcc_al(0x95);
+            em.movzx_rax_al();
+        }
+        BinOpKind::Lt => {
+            em.cmp_rax_rcx();
+            em.setcc_al(0x9C);
+            em.movzx_rax_al();
+        }
+        BinOpKind::Le => {
+            em.cmp_rax_rcx();
+            em.setcc_al(0x9E);
+            em.movzx_rax_al();
+        }
+        BinOpKind::Gt => {
+            em.cmp_rax_rcx();
+            em.setcc_al(0x9F);
+            em.movzx_rax_al();
+        }
+        BinOpKind::Ge => {
+            em.cmp_rax_rcx();
+            em.setcc_al(0x9D);
+            em.movzx_rax_al();
+        }
         _ => return false,
     }
     true
@@ -485,34 +785,71 @@ fn emit_binop_rax_rcx(em: &mut Emitter, op: BinOpKind) -> bool {
 fn emit_binop_rax_imm(em: &mut Emitter, op: BinOpKind, imm: i32) {
     match op {
         BinOpKind::Add => {
-            if imm == 1 { em.inc_rax(); }
-            else if imm == -1 { em.dec_rax(); }
-            else if imm != 0 { em.add_rax_imm32(imm); }
+            if imm == 1 {
+                em.inc_rax();
+            } else if imm == -1 {
+                em.dec_rax();
+            } else if imm != 0 {
+                em.add_rax_imm32(imm);
+            }
         }
         BinOpKind::Sub => {
-            if imm == 1 { em.dec_rax(); }
-            else if imm == -1 { em.inc_rax(); }
-            else if imm != 0 { em.sub_rax_imm32(imm); }
+            if imm == 1 {
+                em.dec_rax();
+            } else if imm == -1 {
+                em.inc_rax();
+            } else if imm != 0 {
+                em.sub_rax_imm32(imm);
+            }
         }
         BinOpKind::Mul => {
-            if      imm == 0  { em.xor_rax_rax(); }
-            else if imm == 1  { /* nop */ }
-            else if imm == -1 { em.neg_rax(); }
-            else if imm == 3  { em.lea_rax_rax_mul3(); }
-            else if imm == 5  { em.lea_rax_rax_mul5(); }
-            else if imm == 9  { em.lea_rax_rax_mul9(); }
-            else if imm > 0 && (imm as u32).is_power_of_two() {
+            if imm == 0 {
+                em.xor_rax_rax();
+            } else if imm == 1 { /* nop */
+            } else if imm == -1 {
+                em.neg_rax();
+            } else if imm == 3 {
+                em.lea_rax_rax_mul3();
+            } else if imm == 5 {
+                em.lea_rax_rax_mul5();
+            } else if imm == 9 {
+                em.lea_rax_rax_mul9();
+            } else if imm > 0 && (imm as u32).is_power_of_two() {
                 em.shl_rax_imm8((imm as u32).trailing_zeros() as u8);
             } else {
                 em.imul_rax_imm32(imm);
             }
         }
-        BinOpKind::Eq  => { em.cmp_rax_imm32(imm); em.setcc_al(0x94); em.movzx_rax_al(); }
-        BinOpKind::Ne  => { em.cmp_rax_imm32(imm); em.setcc_al(0x95); em.movzx_rax_al(); }
-        BinOpKind::Lt  => { em.cmp_rax_imm32(imm); em.setcc_al(0x9C); em.movzx_rax_al(); }
-        BinOpKind::Le  => { em.cmp_rax_imm32(imm); em.setcc_al(0x9E); em.movzx_rax_al(); }
-        BinOpKind::Gt  => { em.cmp_rax_imm32(imm); em.setcc_al(0x9F); em.movzx_rax_al(); }
-        BinOpKind::Ge  => { em.cmp_rax_imm32(imm); em.setcc_al(0x9D); em.movzx_rax_al(); }
+        BinOpKind::Eq => {
+            em.cmp_rax_imm32(imm);
+            em.setcc_al(0x94);
+            em.movzx_rax_al();
+        }
+        BinOpKind::Ne => {
+            em.cmp_rax_imm32(imm);
+            em.setcc_al(0x95);
+            em.movzx_rax_al();
+        }
+        BinOpKind::Lt => {
+            em.cmp_rax_imm32(imm);
+            em.setcc_al(0x9C);
+            em.movzx_rax_al();
+        }
+        BinOpKind::Le => {
+            em.cmp_rax_imm32(imm);
+            em.setcc_al(0x9E);
+            em.movzx_rax_al();
+        }
+        BinOpKind::Gt => {
+            em.cmp_rax_imm32(imm);
+            em.setcc_al(0x9F);
+            em.movzx_rax_al();
+        }
+        BinOpKind::Ge => {
+            em.cmp_rax_imm32(imm);
+            em.setcc_al(0x9D);
+            em.movzx_rax_al();
+        }
         _ => {}
     }
 }
@@ -531,35 +868,48 @@ fn emit_ret(em: &mut Emitter, callee_saved: &[u8]) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[must_use]
-pub fn is_available() -> bool { cfg!(target_arch = "x86_64") }
+pub fn is_available() -> bool {
+    cfg!(target_arch = "x86_64")
+}
 
 pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
-    if !cfg!(target_arch = "x86_64") { return None; }
+    if !cfg!(target_arch = "x86_64") {
+        return None;
+    }
 
     // Gate: bail out early if any instruction is outside our supported set.
     for instr in &compiled.instrs {
         match instr {
-            Instr::LoadI32(..) | Instr::LoadI64(..) | Instr::LoadBool(..) | Instr::LoadUnit(..)
-            | Instr::Move(..)  | Instr::Load(..)    | Instr::Store(..)
+            Instr::LoadI32(..)
+            | Instr::LoadI64(..)
+            | Instr::LoadBool(..)
+            | Instr::LoadUnit(..)
+            | Instr::Move(..)
+            | Instr::Load(..)
+            | Instr::Store(..)
             | Instr::BinOp(..)
-            | Instr::Jump(..)  | Instr::JumpFalse(..) | Instr::JumpTrue(..)
-            | Instr::Return(..)| Instr::ReturnUnit   | Instr::Nop => {}
+            | Instr::Jump(..)
+            | Instr::JumpFalse(..)
+            | Instr::JumpTrue(..)
+            | Instr::Return(..)
+            | Instr::ReturnUnit
+            | Instr::Nop => {}
             _ => return None,
         }
     }
 
-    let instrs        = &compiled.instrs;
-    let slot_count    = compiled.slot_count as usize;
+    let instrs = &compiled.instrs;
+    let slot_count = compiled.slot_count as usize;
 
     // ── Pass 1: liveness + linear-scan register allocation ───────────────
     // (const_prop state is maintained inline in the codegen loop below,
     //  eliminating the O(n) HashMap-clone pre-pass entirely.)
     let intervals = compute_live_intervals(instrs, slot_count);
-    let ra        = linear_scan(&intervals, slot_count);
+    let ra = linear_scan(&intervals, slot_count);
 
     // ── Emission ──────────────────────────────────────────────────────────
-    let mut em         = Emitter::new();
-    let mut pc_to_off  = vec![0usize; instrs.len() + 1];
+    let mut em = Emitter::new();
+    let mut pc_to_off = vec![0usize; instrs.len() + 1];
     let mut fixups: Vec<(usize, usize)> = Vec::new(); // (disp32_pos, target_pc)
 
     // Prologue: save callee-saved registers we actually use.
@@ -603,23 +953,29 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         // x must be a compile-time-unknown operand; the scalar N must be a
         // compile-time constant in const_at (so N can come from a prior LoadI).
         if pc + 1 < instrs.len() {
-            if let (Instr::BinOp(t, BinOpKind::Mul, mul_l, mul_r),
-                    Instr::BinOp(r, BinOpKind::Add, add_l, add_r)) =
-                (&instrs[pc], &instrs[pc + 1])
+            if let (
+                Instr::BinOp(t, BinOpKind::Mul, mul_l, mul_r),
+                Instr::BinOp(r, BinOpKind::Add, add_l, add_r),
+            ) = (&instrs[pc], &instrs[pc + 1])
             {
                 // The Mul result `t` must be one (and only one) operand of the Add.
                 // The other operand of the Add is the addend `y`.
                 // `t` must not also appear as the Add's destination to avoid
                 // clobbering a slot still used as the addend.
-                let (addend_slot, t_consumed_by_add) =
-                    if *add_l == *t && *add_r != *t && *r != *t { (Some(*add_r), true) }
-                    else if *add_r == *t && *add_l != *t && *r != *t { (Some(*add_l), true) }
-                    else { (None, false) };
+                let (addend_slot, t_consumed_by_add) = if *add_l == *t && *add_r != *t && *r != *t {
+                    (Some(*add_r), true)
+                } else if *add_r == *t && *add_l != *t && *r != *t {
+                    (Some(*add_l), true)
+                } else {
+                    (None, false)
+                };
 
                 if t_consumed_by_add {
                     let addend = addend_slot.unwrap();
                     // Determine which operand of Mul is the constant scale.
-                    let maybe_lea = const_at.get(mul_r).copied()
+                    let maybe_lea = const_at
+                        .get(mul_r)
+                        .copied()
                         .map(|c| (*mul_l, c))
                         .or_else(|| const_at.get(mul_l).copied().map(|c| (*mul_r, c)));
 
@@ -630,7 +986,9 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                             load_rax(&mut em, base, &ra);
                             load_rcx(&mut em, addend, &ra);
                             em.lea_rax_rax_scale_plus_rcx(scale);
-                            store_rax(&mut em, *r, &ra);
+                            if !is_straight_line_dead_def(instrs, pc, *r) {
+                                store_rax(&mut em, *r, &ra);
+                            }
                             pc_to_off[pc + 1] = em.pos();
                             pc += 2;
                             continue;
@@ -646,21 +1004,19 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         // Requires both ops to be supported and, when `t` is the *right*
         // operand of op2, requires op2 to be commutative (so we can swap).
         if pc + 1 < instrs.len() {
-            if let (Instr::BinOp(t, op1, a, b),
-                    Instr::BinOp(r, op2, l2, r2)) =
+            if let (Instr::BinOp(t, op1, a, b), Instr::BinOp(r, op2, l2, r2)) =
                 (&instrs[pc], &instrs[pc + 1])
             {
                 // Determine whether `t` appears as lhs or (for commutative ops) rhs of op2,
                 // and that `t` isn't also used as the other operand (which would alias).
-                let commutative = matches!(op2, BinOpKind::Add | BinOpKind::Mul
-                                              | BinOpKind::Eq  | BinOpKind::Ne);
+                let commutative = matches!(
+                    op2,
+                    BinOpKind::Add | BinOpKind::Mul | BinOpKind::Eq | BinOpKind::Ne
+                );
                 let t_as_lhs = *l2 == *t && *r2 != *t;
                 let t_as_rhs = *r2 == *t && *l2 != *t && commutative;
 
-                if (t_as_lhs || t_as_rhs)
-                    && is_supported_binop(*op1)
-                    && is_supported_binop(*op2)
-                {
+                if (t_as_lhs || t_as_rhs) && is_supported_binop(*op1) && is_supported_binop(*op2) {
                     let other = if t_as_lhs { *r2 } else { *l2 };
                     load_rax(&mut em, *a, &ra);
                     load_rcx(&mut em, *b, &ra);
@@ -669,7 +1025,9 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     // rax now holds the result of op1 (= the new value of `t`).
                     load_rcx(&mut em, other, &ra);
                     emit_binop_rax_rcx(&mut em, *op2);
-                    store_rax(&mut em, *r, &ra);
+                    if !is_straight_line_dead_def(instrs, pc, *r) {
+                        store_rax(&mut em, *r, &ra);
+                    }
                     pc_to_off[pc + 1] = em.pos();
                     pc += 2;
                     continue;
@@ -684,10 +1042,10 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         // ── Fusion: Load*(tmp, c) + JumpFalse/JumpTrue → compile-time branch ──
         if pc + 1 < instrs.len() {
             let maybe_const = match &instrs[pc] {
-                Instr::LoadI32(tmp, v)  => Some((*tmp, *v as i64)),
-                Instr::LoadI64(tmp, v)  => Some((*tmp, *v)),
+                Instr::LoadI32(tmp, v) => Some((*tmp, *v as i64)),
+                Instr::LoadI64(tmp, v) => Some((*tmp, *v)),
                 Instr::LoadBool(tmp, v) => Some((*tmp, i64::from(*v))),
-                Instr::LoadUnit(tmp)    => Some((*tmp, 0i64)),
+                Instr::LoadUnit(tmp) => Some((*tmp, 0i64)),
                 _ => None,
             };
             if let Some((tmp, c)) = maybe_const {
@@ -695,14 +1053,24 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 match &instrs[pc + 1] {
                     Instr::JumpFalse(cond, off) if *cond == tmp => {
                         let target = ((pc as i32) + 2 + *off) as usize;
-                        if target > instrs.len() { return None; }
-                        if c == 0 { let p = em.jmp_rel32_placeholder(); fixups.push((p, target)); }
+                        if target > instrs.len() {
+                            return None;
+                        }
+                        if c == 0 {
+                            let p = em.jmp_rel32_placeholder();
+                            fixups.push((p, target));
+                        }
                         folded = true;
                     }
                     Instr::JumpTrue(cond, off) if *cond == tmp => {
                         let target = ((pc as i32) + 2 + *off) as usize;
-                        if target > instrs.len() { return None; }
-                        if c != 0 { let p = em.jmp_rel32_placeholder(); fixups.push((p, target)); }
+                        if target > instrs.len() {
+                            return None;
+                        }
+                        if c != 0 {
+                            let p = em.jmp_rel32_placeholder();
+                            fixups.push((p, target));
+                        }
                         folded = true;
                     }
                     _ => {}
@@ -731,16 +1099,22 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                         // or the lhs for commutative (Add/Mul) ops.
                         let can_use = match op {
                             BinOpKind::Add | BinOpKind::Mul => rhs_is_imm || lhs_is_imm,
-                            BinOpKind::Sub | BinOpKind::Eq  | BinOpKind::Ne |
-                            BinOpKind::Lt  | BinOpKind::Le  | BinOpKind::Gt | BinOpKind::Ge
-                                => rhs_is_imm,
+                            BinOpKind::Sub
+                            | BinOpKind::Eq
+                            | BinOpKind::Ne
+                            | BinOpKind::Lt
+                            | BinOpKind::Le
+                            | BinOpKind::Gt
+                            | BinOpKind::Ge => rhs_is_imm,
                             _ => false,
                         };
                         if can_use {
                             let live_reg = if rhs_is_imm { *l } else { *r };
                             load_rax(&mut em, live_reg, &ra);
                             emit_binop_rax_imm(&mut em, *op, imm);
-                            store_rax(&mut em, *dst, &ra);
+                            if !is_straight_line_dead_def(instrs, pc, *dst) {
+                                store_rax(&mut em, *dst, &ra);
+                            }
                             pc_to_off[pc + 1] = em.pos();
                             pc += 2;
                             continue;
@@ -759,7 +1133,9 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     load_rax(&mut em, *l, &ra);
                     load_rcx(&mut em, *r, &ra);
                     emit_binop_rax_rcx(&mut em, *op);
-                    store_rax(&mut em, *slot, &ra);
+                    if !is_straight_line_dead_def(instrs, pc, *slot) {
+                        store_rax(&mut em, *slot, &ra);
+                    }
                     pc_to_off[pc + 1] = em.pos();
                     pc += 2;
                     continue;
@@ -774,7 +1150,9 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             {
                 if t == cond && is_supported_binop(*op) {
                     let target = ((pc as i32) + 2 + *off) as usize;
-                    if target > instrs.len() { return None; }
+                    if target > instrs.len() {
+                        return None;
+                    }
                     load_rax(&mut em, *l, &ra);
                     load_rcx(&mut em, *r, &ra);
                     emit_binop_rax_rcx(&mut em, *op);
@@ -795,7 +1173,9 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             {
                 if t == cond && is_supported_binop(*op) {
                     let target = ((pc as i32) + 2 + *off) as usize;
-                    if target > instrs.len() { return None; }
+                    if target > instrs.len() {
+                        return None;
+                    }
                     load_rax(&mut em, *l, &ra);
                     load_rcx(&mut em, *r, &ra);
                     emit_binop_rax_rcx(&mut em, *op);
@@ -809,17 +1189,37 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
         }
 
+        // ── Fusion: BinOp(t, op, l, r) + Return(t) ──────────────────────
+        if pc + 1 < instrs.len() {
+            if let (Instr::BinOp(t, op, l, r), Instr::Return(ret)) = (&instrs[pc], &instrs[pc + 1])
+            {
+                if t == ret && is_supported_binop(*op) {
+                    load_rax(&mut em, *l, &ra);
+                    load_rcx(&mut em, *r, &ra);
+                    emit_binop_rax_rcx(&mut em, *op);
+                    emit_ret(&mut em, &ra.used_callee_saved);
+                    pc_to_off[pc + 1] = em.pos();
+                    pc += 2;
+                    continue;
+                }
+            }
+        }
+
         // ════════════════════════════════════════════════════════════════════
         // CONSTANT FOLDING (single BinOp with both operands known)
         // ════════════════════════════════════════════════════════════════════
 
         if let Instr::BinOp(d, op, l, r) = &instrs[pc] {
-            if let Some(v) = const_at.get(l).copied()
+            if let Some(v) = const_at
+                .get(l)
+                .copied()
                 .zip(const_at.get(r).copied())
                 .and_then(|(lv, rv)| fold_binop(*op, lv, rv))
             {
                 em.mov_rax_imm_opt(v);
-                store_rax(&mut em, *d, &ra);
+                if !is_straight_line_dead_def(instrs, pc, *d) {
+                    store_rax(&mut em, *d, &ra);
+                }
                 const_at.insert(*d, v);
                 pc += 1;
                 continue;
@@ -834,55 +1234,93 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             Instr::LoadI32(d, v) => {
                 let cv = *v as i64;
                 em.mov_rax_imm_opt(cv);
-                store_rax(&mut em, *d, &ra);
+                if !is_straight_line_dead_def(instrs, pc, *d) {
+                    store_rax(&mut em, *d, &ra);
+                }
                 const_at.insert(*d, cv);
             }
             Instr::LoadI64(d, v) => {
                 em.mov_rax_imm_opt(*v);
-                store_rax(&mut em, *d, &ra);
+                if !is_straight_line_dead_def(instrs, pc, *d) {
+                    store_rax(&mut em, *d, &ra);
+                }
                 const_at.insert(*d, *v);
             }
             Instr::LoadBool(d, v) => {
                 let cv = i64::from(*v);
                 em.mov_rax_imm_opt(cv);
-                store_rax(&mut em, *d, &ra);
+                if !is_straight_line_dead_def(instrs, pc, *d) {
+                    store_rax(&mut em, *d, &ra);
+                }
                 const_at.insert(*d, cv);
             }
             Instr::LoadUnit(d) => {
                 em.xor_rax_rax();
-                store_rax(&mut em, *d, &ra);
+                if !is_straight_line_dead_def(instrs, pc, *d) {
+                    store_rax(&mut em, *d, &ra);
+                }
                 const_at.insert(*d, 0);
             }
             Instr::Move(d, s) | Instr::Load(d, s) => {
                 load_rax(&mut em, *s, &ra);
-                store_rax(&mut em, *d, &ra);
-                if let Some(&c) = const_at.get(s).map(|c| c) { const_at.insert(*d, c); } else { const_at.remove(d); }
+                if !is_straight_line_dead_def(instrs, pc, *d) {
+                    store_rax(&mut em, *d, &ra);
+                }
+                if let Some(&c) = const_at.get(s).map(|c| c) {
+                    const_at.insert(*d, c);
+                } else {
+                    const_at.remove(d);
+                }
             }
             Instr::Store(slot, s) => {
                 load_rax(&mut em, *s, &ra);
-                store_rax(&mut em, *slot, &ra);
-                if let Some(&c) = const_at.get(s) { const_at.insert(*slot, c); } else { const_at.remove(slot); }
+                if !is_straight_line_dead_def(instrs, pc, *slot) {
+                    store_rax(&mut em, *slot, &ra);
+                }
+                if let Some(&c) = const_at.get(s) {
+                    const_at.insert(*slot, c);
+                } else {
+                    const_at.remove(slot);
+                }
             }
             Instr::BinOp(d, op, l, r) => {
-                if !is_supported_binop(*op) { return None; }
+                if !is_supported_binop(*op) {
+                    return None;
+                }
                 load_rax(&mut em, *l, &ra);
                 load_rcx(&mut em, *r, &ra);
                 emit_binop_rax_rcx(&mut em, *op);
-                store_rax(&mut em, *d, &ra);
-                let folded = const_at.get(l).copied().zip(const_at.get(r).copied())
+                if !is_straight_line_dead_def(instrs, pc, *d) {
+                    store_rax(&mut em, *d, &ra);
+                }
+                let folded = const_at
+                    .get(l)
+                    .copied()
+                    .zip(const_at.get(r).copied())
                     .and_then(|(lv, rv)| fold_binop(*op, lv, rv));
-                match folded { Some(c) => { const_at.insert(*d, c); } None => { const_at.remove(d); } }
+                match folded {
+                    Some(c) => {
+                        const_at.insert(*d, c);
+                    }
+                    None => {
+                        const_at.remove(d);
+                    }
+                }
             }
             Instr::Jump(off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
-                if target > instrs.len() { return None; }
+                if target > instrs.len() {
+                    return None;
+                }
                 let p = em.jmp_rel32_placeholder();
                 fixups.push((p, target));
                 const_at.clear(); // conservative: branch target may have unknown state
             }
             Instr::JumpFalse(cond, off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
-                if target > instrs.len() { return None; }
+                if target > instrs.len() {
+                    return None;
+                }
                 load_rax(&mut em, *cond, &ra);
                 em.test_rax_rax();
                 let p = em.jz_rel32_placeholder();
@@ -891,7 +1329,9 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
             Instr::JumpTrue(cond, off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
-                if target > instrs.len() { return None; }
+                if target > instrs.len() {
+                    return None;
+                }
                 load_rax(&mut em, *cond, &ra);
                 em.test_rax_rax();
                 let p = em.jnz_rel32_placeholder();
@@ -920,13 +1360,16 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // ── Patch branch displacements ────────────────────────────────────────
     for (disp_pos, target_pc) in fixups {
         let target_off = *pc_to_off.get(target_pc)? as isize;
-        let next_ip    = (disp_pos + 4) as isize;
-        let rel        = i32::try_from(target_off - next_ip).ok()?;
+        let next_ip = (disp_pos + 4) as isize;
+        let rel = i32::try_from(target_off - next_ip).ok()?;
         em.buf[disp_pos..disp_pos + 4].copy_from_slice(&rel.to_le_bytes());
     }
 
     let mem = ExecMem::new(&em.buf)?;
-    Some(NativeCode { slot_count: compiled.slot_count, mem })
+    Some(NativeCode {
+        slot_count: compiled.slot_count,
+        mem,
+    })
 }
 
 pub fn execute(native: &NativeCode, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -942,20 +1385,24 @@ pub fn execute(native: &NativeCode, args: &[Value]) -> Result<Value, RuntimeErro
             regs[..needed].fill(0);
         }
         for (i, arg) in args.iter().enumerate() {
-            if i >= needed { break; }
+            if i >= needed {
+                break;
+            }
             regs[i] = match arg {
-                Value::I8(v)   => *v as i64,
-                Value::I16(v)  => *v as i64,
-                Value::I32(v)  => *v as i64,
-                Value::I64(v)  => *v,
-                Value::U8(v)   => *v as i64,
-                Value::U16(v)  => *v as i64,
-                Value::U32(v)  => *v as i64,
-                Value::U64(v)  => *v as i64,
+                Value::I8(v) => *v as i64,
+                Value::I16(v) => *v as i64,
+                Value::I32(v) => *v as i64,
+                Value::I64(v) => *v,
+                Value::U8(v) => *v as i64,
+                Value::U16(v) => *v as i64,
+                Value::U32(v) => *v as i64,
+                Value::U64(v) => *v as i64,
                 Value::Bool(v) => i64::from(*v),
-                _ => return Err(RuntimeError::new(
-                    "native machine-code JIT supports int/bool args",
-                )),
+                _ => {
+                    return Err(RuntimeError::new(
+                        "native machine-code JIT supports int/bool args",
+                    ))
+                }
             };
         }
         let f = native.mem.entry();
