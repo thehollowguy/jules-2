@@ -787,6 +787,8 @@ pub struct EcsWorld {
     components: HashMap<String, SparseSet>,
     /// Pending events (signal_name → Vec<EntityId>)
     events: HashMap<String, Vec<EntityId>>,
+    vec3_plan_cache: HashMap<String, Vec3PlanCache>,
+    fused_plan_cache: HashMap<String, FusedPlanCache>,
 }
 
 /// Sparse-set component storage.
@@ -796,6 +798,25 @@ struct SparseSet {
     sparse: HashMap<EntityId, usize>,
     dense_ids: Vec<EntityId>,
     dense_vals: Vec<Value>,
+    version: u64,
+}
+
+#[derive(Debug, Default)]
+struct Vec3PlanCache {
+    pos_version: u64,
+    vel_version: u64,
+    chunk_size: usize,
+    pairs: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Default)]
+struct FusedPlanCache {
+    pos_version: u64,
+    vel_version: u64,
+    health_version: u64,
+    damage_version: u64,
+    chunk_size: usize,
+    tuples: Vec<(usize, usize, usize, usize)>,
 }
 
 impl SparseSet {
@@ -808,6 +829,7 @@ impl SparseSet {
             self.sparse.insert(id, idx);
             self.dense_ids.push(id);
             self.dense_vals.push(val);
+            self.version = self.version.wrapping_add(1);
         }
     }
 
@@ -835,6 +857,7 @@ impl SparseSet {
             }
             self.dense_ids.pop();
             self.dense_vals.pop();
+            self.version = self.version.wrapping_add(1);
         }
     }
 
@@ -844,6 +867,15 @@ impl SparseSet {
 }
 
 impl EcsWorld {
+    #[inline]
+    fn plan_key2(a: &str, b: &str) -> String {
+        format!("{a}|{b}")
+    }
+    #[inline]
+    fn plan_key4(a: &str, b: &str, c: &str, d: &str) -> String {
+        format!("{a}|{b}|{c}|{d}")
+    }
+
     pub fn spawn(&mut self) -> EntityId {
         let id = self.next_id;
         self.next_id += 1;
@@ -915,12 +947,265 @@ impl EcsWorld {
         out
     }
 
+    /// Allocation-lean query for the common 2-component include case.
+    #[inline]
+    pub fn query2(&self, c1: &str, c2: &str) -> Vec<EntityId> {
+        let (Some(s1), Some(s2)) = (self.components.get(c1), self.components.get(c2)) else {
+            return Vec::new();
+        };
+        let (base, other) = if s1.dense_ids.len() <= s2.dense_ids.len() {
+            (s1, s2)
+        } else {
+            (s2, s1)
+        };
+        let mut out = Vec::with_capacity(base.dense_ids.len());
+        for id in &base.dense_ids {
+            if self.alive.contains(id) && other.sparse.contains_key(id) {
+                out.push(*id);
+            }
+        }
+        out
+    }
+
     /// Emit an event signal for the training loop.
     pub fn emit_event(&mut self, signal: &str, entity: EntityId) {
         self.events
             .entry(signal.to_owned())
             .or_default()
             .push(entity);
+    }
+
+    /// Tight linear integration pass for the common `pos += vel * dt` case.
+    ///
+    /// This avoids per-entity component lookups by iterating directly over the
+    /// dense component arrays and joining through sparse indices.
+    pub fn integrate_vec3_linear(&mut self, pos_comp: &str, vel_comp: &str, dt: f32) -> usize {
+        if pos_comp == vel_comp {
+            return 0;
+        }
+        let Some(mut pos_set) = self.components.remove(pos_comp) else {
+            return 0;
+        };
+        let Some(vel_set) = self.components.get(vel_comp) else {
+            self.components.insert(pos_comp.to_owned(), pos_set);
+            return 0;
+        };
+
+        let mut updated = 0usize;
+        if pos_set.dense_ids.len() <= vel_set.dense_ids.len() {
+            for i in 0..pos_set.dense_ids.len() {
+                let id = pos_set.dense_ids[i];
+                let Some(&vi) = vel_set.sparse.get(&id) else {
+                    continue;
+                };
+                if let (Some(Value::Vec3(p)), Some(Value::Vec3(v))) =
+                    (pos_set.dense_vals.get_mut(i), vel_set.dense_vals.get(vi))
+                {
+                    p[0] += v[0] * dt;
+                    p[1] += v[1] * dt;
+                    p[2] += v[2] * dt;
+                    updated += 1;
+                }
+            }
+        } else {
+            for vi in 0..vel_set.dense_ids.len() {
+                let id = vel_set.dense_ids[vi];
+                let Some(&pi) = pos_set.sparse.get(&id) else {
+                    continue;
+                };
+                if let (Some(Value::Vec3(p)), Some(Value::Vec3(v))) =
+                    (pos_set.dense_vals.get_mut(pi), vel_set.dense_vals.get(vi))
+                {
+                    p[0] += v[0] * dt;
+                    p[1] += v[1] * dt;
+                    p[2] += v[2] * dt;
+                    updated += 1;
+                }
+            }
+        }
+        self.components.insert(pos_comp.to_owned(), pos_set);
+        updated
+    }
+
+    /// Batched/fused loop form that keeps hot loops on raw contiguous arrays.
+    #[inline]
+    pub fn integrate_vec3_linear_fused(&mut self, pos_comp: &str, vel_comp: &str, dt: f32) -> usize {
+        if pos_comp == vel_comp {
+            return 0;
+        }
+        let Some(mut pos_set) = self.components.remove(pos_comp) else {
+            return 0;
+        };
+        let Some(vel_set) = self.components.get(vel_comp) else {
+            self.components.insert(pos_comp.to_owned(), pos_set);
+            return 0;
+        };
+        let mut updated = 0usize;
+        for i in 0..pos_set.dense_ids.len() {
+            let id = pos_set.dense_ids[i];
+            let Some(&vi) = vel_set.sparse.get(&id) else { continue };
+            let (p, v) = unsafe {
+                let p = pos_set.dense_vals.get_unchecked_mut(i);
+                let v = vel_set.dense_vals.get_unchecked(vi);
+                (p, v)
+            };
+            if let (Value::Vec3(p3), Value::Vec3(v3)) = (p, v) {
+                p3[0] += v3[0] * dt;
+                p3[1] += v3[1] * dt;
+                p3[2] += v3[2] * dt;
+                updated += 1;
+            }
+        }
+        self.components.insert(pos_comp.to_owned(), pos_set);
+        updated
+    }
+
+    /// Archetype-like chunked precomputed join for `pos += vel * dt`.
+    /// Reuses precomputed dense indices and executes branch-light chunk loops.
+    pub fn integrate_vec3_chunked_precomputed(
+        &mut self,
+        pos_comp: &str,
+        vel_comp: &str,
+        dt: f32,
+        chunk_size: usize,
+    ) -> usize {
+        if pos_comp == vel_comp {
+            return 0;
+        }
+        let Some(pos_set_ref) = self.components.get(pos_comp) else { return 0 };
+        let Some(vel_set_ref) = self.components.get(vel_comp) else { return 0 };
+        let pos_v = pos_set_ref.version;
+        let vel_v = vel_set_ref.version;
+        let key = Self::plan_key2(pos_comp, vel_comp);
+        let mut cache = self.vec3_plan_cache.remove(&key).unwrap_or_default();
+        let chunk_size = chunk_size.max(1);
+        if cache.pos_version != pos_v || cache.vel_version != vel_v || cache.chunk_size != chunk_size {
+            cache.pairs.clear();
+            cache.pairs.reserve(pos_set_ref.dense_ids.len().min(vel_set_ref.dense_ids.len()));
+            for (pi, id) in pos_set_ref.dense_ids.iter().enumerate() {
+                if let Some(&vi) = vel_set_ref.sparse.get(id) {
+                    cache.pairs.push((pi, vi));
+                }
+            }
+            cache.pos_version = pos_v;
+            cache.vel_version = vel_v;
+            cache.chunk_size = chunk_size;
+        }
+
+        let Some(mut pos_set) = self.components.remove(pos_comp) else {
+            self.vec3_plan_cache.insert(key, cache);
+            return 0;
+        };
+        let Some(vel_set) = self.components.get(vel_comp) else {
+            self.components.insert(pos_comp.to_owned(), pos_set);
+            self.vec3_plan_cache.insert(key, cache);
+            return 0;
+        };
+        let mut updated = 0usize;
+        for chunk in cache.pairs.chunks(cache.chunk_size) {
+            for (pi, vi) in chunk {
+                let (p, v) = unsafe {
+                    let p = pos_set.dense_vals.get_unchecked_mut(*pi);
+                    let v = vel_set.dense_vals.get_unchecked(*vi);
+                    (p, v)
+                };
+                if let (Value::Vec3(p3), Value::Vec3(v3)) = (p, v) {
+                    p3[0] += v3[0] * dt;
+                    p3[1] += v3[1] * dt;
+                    p3[2] += v3[2] * dt;
+                    updated += 1;
+                }
+            }
+        }
+        self.components.insert(pos_comp.to_owned(), pos_set);
+        self.vec3_plan_cache.insert(key, cache);
+        updated
+    }
+
+    /// Fused chunked system pass:
+    /// `pos += vel * dt` and `health -= damage * dt` in one tight loop.
+    pub fn integrate_vec3_and_health_chunked(
+        &mut self,
+        pos_comp: &str,
+        vel_comp: &str,
+        health_comp: &str,
+        damage_comp: &str,
+        dt: f32,
+        chunk_size: usize,
+    ) -> usize {
+        let Some(pos_ref) = self.components.get(pos_comp) else { return 0 };
+        let Some(vel_ref) = self.components.get(vel_comp) else { return 0 };
+        let Some(health_ref) = self.components.get(health_comp) else { return 0 };
+        let Some(damage_ref) = self.components.get(damage_comp) else { return 0 };
+        let key = Self::plan_key4(pos_comp, vel_comp, health_comp, damage_comp);
+        let mut cache = self.fused_plan_cache.remove(&key).unwrap_or_default();
+        let chunk_size = chunk_size.max(1);
+        if cache.pos_version != pos_ref.version
+            || cache.vel_version != vel_ref.version
+            || cache.health_version != health_ref.version
+            || cache.damage_version != damage_ref.version
+            || cache.chunk_size != chunk_size
+        {
+            cache.tuples.clear();
+            cache
+                .tuples
+                .reserve(pos_ref.dense_ids.len().min(vel_ref.dense_ids.len()));
+            for (pi, id) in pos_ref.dense_ids.iter().enumerate() {
+                let (Some(&vi), Some(&hi), Some(&di)) = (
+                    vel_ref.sparse.get(id),
+                    health_ref.sparse.get(id),
+                    damage_ref.sparse.get(id),
+                ) else {
+                    continue;
+                };
+                cache.tuples.push((pi, vi, hi, di));
+            }
+            cache.pos_version = pos_ref.version;
+            cache.vel_version = vel_ref.version;
+            cache.health_version = health_ref.version;
+            cache.damage_version = damage_ref.version;
+            cache.chunk_size = chunk_size;
+        }
+
+        let Some(mut pos_set) = self.components.remove(pos_comp) else {
+            self.fused_plan_cache.insert(key, cache);
+            return 0;
+        };
+        let Some(mut health_set) = self.components.remove(health_comp) else {
+            self.components.insert(pos_comp.to_owned(), pos_set);
+            self.fused_plan_cache.insert(key, cache);
+            return 0;
+        };
+        let (Some(vel_set), Some(damage_set)) = (self.components.get(vel_comp), self.components.get(damage_comp)) else {
+            self.components.insert(pos_comp.to_owned(), pos_set);
+            self.components.insert(health_comp.to_owned(), health_set);
+            self.fused_plan_cache.insert(key, cache);
+            return 0;
+        };
+
+        let mut updated = 0usize;
+        for chunk in cache.tuples.chunks(cache.chunk_size) {
+            for (pi, vi, hi, di) in chunk {
+                let (p, v, h, d) = unsafe {
+                    let p = pos_set.dense_vals.get_unchecked_mut(*pi);
+                    let v = vel_set.dense_vals.get_unchecked(*vi);
+                    let h = health_set.dense_vals.get_unchecked_mut(*hi);
+                    let d = damage_set.dense_vals.get_unchecked(*di);
+                    (p, v, h, d)
+                };
+                if let (Value::Vec3(p3), Value::Vec3(v3), Value::F32(hp), Value::F32(dmg)) = (p, v, h, d) {
+                    p3[0] += v3[0] * dt;
+                    p3[1] += v3[1] * dt;
+                    p3[2] += v3[2] * dt;
+                    *hp -= *dmg * dt;
+                    updated += 1;
+                }
+            }
+        }
+        self.components.insert(pos_comp.to_owned(), pos_set);
+        self.components.insert(health_comp.to_owned(), health_set);
+        self.fused_plan_cache.insert(key, cache);
+        updated
     }
 
     /// Drain all events for a named signal.
@@ -2214,12 +2499,36 @@ pub fn vm_exec(
     let mut pc: usize = 0;
 
     macro_rules! reg {
-        ($r:expr) => { regs[$r as usize] };
+        ($r:expr) => {
+            // SAFETY: register operands are emitted by the compiler and always
+            // in-range for `slot_count`; `regs` is over-allocated by +32 as guard.
+            unsafe { regs.get_unchecked($r as usize) }
+        };
+    }
+    macro_rules! reg_mut {
+        ($r:expr) => {
+            // SAFETY: same argument as `reg!`.
+            unsafe { regs.get_unchecked_mut($r as usize) }
+        };
+    }
+    macro_rules! slot {
+        ($s:expr) => {
+            // SAFETY: bytecode slots are compiler-produced and bounded by function slots.
+            unsafe { regs.get_unchecked($s as usize) }
+        };
+    }
+    macro_rules! slot_mut {
+        ($s:expr) => {
+            // SAFETY: bytecode slots are compiler-produced and bounded by function slots.
+            unsafe { regs.get_unchecked_mut($s as usize) }
+        };
     }
     macro_rules! str_c {
-        ($i:expr) => { str_pool[$i as usize].as_str() };
+        ($i:expr) => {
+            // SAFETY: string indices are interned at compile time.
+            unsafe { str_pool.get_unchecked($i as usize).as_str() }
+        };
     }
-
     loop {
         if pc >= instrs.len() {
             return Ok(Value::Unit);
@@ -2230,43 +2539,43 @@ pub fn vm_exec(
 
         match instr {
             Instr::Nop => {}
-            Instr::LoadUnit(d)        => reg!(*d) = Value::Unit,
-            Instr::LoadBool(d, b)     => reg!(*d) = Value::Bool(*b),
-            Instr::LoadI32(d, v)      => reg!(*d) = Value::I32(*v),
-            Instr::LoadI64(d, v)      => reg!(*d) = Value::I64(*v),
-            Instr::LoadF32(d, v)      => reg!(*d) = Value::F32(*v),
-            Instr::LoadF64(d, v)      => reg!(*d) = Value::F64(*v),
-            Instr::LoadStr(d, si)     => reg!(*d) = Value::Str(str_pool[*si as usize].clone()),
-            Instr::LoadConst(d, ci)   => reg!(*d) = const_pool[*ci as usize].clone(),
+            Instr::LoadUnit(d)        => *reg_mut!(*d) = Value::Unit,
+            Instr::LoadBool(d, b)     => *reg_mut!(*d) = Value::Bool(*b),
+            Instr::LoadI32(d, v)      => *reg_mut!(*d) = Value::I32(*v),
+            Instr::LoadI64(d, v)      => *reg_mut!(*d) = Value::I64(*v),
+            Instr::LoadF32(d, v)      => *reg_mut!(*d) = Value::F32(*v),
+            Instr::LoadF64(d, v)      => *reg_mut!(*d) = Value::F64(*v),
+            Instr::LoadStr(d, si)     => *reg_mut!(*d) = Value::Str(str_c!(*si).to_owned()),
+            Instr::LoadConst(d, ci)   => *reg_mut!(*d) = unsafe { const_pool.get_unchecked(*ci as usize) }.clone(),
             Instr::LoadFn(d, si)  => {
                 let name = str_c!(*si);
                 if name == "world" {
-                    reg!(*d) = Value::World(interp.world.clone());
+                    *reg_mut!(*d) = Value::World(interp.world.clone());
                 } else if let Some(f) = interp.fns.get(name).cloned() {
-                    reg!(*d) = Value::Fn(f);
+                    *reg_mut!(*d) = Value::Fn(f);
                 } else if let Some(m) = interp.models.get(name).cloned() {
-                    reg!(*d) = Value::Model(m);
+                    *reg_mut!(*d) = Value::Model(m);
                 } else {
-                    reg!(*d) = Value::Unit;
+                    *reg_mut!(*d) = Value::Unit;
                 }
             }
-            Instr::Move(d, s)         => { let v = reg!(*s).clone(); reg!(*d) = v; }
-            Instr::Load(d, slot)      => { let v = regs[*slot as usize].clone(); reg!(*d) = v; }
-            Instr::Store(slot, s)     => { let v = reg!(*s).clone(); regs[*slot as usize] = v; }
+            Instr::Move(d, s)         => { let v = reg!(*s).clone(); *reg_mut!(*d) = v; }
+            Instr::Load(d, slot)      => { let v = slot!(*slot).clone(); *reg_mut!(*d) = v; }
+            Instr::Store(slot, s)     => { let v = reg!(*s).clone(); *slot_mut!(*slot) = v; }
 
             Instr::BinOp(d, op, l, r) => {
                 let lv = reg!(*l).clone();
                 let rv = reg!(*r).clone();
-                reg!(*d) = eval_numeric_binop(*op, lv, rv)?;
+                *reg_mut!(*d) = eval_numeric_binop(*op, lv, rv)?;
             }
             Instr::UnOp(d, op, s) => {
                 let v = reg!(*s).clone();
-                reg!(*d) = vm_unop(*op, v)?;
+                *reg_mut!(*d) = vm_unop(*op, v)?;
             }
             Instr::PowOp(d, b, e) => {
                 let bv = reg!(*b).clone();
                 let ev = reg!(*e).clone();
-                reg!(*d) = match (&bv, &ev) {
+                *reg_mut!(*d) = match (&bv, &ev) {
                     (Value::F32(x), Value::F32(y)) => Value::F32(x.powf(*y)),
                     (Value::F64(x), Value::F64(y)) => Value::F64(x.powf(*y)),
                     (Value::I32(x), Value::I32(y)) => Value::I32(x.pow(*y as u32)),
@@ -2314,31 +2623,31 @@ pub fn vm_exec(
                 let func_v = reg!(*fn_reg).clone();
                 let mut call_args = Vec::with_capacity(*arg_count as usize);
                 for i in 0..*arg_count {
-                    call_args.push(regs[(*args_start + i) as usize].clone());
+                    call_args.push(slot!(*args_start + i).clone());
                 }
                 let mut env = Env::new();
-                reg!(*d) = interp.eval_call(func_v, call_args, &mut env)?;
+                *reg_mut!(*d) = interp.eval_call(func_v, call_args, &mut env)?;
             }
             Instr::CallBuiltin(d, si, args_start, arg_count) => {
-                let name = str_pool[*si as usize].clone();
+                let name = str_c!(*si);
                 let mut call_args = Vec::with_capacity(*arg_count as usize);
                 for i in 0..*arg_count {
-                    call_args.push(regs[(*args_start + i) as usize].clone());
+                    call_args.push(slot!(*args_start + i).clone());
                 }
-                reg!(*d) = interp.eval_builtin(&name, call_args)?;
+                *reg_mut!(*d) = interp.eval_builtin(name, call_args)?;
             }
             Instr::CallMethod(d, recv_r, mi, args_start, arg_count) => {
                 let recv = reg!(*recv_r).clone();
-                let method = str_pool[*mi as usize].clone();
+                let method = str_c!(*mi);
                 let mut call_args = Vec::with_capacity(*arg_count as usize);
                 for i in 0..*arg_count {
-                    call_args.push(regs[(*args_start + i) as usize].clone());
+                    call_args.push(slot!(*args_start + i).clone());
                 }
                 let mut env = Env::new();
-                reg!(*d) = interp.eval_method(recv, &method, call_args, &mut env)?;
+                *reg_mut!(*d) = interp.eval_method(recv, method, call_args, &mut env)?;
             }
 
-            Instr::NewArray(d)  => reg!(*d) = Value::Array(Arc::new(Mutex::new(Vec::new()))),
+            Instr::NewArray(d)  => *reg_mut!(*d) = Value::Array(Arc::new(Mutex::new(Vec::new()))),
             Instr::ArrayPush(arr, v) => {
                 if let Value::Array(a) = &reg!(*arr) {
                     let val = reg!(*v).clone();
@@ -2348,7 +2657,7 @@ pub fn vm_exec(
             Instr::ArrayGet(d, arr, idx) => {
                 let a = reg!(*arr).clone();
                 let i = reg!(*idx).clone();
-                reg!(*d) = interp.eval_index(a, vec![i])?;
+                *reg_mut!(*d) = interp.eval_index(a, vec![i])?;
             }
             Instr::ArraySet(arr, idx, val) => {
                 let i = reg!(*idx).as_i64().unwrap_or(0) as usize;
@@ -2359,23 +2668,23 @@ pub fn vm_exec(
                 }
             }
             Instr::NewHashMap(d) => {
-                reg!(*d) = Value::HashMap(Arc::new(Mutex::new(HashMap::new())));
+                *reg_mut!(*d) = Value::HashMap(Arc::new(Mutex::new(HashMap::new())));
             }
             Instr::NewTuple(d, start, count) => {
                 let mut vals = Vec::with_capacity(*count as usize);
                 for i in 0..*count {
                     vals.push(regs[(*start + i) as usize].clone());
                 }
-                reg!(*d) = Value::Tuple(vals);
+                *reg_mut!(*d) = Value::Tuple(vals);
             }
             Instr::NewStruct(d, ni) => {
-                let name = str_pool[*ni as usize].clone();
-                reg!(*d) = Value::Struct { name, fields: HashMap::new() };
+                let name = str_c!(*ni).to_owned();
+                *reg_mut!(*d) = Value::Struct { name, fields: HashMap::new() };
             }
             Instr::FieldGet(d, obj, fi) => {
                 let o = reg!(*obj).clone();
                 let field = str_c!(*fi);
-                reg!(*d) = interp.eval_field(o, field)?;
+                *reg_mut!(*d) = interp.eval_field(o, field)?;
             }
             Instr::FieldSet(obj, fi, val) => {
                 let field = str_pool[*fi as usize].clone();
@@ -2388,7 +2697,7 @@ pub fn vm_exec(
             Instr::IndexGet(d, obj, idx) => {
                 let o = reg!(*obj).clone();
                 let i = reg!(*idx).clone();
-                reg!(*d) = interp.eval_index(o, vec![i])?;
+                *reg_mut!(*d) = interp.eval_index(o, vec![i])?;
             }
             Instr::IndexSet(obj, idx, val) => {
                 let i = reg!(*idx).as_i64().unwrap_or(0) as usize;
@@ -2401,52 +2710,52 @@ pub fn vm_exec(
             Instr::Vec2Ctor(d, x, y) => {
                 let xv = reg!(*x).as_f64().unwrap_or(0.0) as f32;
                 let yv = reg!(*y).as_f64().unwrap_or(0.0) as f32;
-                reg!(*d) = Value::Vec2([xv, yv]);
+                *reg_mut!(*d) = Value::Vec2([xv, yv]);
             }
             Instr::Vec3Ctor(d, x, y, z) => {
                 let xv = reg!(*x).as_f64().unwrap_or(0.0) as f32;
                 let yv = reg!(*y).as_f64().unwrap_or(0.0) as f32;
                 let zv = reg!(*z).as_f64().unwrap_or(0.0) as f32;
-                reg!(*d) = Value::Vec3([xv, yv, zv]);
+                *reg_mut!(*d) = Value::Vec3([xv, yv, zv]);
             }
             Instr::Vec4Ctor(d, x, y, z, w) => {
                 let xv = reg!(*x).as_f64().unwrap_or(0.0) as f32;
                 let yv = reg!(*y).as_f64().unwrap_or(0.0) as f32;
                 let zv = reg!(*z).as_f64().unwrap_or(0.0) as f32;
                 let wv = reg!(*w).as_f64().unwrap_or(0.0) as f32;
-                reg!(*d) = Value::Vec4([xv, yv, zv, wv]);
+                *reg_mut!(*d) = Value::Vec4([xv, yv, zv, wv]);
             }
             Instr::RangeExcl(d, lo, hi) => {
                 let s = reg!(*lo).as_i64().unwrap_or(0) as i32;
                 let e = reg!(*hi).as_i64().unwrap_or(0) as i32;
-                reg!(*d) = Value::Array(Arc::new(Mutex::new((s..e).map(Value::I32).collect())));
+                *reg_mut!(*d) = Value::Array(Arc::new(Mutex::new((s..e).map(Value::I32).collect())));
             }
             Instr::RangeIncl(d, lo, hi) => {
                 let s = reg!(*lo).as_i64().unwrap_or(0) as i32;
                 let e = reg!(*hi).as_i64().unwrap_or(0) as i32;
-                reg!(*d) = Value::Array(Arc::new(Mutex::new((s..=e).map(Value::I32).collect())));
+                *reg_mut!(*d) = Value::Array(Arc::new(Mutex::new((s..=e).map(Value::I32).collect())));
             }
             Instr::MatMulInstr(d, l, r) => {
                 let lv = reg!(*l).clone();
                 let rv = reg!(*r).clone();
-                reg!(*d) = interp.eval_matmul(lv, rv)?;
+                *reg_mut!(*d) = interp.eval_matmul(lv, rv)?;
             }
             Instr::HadamardMulInstr(d, l, r) => {
                 if let (Value::Tensor(a), Value::Tensor(b)) = (reg!(*l).clone(), reg!(*r).clone()) {
                     let out = a.read().unwrap().hadamard_mul(&b.read().unwrap())?;
-                    reg!(*d) = Value::Tensor(Arc::new(RwLock::new(out)));
+                    *reg_mut!(*d) = Value::Tensor(Arc::new(RwLock::new(out)));
                 }
             }
             Instr::HadamardDivInstr(d, l, r) => {
                 if let (Value::Tensor(a), Value::Tensor(b)) = (reg!(*l).clone(), reg!(*r).clone()) {
                     let out = a.read().unwrap().hadamard_div(&b.read().unwrap())?;
-                    reg!(*d) = Value::Tensor(Arc::new(RwLock::new(out)));
+                    *reg_mut!(*d) = Value::Tensor(Arc::new(RwLock::new(out)));
                 }
             }
             Instr::TensorConcatInstr(d, l, r) => {
                 if let (Value::Tensor(a), Value::Tensor(b)) = (reg!(*l).clone(), reg!(*r).clone()) {
                     let out = a.read().unwrap().concat(&b.read().unwrap())?;
-                    reg!(*d) = Value::Tensor(Arc::new(RwLock::new(out)));
+                    *reg_mut!(*d) = Value::Tensor(Arc::new(RwLock::new(out)));
                 }
             }
             Instr::EnableGrad(d, s) => {
@@ -2454,7 +2763,7 @@ pub fn vm_exec(
                 if let Value::Tensor(t) = &v {
                     t.write().unwrap().enable_grad();
                 }
-                reg!(*d) = v;
+                *reg_mut!(*d) = v;
             }
         }
     }
@@ -2706,6 +3015,9 @@ pub struct Interpreter {
     pgo_window_done: bool,
     #[cfg(feature = "phase3-jit")]
     pgo_call_counts: FxHashMap<String, u64>,
+    /// Runtime function profiler (built-in hotspot weighting).
+    runtime_profile_enabled: bool,
+    runtime_profile: FxHashMap<String, (u64, u128)>, // fn -> (calls, total_nanos)
     /// Global VM/JIT switch. When disabled, execution falls back to tree-walking.
     jit_enabled: bool,
     /// If enabled, compile all top-level functions at load time to remove first-call latency.
@@ -2741,9 +3053,23 @@ impl Interpreter {
             pgo_window_done: false,
             #[cfg(feature = "phase3-jit")]
             pgo_call_counts: FxHashMap::default(),
+            runtime_profile_enabled: false,
+            runtime_profile: FxHashMap::default(),
             jit_enabled: true,
             advance_jit_enabled: true,
         }
+    }
+
+    fn record_runtime_profile(&mut self, name: &str, elapsed: Duration) {
+        if !self.runtime_profile_enabled {
+            return;
+        }
+        let entry = self
+            .runtime_profile
+            .entry(name.to_string())
+            .or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(elapsed.as_nanos());
     }
 
     /// Enable/disable VM/JIT execution globally.
@@ -2848,6 +3174,7 @@ impl Interpreter {
     /// Falls back to the tree-walker if compilation fails or the function is
     /// a complex closure.
     pub fn call_fn(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        let started = Instant::now();
         let closure = self
             .fns
             .get(name)
@@ -2897,20 +3224,24 @@ impl Interpreter {
                 {
                     if let Some(native) = self.native_fns.get(name).cloned() {
                         if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
+                            self.record_runtime_profile(name, started.elapsed());
                             return Ok(v);
                         }
                     } else if let Some(native) = crate::phase3_jit::translate(&compiled) {
                         let native = Arc::new(native);
                         self.native_fns.insert(name.to_owned(), native.clone());
                         if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
+                            self.record_runtime_profile(name, started.elapsed());
                             return Ok(v);
                         }
                     }
                 }
-                return vm_exec(self, &compiled, args).map(|r| match r {
+                let result = vm_exec(self, &compiled, args).map(|r| match r {
                     Value::Return(v) => *v,
                     other => other,
                 });
+                self.record_runtime_profile(name, started.elapsed());
+                return result;
             }
         }
 
@@ -2927,12 +3258,15 @@ impl Interpreter {
         if let Some(body) = &closure.decl.body.clone() {
             let result = self.eval_block(body, &mut env)?;
             env.pop();
-            match result {
+            let out = match result {
                 Value::Return(v) => Ok(*v),
                 other => Ok(other),
-            }
+            };
+            self.record_runtime_profile(name, started.elapsed());
+            out
         } else {
             env.pop();
+            self.record_runtime_profile(name, started.elapsed());
             Ok(Value::Unit)
         }
     }
@@ -3990,6 +4324,9 @@ impl Interpreter {
                     "debug::enable_jit",
                     "debug::set_advance_jit",
                     "debug::jit_state",
+                    "debug::runtime_profile",
+                    "debug::runtime_hotspots",
+                    "debug::runtime_profile_reset",
                 ],
             ),
             (
@@ -4789,6 +5126,54 @@ impl Interpreter {
                     Value::I64(self.compiled_fns.len() as i64),
                 );
                 Ok(Value::HashMap(Arc::new(Mutex::new(state))))
+            }
+            "debug::runtime_profile" => {
+                let enabled = args
+                    .first()
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                self.runtime_profile_enabled = enabled;
+                Ok(Value::Bool(enabled))
+            }
+            "debug::runtime_profile_reset" => {
+                self.runtime_profile.clear();
+                Ok(Value::Bool(true))
+            }
+            "debug::runtime_hotspots" => {
+                let limit = args
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(8)
+                    .max(1) as usize;
+                let total_nanos: u128 = self.runtime_profile.values().map(|(_, n)| *n).sum();
+                let mut rows = self
+                    .runtime_profile
+                    .iter()
+                    .map(|(name, (calls, nanos))| (name.clone(), *calls, *nanos))
+                    .collect::<Vec<_>>();
+                rows.sort_by(|a, b| b.2.cmp(&a.2));
+                let mut out = Vec::new();
+                for (name, calls, nanos) in rows.into_iter().take(limit) {
+                    let mut row = HashMap::default();
+                    let total_ms = nanos as f64 / 1_000_000.0;
+                    let avg_us = if calls == 0 {
+                        0.0
+                    } else {
+                        (nanos as f64 / calls as f64) / 1_000.0
+                    };
+                    let weight = if total_nanos == 0 {
+                        0.0
+                    } else {
+                        nanos as f64 / total_nanos as f64
+                    };
+                    row.insert("fn".to_string(), Value::Str(name));
+                    row.insert("calls".to_string(), Value::I64(calls as i64));
+                    row.insert("total_ms".to_string(), Value::F64(total_ms));
+                    row.insert("avg_us".to_string(), Value::F64(avg_us));
+                    row.insert("weight".to_string(), Value::F64(weight));
+                    out.push(Value::HashMap(Arc::new(Mutex::new(row))));
+                }
+                Ok(Value::Array(Arc::new(Mutex::new(out))))
             }
             "quant::int8_export" => Ok(Value::Bool(true)),
             "sim::world" => {
@@ -8049,6 +8434,18 @@ mod tests {
     }
 
     #[test]
+    fn test_ecs_query2() {
+        let mut world = EcsWorld::default();
+        let e1 = world.spawn();
+        let e2 = world.spawn();
+        world.insert_component(e1, "pos", Value::Vec3([0.0, 0.0, 0.0]));
+        world.insert_component(e1, "vel", Value::Vec3([1.0, 0.0, 0.0]));
+        world.insert_component(e2, "pos", Value::Vec3([1.0, 0.0, 0.0]));
+        let ids = world.query2("pos", "vel");
+        assert_eq!(ids, vec![e1]);
+    }
+
+    #[test]
     fn test_ecs_query_without() {
         let mut world = EcsWorld::default();
         let alive = world.spawn();
@@ -8070,6 +8467,68 @@ mod tests {
         assert_eq!(evts.len(), 2);
         let evts2 = world.drain_events("killed");
         assert!(evts2.is_empty());
+    }
+
+    #[test]
+    fn test_ecs_integrate_vec3_linear() {
+        let mut world = EcsWorld::default();
+        let a = world.spawn();
+        world.insert_component(a, "pos", Value::Vec3([0.0, 0.0, 0.0]));
+        world.insert_component(a, "vel", Value::Vec3([2.0, 0.0, 0.0]));
+        let b = world.spawn();
+        world.insert_component(b, "pos", Value::Vec3([1.0, 1.0, 1.0]));
+        world.insert_component(b, "vel", Value::Vec3([0.0, -2.0, 0.0]));
+
+        let n = world.integrate_vec3_linear("pos", "vel", 0.5);
+        assert_eq!(n, 2);
+        assert!(matches!(world.get_component(a, "pos"), Some(Value::Vec3(p)) if (p[0] - 1.0).abs() < 1e-6));
+        assert!(matches!(world.get_component(b, "pos"), Some(Value::Vec3(p)) if (p[1] - 0.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_ecs_integrate_vec3_linear_fused() {
+        let mut world = EcsWorld::default();
+        let a = world.spawn();
+        world.insert_component(a, "pos", Value::Vec3([0.0, 0.0, 0.0]));
+        world.insert_component(a, "vel", Value::Vec3([2.0, 0.0, 0.0]));
+        let b = world.spawn();
+        world.insert_component(b, "pos", Value::Vec3([1.0, 1.0, 1.0]));
+        world.insert_component(b, "vel", Value::Vec3([0.0, -2.0, 0.0]));
+
+        let n = world.integrate_vec3_linear_fused("pos", "vel", 0.5);
+        assert_eq!(n, 2);
+        assert!(matches!(world.get_component(a, "pos"), Some(Value::Vec3(p)) if (p[0] - 1.0).abs() < 1e-6));
+        assert!(matches!(world.get_component(b, "pos"), Some(Value::Vec3(p)) if (p[1] - 0.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_ecs_integrate_vec3_chunked_precomputed() {
+        let mut world = EcsWorld::default();
+        let a = world.spawn();
+        world.insert_component(a, "pos", Value::Vec3([0.0, 0.0, 0.0]));
+        world.insert_component(a, "vel", Value::Vec3([2.0, 0.0, 0.0]));
+        let b = world.spawn();
+        world.insert_component(b, "pos", Value::Vec3([1.0, 1.0, 1.0]));
+        world.insert_component(b, "vel", Value::Vec3([0.0, -2.0, 0.0]));
+
+        let n = world.integrate_vec3_chunked_precomputed("pos", "vel", 0.5, 64);
+        assert_eq!(n, 2);
+        assert!(matches!(world.get_component(a, "pos"), Some(Value::Vec3(p)) if (p[0] - 1.0).abs() < 1e-6));
+        assert!(matches!(world.get_component(b, "pos"), Some(Value::Vec3(p)) if (p[1] - 0.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_ecs_integrate_vec3_and_health_chunked() {
+        let mut world = EcsWorld::default();
+        let e = world.spawn();
+        world.insert_component(e, "pos", Value::Vec3([0.0, 0.0, 0.0]));
+        world.insert_component(e, "vel", Value::Vec3([1.0, 0.0, 0.0]));
+        world.insert_component(e, "health", Value::F32(10.0));
+        world.insert_component(e, "damage", Value::F32(2.0));
+        let n = world.integrate_vec3_and_health_chunked("pos", "vel", "health", "damage", 0.5, 64);
+        assert_eq!(n, 1);
+        assert!(matches!(world.get_component(e, "pos"), Some(Value::Vec3(p)) if (p[0] - 0.5).abs() < 1e-6));
+        assert!(matches!(world.get_component(e, "health"), Some(Value::F32(h)) if (h - 9.0).abs() < 1e-6));
     }
 
     // ── Interpreter ───────────────────────────────────────────────────────────
@@ -8617,6 +9076,32 @@ mod tests {
             assert!(matches!(s[1], Value::I64(200)));
         } else {
             panic!("expected window size array");
+        }
+    }
+
+    #[test]
+    fn test_runtime_hotspot_weighting_builtin() {
+        let mut interp = mk_interp();
+        interp
+            .eval_builtin("debug::runtime_profile", vec![Value::Bool(true)])
+            .unwrap();
+        interp
+            .eval_builtin("debug::runtime_profile_reset", vec![])
+            .unwrap();
+        interp
+            .runtime_profile
+            .insert("sim::step".to_string(), (120, 9_000_000));
+        interp
+            .runtime_profile
+            .insert("render::flush".to_string(), (120, 3_000_000));
+        let hotspots = interp
+            .eval_builtin("debug::runtime_hotspots", vec![Value::I64(4)])
+            .unwrap();
+        if let Value::Array(rows) = hotspots {
+            let vals = rows.lock().unwrap();
+            assert!(!vals.is_empty());
+        } else {
+            panic!("expected array from debug::runtime_hotspots");
         }
     }
 

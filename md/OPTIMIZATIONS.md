@@ -63,6 +63,10 @@ It covers runtime, compiler/JIT, ML kernels, memory behavior, and benchmark tool
 - Fast-path support for common integer/bool operations in hot loops.
 - Specialized handling for common control-flow bytecodes.
 - Thread-local register scratch reuse during JIT execution (`EXEC_REGS`) to reduce realloc churn.
+- Register VM dispatch now uses compiler-validated unchecked register/string/constant operand access:
+  - removes repeated bounds checks on register reads/writes and pool lookups in the hot bytecode loop.
+  - lowers branch pressure in the VM dispatch path while preserving safety invariants at compile/emit boundaries.
+- VM call-site argument loading now pulls from slot helpers directly and avoids redundant string cloning for builtin/method names.
 
 ## 4) ML and tensor engine optimizations
 

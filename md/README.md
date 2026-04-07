@@ -203,6 +203,27 @@ loop example (player/enemy movement, collisions, waves, scoring, HP).
 cargo run --bin jules -- check game_arcade_showcase.jules
 ```
 
+## Game benchmark modes (baseline / SoA / fused / AoT / Rust)
+
+`bench-ecs` supports multiple stepping modes so you can separate
+architecture wins (contiguous/batched linear loops) from AoT-hash overhead:
+
+```bash
+cargo run --release --bin bench-ecs -- 20000 200 0.016 aot-hash
+```
+
+Modes:
+- `baseline` (classic per-step query/update)
+- `soa-linear` (dense linear `pos += vel * dt` ECS integration pass)
+- `fused-linear` (fused/batched dense loop on component arrays; no per-step query vec alloc)
+- `chunked` (precomputed archetype-like chunk indices + fused `pos/vel/health/damage` system loop)
+- `aot-hash` (prebuilt query layout + hash-validated fast path)
+- `rust-compare` (runs baseline + soa-linear + fused-linear + chunked + aot-hash + native Rust baseline + ratios)
+- `both` (default, prints all built-in comparisons)
+
+The benchmark also prints weighted hotspot shares (`query/fetch/math/write`) to
+show what part of runtime currently dominates.
+
 ## Chess ML learning environment + benchmark
 
 A high-throughput chess-like learning environment is available via:
