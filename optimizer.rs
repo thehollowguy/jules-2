@@ -23,7 +23,6 @@
 // │  process 8 f32s per cycle.                                               │
 // └─────────────────────────────────────────────────────────────────────────┘
 //
-// Production-grade optimizer suite for the Jules neural-network runtime.
 //
 // ┌─────────────────────────────────────────────────────────────────────────┐
 // │  Optimizers implemented                                                  │
