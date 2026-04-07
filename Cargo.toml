@@ -44,9 +44,10 @@ serde_json = "1.0"
 clap = { version = "4", features = ["derive"] }
 colored = "2"
 rustyline = "12"
+rustc-hash = "1"
 
 [features]
-default = ["ffi-c", "phase1", "phase2"]
+default = ["ffi-c", "phase1", "phase2", "phase3-jit"]
 python = ["pyo3", "numpy"]
 ffi-c = []
 phase1 = []

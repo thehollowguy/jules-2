@@ -234,6 +234,7 @@ dependencies = [
  "numpy",
  "parking_lot",
  "pyo3",
+ "rustc-hash",
  "rustyline",
  "serde",
  "serde_json",

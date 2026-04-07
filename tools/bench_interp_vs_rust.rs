@@ -12,6 +12,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(2_000_000);
     let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(15);
+    let samples: usize = 10;
 
     println!("bench-interp-vs-rust n={n} iters={iters}");
 
@@ -19,71 +20,85 @@ fn main() {
         r#"
 fn main() {{
   let mut s = 0;
-  for i in 0..{n} {{
+  let mut i = 0;
+  while i < {n} {{
     s = s + ((i * 1664525 + 1013904223) % 97);
+    i = i + 1;
   }}
 }}
 "#
     );
 
-    // Jules compile benchmark
-    let pipeline = Pipeline::new();
-    let compile_start = Instant::now();
+    // Jules compile benchmark (10 runs, averaged)
+    let mut jules_compile_s = 0.0f64;
     let mut program = None;
-    for i in 0..iters {
-        let mut unit = CompileUnit::new(format!("<bench:{i}>"), &jules_src);
-        let result = pipeline.run(&mut unit);
-        if unit.has_errors() {
-            eprintln!("compile diagnostics: {}", unit.diags.len());
-            std::process::exit(1);
-        }
-        if i + 1 == iters {
-            match result {
-                PipelineResult::Ok(p) => program = Some(p),
-                _ => {
-                    eprintln!("pipeline failed to produce executable program");
-                    std::process::exit(1);
+    for sample in 0..samples {
+        let pipeline = Pipeline::new();
+        let compile_start = Instant::now();
+        for i in 0..iters {
+            let mut unit = CompileUnit::new(format!("<bench:{sample}:{i}>"), &jules_src);
+            let result = pipeline.run(&mut unit);
+            if unit.has_errors() {
+                eprintln!("compile diagnostics: {}", unit.diags.len());
+                std::process::exit(1);
+            }
+            if i + 1 == iters && sample + 1 == samples {
+                match result {
+                    PipelineResult::Ok(p) => program = Some(p),
+                    _ => {
+                        eprintln!("pipeline failed to produce executable program");
+                        std::process::exit(1);
+                    }
                 }
             }
         }
+        jules_compile_s += compile_start.elapsed().as_secs_f64();
     }
-    let jules_compile_s = compile_start.elapsed().as_secs_f64();
+    jules_compile_s /= samples as f64;
 
     // Jules runtime benchmark (interpreter)
     let mut interp = jules::interp::Interpreter::new();
     interp.load_program(&program.expect("program should exist"));
-    let run_start = Instant::now();
-    for _ in 0..iters {
-        if let Err(e) = interp.call_fn("main", vec![]) {
-            eprintln!("runtime error: {}", e.message);
-            std::process::exit(1);
+    let mut jules_runtime_s = 0.0f64;
+    for _ in 0..samples {
+        let run_start = Instant::now();
+        for _ in 0..iters {
+            if let Err(e) = interp.call_fn("main", vec![]) {
+                eprintln!("runtime error: {}", e.message);
+                std::process::exit(1);
+            }
         }
+        jules_runtime_s += run_start.elapsed().as_secs_f64();
     }
-    let jules_runtime_s = run_start.elapsed().as_secs_f64();
+    jules_runtime_s /= samples as f64;
 
     // Rust runtime baseline
-    let rust_runtime_start = Instant::now();
+    let mut rust_runtime_s = 0.0f64;
     let mut rust_checksum = 0i64;
-    for _ in 0..iters {
-        rust_checksum ^= rust_kernel(n);
+    for _ in 0..samples {
+        let rust_runtime_start = Instant::now();
+        for _ in 0..iters {
+            rust_checksum ^= rust_kernel(n);
+        }
+        rust_runtime_s += rust_runtime_start.elapsed().as_secs_f64();
     }
-    let rust_runtime_s = rust_runtime_start.elapsed().as_secs_f64();
+    rust_runtime_s /= samples as f64;
 
     // Rust compile baseline (single rustc -O for equivalent source)
     let rust_compile_s = rustc_compile_baseline(n);
 
     println!(
-        "Jules compile:  {:.6}s total ({:.6}s/iter)",
+        "Jules compile(avg {samples}): {:.6}s total ({:.6}s/iter)",
         jules_compile_s,
         jules_compile_s / iters as f64
     );
     println!(
-        "Jules runtime:  {:.6}s total ({:.6}s/iter)",
+        "Jules runtime(avg {samples}): {:.6}s total ({:.6}s/iter)",
         jules_runtime_s,
         jules_runtime_s / iters as f64
     );
     println!(
-        "Rust runtime:   {:.6}s total ({:.6}s/iter) checksum={}",
+        "Rust runtime(avg {samples}): {:.6}s total ({:.6}s/iter) checksum={}",
         rust_runtime_s,
         rust_runtime_s / iters as f64,
         rust_checksum
