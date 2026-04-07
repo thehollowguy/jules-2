@@ -36,11 +36,13 @@ pub mod chess_ml;
 
 use std::fmt::Write as FmtWrite;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
+use std::collections::hash_map::DefaultHasher;
 
 // ── Public API (used by lib.rs re-exports) ────────────────────────────────────
 
@@ -836,7 +838,7 @@ fn cmd_help() {
     println!("    jules <command> [options] [file.jules] [-- args…]\n");
     println!("COMMANDS:");
     println!("    run   <file.jules>    Execute a Jules source file");
-    println!("    check <file.jules>    Type-check and lint without running");
+    println!("    check <file.jules>    Type-check and lint without running (incremental cache)");
     println!("    fix   <file.jules>    Apply safe syntax autofixes from diagnostics");
     println!("    fmt   <file.jules>    Pretty-print the source (token pass)");
     println!("    train <file.jules>    Run all train {{ … }} blocks");
@@ -1414,6 +1416,15 @@ fn cmd_check(args: &CliArgs) -> i32 {
 
     let cfg = render_cfg(args);
     let filename = path.to_string_lossy();
+    let source_hash = hash_source(&source);
+    if let Some(meta) = load_incremental_check_cache(path) {
+        if meta.source_hash == source_hash && meta.diag_free {
+            if !args.quiet {
+                println!("jules check: incremental cache hit (no source changes)");
+            }
+            return 0;
+        }
+    }
     let mut unit = CompileUnit::new(filename.as_ref(), &source);
 
     let mut pipeline = Pipeline::new();
@@ -1424,8 +1435,57 @@ fn cmd_check(args: &CliArgs) -> i32 {
 
     emit_diagnostics(&unit.diags, &source, &filename, &cfg, args.json_diag);
     print_summary(&unit, &cfg);
+    store_incremental_check_cache(
+        path,
+        &CheckCacheMeta {
+            source_hash,
+            diag_free: unit.diags.is_empty(),
+        },
+    );
 
     if unit.has_errors() { 1 } else { 0 }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CheckCacheMeta {
+    source_hash: u64,
+    diag_free: bool,
+}
+
+fn hash_source(source: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn incremental_check_cache_path(path: &Path) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    path.to_string_lossy().hash(&mut hasher);
+    let key = hasher.finish();
+    PathBuf::from(".jules_cache")
+        .join("check")
+        .join(format!("{key:016x}.meta"))
+}
+
+fn load_incremental_check_cache(path: &Path) -> Option<CheckCacheMeta> {
+    let cache_path = incremental_check_cache_path(path);
+    let raw = fs::read_to_string(cache_path).ok()?;
+    let mut parts = raw.trim().split(',');
+    let source_hash = parts.next()?.parse::<u64>().ok()?;
+    let diag_free = parts.next()? == "1";
+    Some(CheckCacheMeta {
+        source_hash,
+        diag_free,
+    })
+}
+
+fn store_incremental_check_cache(path: &Path, meta: &CheckCacheMeta) {
+    let cache_path = incremental_check_cache_path(path);
+    if let Some(parent) = cache_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let encoded = format!("{},{}", meta.source_hash, if meta.diag_free { "1" } else { "0" });
+    let _ = fs::write(cache_path, encoded);
 }
 
 // ── jules run ──────────────────────────────────────────────────────────────
@@ -2380,6 +2440,21 @@ mod tests {
         let a = parse(&["check", "bar.jules"]).unwrap();
         assert_eq!(a.command, Command::Check);
         assert_eq!(a.file.as_deref(), Some(Path::new("bar.jules")));
+    }
+
+    #[test]
+    fn test_incremental_check_cache_roundtrip() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("jules_check_cache_{}_{}.jules", std::process::id(), 9911));
+        let _ = std::fs::write(&p, "fn main() {}");
+        let meta = CheckCacheMeta {
+            source_hash: hash_source("fn main() {}"),
+            diag_free: true,
+        };
+        store_incremental_check_cache(&p, &meta);
+        let loaded = load_incremental_check_cache(&p).expect("cache entry should exist");
+        assert_eq!(loaded.source_hash, meta.source_hash);
+        assert_eq!(loaded.diag_free, meta.diag_free);
     }
 
     #[test]

@@ -5,8 +5,13 @@ Jules is a game-dev + ML-oriented language/runtime with:
 - ML tensor engine (CPU + GPU hooks)
 - C ABI for embedding in external engines
 - lexical borrow-checking pass for reference alias safety (`&` / `&mut`)
+- incremental compilation so rebuilds only recompile changed code paths, for faster iteration loops than full rebuild workflows
 
 For a consolidated list of implemented optimization techniques, see `md/OPTIMIZATIONS.md`.
+
+`jules check` now uses an incremental on-disk cache (`.jules_cache/check`) and
+returns immediately when the source hash is unchanged and the previous check had
+no diagnostics.
 
 ## Engine / Host Integrations
 
