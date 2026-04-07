@@ -5,10 +5,12 @@ use jules::chess_ml::{
     eval_policy_vs_random, train_chess_policy_batched, train_chess_policy_batched_from,
     train_chess_policy_gpu, train_chess_policy_soa,
 };
+use std::hint::black_box;
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use std::time::Instant;
 
 const BASELINE_PARAM_COUNT: usize = 8;
 const F32_BYTES: u64 = std::mem::size_of::<f32>() as u64;
@@ -38,6 +40,7 @@ fn main() {
     let device = args.get(5).map(String::as_str).unwrap_or("cpu");
     let mut params = BASELINE_PARAM_COUNT;
     let mut estimate_only = false;
+    let mut skip_strength_eval = false;
     let mut i = 6usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -52,6 +55,10 @@ fn main() {
             }
             "--estimate-only" => {
                 estimate_only = true;
+                i += 1;
+            }
+            "--skip-strength-eval" => {
+                skip_strength_eval = true;
                 i += 1;
             }
             _ => {
@@ -132,6 +139,20 @@ fn main() {
         Err(e) => {
             println!("⚠️ JAX baseline skipped: {e}");
         }
+    }
+    let rust = rust_baseline(episodes, max_steps, envs.max(1));
+    println!(
+        "Rust baseline: {:.3}s, {:.0} steps/s, checksum={:.4}",
+        rust.0, rust.1, rust.2
+    );
+    println!(
+        "Speedup (Jules/Rust): {:.2}x",
+        jules.steps_per_sec / rust.1.max(1e-9)
+    );
+
+    if skip_strength_eval {
+        println!("Skipping long strength evaluation loop (--skip-strength-eval).");
+        return;
     }
 
     let target_strength = 0.70f32;
@@ -538,4 +559,55 @@ print(f"{elapsed} {steps/elapsed if elapsed>0 else 0} {backend}")
     let backend = it.next().unwrap_or("unknown").to_string();
 
     Ok((elapsed, steps_per_sec, backend))
+}
+
+fn rust_baseline(episodes: usize, max_steps: usize, envs: usize) -> (f64, f64, f32) {
+    let e = episodes;
+    let m = max_steps;
+    let n = envs.max(1);
+    let mut rng = 0xC0FFEEu64;
+    let mut w = [0.03f32, 0.0, 0.0, 0.2, 0.01, -0.01, 0.0, 0.0];
+    let t0 = Instant::now();
+    let mut checksum = 0.0f32;
+
+    for _ in 0..e {
+        let wp = vec![8.0f32; n];
+        let mut bp = vec![8.0f32; n];
+        let mut wa = vec![0.0f32; n];
+        let ba = vec![0.0f32; n];
+        for _ in 0..m {
+            let mut grad = [0.0f32; 8];
+            for i in 0..n {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let r0 = (((rng >> 32) as u32) as f32 / u32::MAX as f32) - 0.5;
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let hit = ((rng >> 32) as u32) as f32 / u32::MAX as f32;
+                let f = [1.0f32, wp[i], bp[i], wp[i] - bp[i], wa[i], ba[i], wa[i] * 0.1, ba[i] * 0.1];
+                let score = f
+                    .iter()
+                    .zip(w.iter())
+                    .map(|(fi, wi)| fi * wi)
+                    .sum::<f32>()
+                    + r0 * 0.01;
+                let mut reward = if score > 0.0 { 0.001 } else { -0.001 };
+                if hit < 0.03 && bp[i] > 0.0 {
+                    bp[i] -= 1.0;
+                    reward += 0.1;
+                }
+                wa[i] += 1.0;
+                for k in 0..8 {
+                    grad[k] += f[k] * reward;
+                }
+                checksum += score * 1e-6 + reward;
+            }
+            let inv_n = 1.0 / n as f32;
+            for k in 0..8 {
+                w[k] += 0.002 * grad[k] * inv_n;
+            }
+        }
+    }
+    black_box(w);
+    let elapsed = t0.elapsed().as_secs_f64();
+    let steps = (e * m * n) as f64;
+    (elapsed, steps / elapsed.max(1e-9), checksum)
 }
