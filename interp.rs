@@ -935,13 +935,22 @@ impl EcsWorld {
         // Collect with pre-allocated capacity equal to the base set size.
         let mut out = Vec::with_capacity(base.len());
         for id in base {
-            if !self.alive.contains(&id) { continue; }
-            if with.iter().any(|c| {
-                    self.components.get(c).map_or(true, |s| s.get(id).is_none())
-                }) { continue; }
+            if !self.alive.contains(&id) {
+                continue;
+            }
+            if with
+                .iter()
+                .any(|c| self.components.get(c).map_or(true, |s| s.get(id).is_none()))
+            {
+                continue;
+            }
             if without.iter().any(|c| {
-                    self.components.get(c).map_or(false, |s| s.get(id).is_some())
-                }) { continue; }
+                self.components
+                    .get(c)
+                    .map_or(false, |s| s.get(id).is_some())
+            }) {
+                continue;
+            }
             out.push(id);
         }
         out
@@ -1029,7 +1038,12 @@ impl EcsWorld {
 
     /// Batched/fused loop form that keeps hot loops on raw contiguous arrays.
     #[inline]
-    pub fn integrate_vec3_linear_fused(&mut self, pos_comp: &str, vel_comp: &str, dt: f32) -> usize {
+    pub fn integrate_vec3_linear_fused(
+        &mut self,
+        pos_comp: &str,
+        vel_comp: &str,
+        dt: f32,
+    ) -> usize {
         if pos_comp == vel_comp {
             return 0;
         }
@@ -1043,7 +1057,9 @@ impl EcsWorld {
         let mut updated = 0usize;
         for i in 0..pos_set.dense_ids.len() {
             let id = pos_set.dense_ids[i];
-            let Some(&vi) = vel_set.sparse.get(&id) else { continue };
+            let Some(&vi) = vel_set.sparse.get(&id) else {
+                continue;
+            };
             let (p, v) = unsafe {
                 let p = pos_set.dense_vals.get_unchecked_mut(i);
                 let v = vel_set.dense_vals.get_unchecked(vi);
@@ -1072,16 +1088,25 @@ impl EcsWorld {
         if pos_comp == vel_comp {
             return 0;
         }
-        let Some(pos_set_ref) = self.components.get(pos_comp) else { return 0 };
-        let Some(vel_set_ref) = self.components.get(vel_comp) else { return 0 };
+        let Some(pos_set_ref) = self.components.get(pos_comp) else {
+            return 0;
+        };
+        let Some(vel_set_ref) = self.components.get(vel_comp) else {
+            return 0;
+        };
         let pos_v = pos_set_ref.version;
         let vel_v = vel_set_ref.version;
         let key = Self::plan_key2(pos_comp, vel_comp);
         let mut cache = self.vec3_plan_cache.remove(&key).unwrap_or_default();
         let chunk_size = chunk_size.max(1);
-        if cache.pos_version != pos_v || cache.vel_version != vel_v || cache.chunk_size != chunk_size {
+        if cache.pos_version != pos_v
+            || cache.vel_version != vel_v
+            || cache.chunk_size != chunk_size
+        {
             cache.pairs.clear();
-            cache.pairs.reserve(pos_set_ref.dense_ids.len().min(vel_set_ref.dense_ids.len()));
+            cache
+                .pairs
+                .reserve(pos_set_ref.dense_ids.len().min(vel_set_ref.dense_ids.len()));
             for (pi, id) in pos_set_ref.dense_ids.iter().enumerate() {
                 if let Some(&vi) = vel_set_ref.sparse.get(id) {
                     cache.pairs.push((pi, vi));
@@ -1122,6 +1147,182 @@ impl EcsWorld {
         updated
     }
 
+    /// Superoptimizer pass for `pos += vel * dt`.
+    ///
+    /// Uses the same cached join plan as the chunked pass but executes an
+    /// aggressively unrolled inner loop with `mul_add` to reduce instruction
+    /// count and improve autovectorization in release mode.
+    pub fn integrate_vec3_superoptimizer(
+        &mut self,
+        pos_comp: &str,
+        vel_comp: &str,
+        dt: f32,
+        chunk_size: usize,
+    ) -> usize {
+        if pos_comp == vel_comp {
+            return 0;
+        }
+        let Some(pos_set_ref) = self.components.get(pos_comp) else {
+            return 0;
+        };
+        let Some(vel_set_ref) = self.components.get(vel_comp) else {
+            return 0;
+        };
+        let pos_v = pos_set_ref.version;
+        let vel_v = vel_set_ref.version;
+        let key = Self::plan_key2(pos_comp, vel_comp);
+        let mut cache = self.vec3_plan_cache.remove(&key).unwrap_or_default();
+        let chunk_size = chunk_size.max(1);
+        if cache.pos_version != pos_v
+            || cache.vel_version != vel_v
+            || cache.chunk_size != chunk_size
+        {
+            cache.pairs.clear();
+            cache
+                .pairs
+                .reserve(pos_set_ref.dense_ids.len().min(vel_set_ref.dense_ids.len()));
+            for (pi, id) in pos_set_ref.dense_ids.iter().enumerate() {
+                if let Some(&vi) = vel_set_ref.sparse.get(id) {
+                    cache.pairs.push((pi, vi));
+                }
+            }
+            cache.pos_version = pos_v;
+            cache.vel_version = vel_v;
+            cache.chunk_size = chunk_size;
+        }
+
+        let Some(mut pos_set) = self.components.remove(pos_comp) else {
+            self.vec3_plan_cache.insert(key, cache);
+            return 0;
+        };
+        let Some(vel_set) = self.components.get(vel_comp) else {
+            self.components.insert(pos_comp.to_owned(), pos_set);
+            self.vec3_plan_cache.insert(key, cache);
+            return 0;
+        };
+        let mut updated = 0usize;
+        for chunk in cache.pairs.chunks(cache.chunk_size) {
+            let mut i = 0usize;
+            while i + 3 < chunk.len() {
+                let slots = [chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]];
+                if Self::simd_update_vec3_x4(&mut pos_set, vel_set, slots, dt) {
+                    updated += 4;
+                    i += 4;
+                    continue;
+                }
+                for (pi, vi) in slots {
+                    let (p, v) = unsafe {
+                        let p = pos_set.dense_vals.get_unchecked_mut(pi);
+                        let v = vel_set.dense_vals.get_unchecked(vi);
+                        (p, v)
+                    };
+                    if let (Value::Vec3(p3), Value::Vec3(v3)) = (p, v) {
+                        p3[0] = v3[0].mul_add(dt, p3[0]);
+                        p3[1] = v3[1].mul_add(dt, p3[1]);
+                        p3[2] = v3[2].mul_add(dt, p3[2]);
+                        updated += 1;
+                    }
+                }
+                i += 4;
+            }
+            while i < chunk.len() {
+                let (pi, vi) = chunk[i];
+                let (p, v) = unsafe {
+                    let p = pos_set.dense_vals.get_unchecked_mut(pi);
+                    let v = vel_set.dense_vals.get_unchecked(vi);
+                    (p, v)
+                };
+                if let (Value::Vec3(p3), Value::Vec3(v3)) = (p, v) {
+                    p3[0] = v3[0].mul_add(dt, p3[0]);
+                    p3[1] = v3[1].mul_add(dt, p3[1]);
+                    p3[2] = v3[2].mul_add(dt, p3[2]);
+                    updated += 1;
+                }
+                i += 1;
+            }
+        }
+        self.components.insert(pos_comp.to_owned(), pos_set);
+        self.vec3_plan_cache.insert(key, cache);
+        updated
+    }
+
+    #[inline]
+    fn simd_update_vec3_x4(
+        pos_set: &mut SparseSet,
+        vel_set: &SparseSet,
+        slots: [(usize, usize); 4],
+        dt: f32,
+    ) -> bool {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        unsafe {
+            use std::arch::x86_64::*;
+
+            let [(pi0, vi0), (pi1, vi1), (pi2, vi2), (pi3, vi3)] = slots;
+            let pos_ptr = pos_set.dense_vals.as_mut_ptr();
+            let vel_ptr = vel_set.dense_vals.as_ptr();
+            let p0 = &mut *pos_ptr.add(pi0);
+            let p1 = &mut *pos_ptr.add(pi1);
+            let p2 = &mut *pos_ptr.add(pi2);
+            let p3 = &mut *pos_ptr.add(pi3);
+            let v0 = &*vel_ptr.add(vi0);
+            let v1 = &*vel_ptr.add(vi1);
+            let v2 = &*vel_ptr.add(vi2);
+            let v3 = &*vel_ptr.add(vi3);
+            let (
+                Value::Vec3(p0),
+                Value::Vec3(v0),
+                Value::Vec3(p1),
+                Value::Vec3(v1),
+                Value::Vec3(p2),
+                Value::Vec3(v2),
+                Value::Vec3(p3),
+                Value::Vec3(v3),
+            ) = (p0, v0, p1, v1, p2, v2, p3, v3)
+            else {
+                return false;
+            };
+
+            let dtv = _mm_set1_ps(dt);
+            let px = _mm_set_ps(p3[0], p2[0], p1[0], p0[0]);
+            let py = _mm_set_ps(p3[1], p2[1], p1[1], p0[1]);
+            let pz = _mm_set_ps(p3[2], p2[2], p1[2], p0[2]);
+            let vx = _mm_set_ps(v3[0], v2[0], v1[0], v0[0]);
+            let vy = _mm_set_ps(v3[1], v2[1], v1[1], v0[1]);
+            let vz = _mm_set_ps(v3[2], v2[2], v1[2], v0[2]);
+
+            let ox = _mm_add_ps(px, _mm_mul_ps(vx, dtv));
+            let oy = _mm_add_ps(py, _mm_mul_ps(vy, dtv));
+            let oz = _mm_add_ps(pz, _mm_mul_ps(vz, dtv));
+
+            let mut out_x = [0.0_f32; 4];
+            let mut out_y = [0.0_f32; 4];
+            let mut out_z = [0.0_f32; 4];
+            _mm_storeu_ps(out_x.as_mut_ptr(), ox);
+            _mm_storeu_ps(out_y.as_mut_ptr(), oy);
+            _mm_storeu_ps(out_z.as_mut_ptr(), oz);
+
+            p0[0] = out_x[0];
+            p1[0] = out_x[1];
+            p2[0] = out_x[2];
+            p3[0] = out_x[3];
+            p0[1] = out_y[0];
+            p1[1] = out_y[1];
+            p2[1] = out_y[2];
+            p3[1] = out_y[3];
+            p0[2] = out_z[0];
+            p1[2] = out_z[1];
+            p2[2] = out_z[2];
+            p3[2] = out_z[3];
+            return true;
+        }
+
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            let _ = (pos_set, vel_set, slots, dt);
+            false
+        }
+    }
+
     /// Fused chunked system pass:
     /// `pos += vel * dt` and `health -= damage * dt` in one tight loop.
     pub fn integrate_vec3_and_health_chunked(
@@ -1133,10 +1334,18 @@ impl EcsWorld {
         dt: f32,
         chunk_size: usize,
     ) -> usize {
-        let Some(pos_ref) = self.components.get(pos_comp) else { return 0 };
-        let Some(vel_ref) = self.components.get(vel_comp) else { return 0 };
-        let Some(health_ref) = self.components.get(health_comp) else { return 0 };
-        let Some(damage_ref) = self.components.get(damage_comp) else { return 0 };
+        let Some(pos_ref) = self.components.get(pos_comp) else {
+            return 0;
+        };
+        let Some(vel_ref) = self.components.get(vel_comp) else {
+            return 0;
+        };
+        let Some(health_ref) = self.components.get(health_comp) else {
+            return 0;
+        };
+        let Some(damage_ref) = self.components.get(damage_comp) else {
+            return 0;
+        };
         let key = Self::plan_key4(pos_comp, vel_comp, health_comp, damage_comp);
         let mut cache = self.fused_plan_cache.remove(&key).unwrap_or_default();
         let chunk_size = chunk_size.max(1);
@@ -1176,7 +1385,10 @@ impl EcsWorld {
             self.fused_plan_cache.insert(key, cache);
             return 0;
         };
-        let (Some(vel_set), Some(damage_set)) = (self.components.get(vel_comp), self.components.get(damage_comp)) else {
+        let (Some(vel_set), Some(damage_set)) = (
+            self.components.get(vel_comp),
+            self.components.get(damage_comp),
+        ) else {
             self.components.insert(pos_comp.to_owned(), pos_set);
             self.components.insert(health_comp.to_owned(), health_set);
             self.fused_plan_cache.insert(key, cache);
@@ -1193,7 +1405,9 @@ impl EcsWorld {
                     let d = damage_set.dense_vals.get_unchecked(*di);
                     (p, v, h, d)
                 };
-                if let (Value::Vec3(p3), Value::Vec3(v3), Value::F32(hp), Value::F32(dmg)) = (p, v, h, d) {
+                if let (Value::Vec3(p3), Value::Vec3(v3), Value::F32(hp), Value::F32(dmg)) =
+                    (p, v, h, d)
+                {
                     p3[0] += v3[0] * dt;
                     p3[1] += v3[1] * dt;
                     p3[2] += v3[2] * dt;
@@ -1778,7 +1992,9 @@ impl Env {
             // SAFETY: every slot inserted by `set_local` is a valid index into
             // `self.values`; we never remove elements from the slab.
             #[cfg(not(debug_assertions))]
-            unsafe { self.values.get_unchecked(slot as usize) }
+            unsafe {
+                self.values.get_unchecked(slot as usize)
+            }
             #[cfg(debug_assertions)]
             &self.values[slot as usize]
         })
@@ -1832,7 +2048,7 @@ pub enum Instr {
     LoadFn(u16, u16),
 
     // ── Register ─────────────────────────────────────────────────────────────
-    Move(u16, u16),   // dst ← src
+    Move(u16, u16), // dst ← src
 
     // ── Variables (slot-addressed) ────────────────────────────────────────────
     /// Load from slot: (dst_reg, slot)
@@ -1842,7 +2058,7 @@ pub enum Instr {
 
     // ── Arithmetic / comparison ───────────────────────────────────────────────
     BinOp(u16, BinOpKind, u16, u16), // dst, op, lhs, rhs
-    UnOp(u16, UnOpKind, u16),         // dst, op, src
+    UnOp(u16, UnOpKind, u16),        // dst, op, src
     PowOp(u16, u16, u16),            // dst, base, exp
     MatMulInstr(u16, u16, u16),      // dst, lhs, rhs
     HadamardMulInstr(u16, u16, u16),
@@ -1874,18 +2090,18 @@ pub enum Instr {
 
     // ── Collections ─────────────────────────────────────────────────────────
     NewArray(u16),
-    ArrayPush(u16, u16),          // array_reg, val_reg
-    ArrayGet(u16, u16, u16),      // dst, array_reg, idx_reg
-    ArraySet(u16, u16, u16),      // array_reg, idx_reg, val_reg
+    ArrayPush(u16, u16),     // array_reg, val_reg
+    ArrayGet(u16, u16, u16), // dst, array_reg, idx_reg
+    ArraySet(u16, u16, u16), // array_reg, idx_reg, val_reg
     NewHashMap(u16),
-    NewTuple(u16, u16, u16),      // dst, first_reg, count
-    NewStruct(u16, u16),          // dst, name_str_idx
+    NewTuple(u16, u16, u16), // dst, first_reg, count
+    NewStruct(u16, u16),     // dst, name_str_idx
 
     // ── Field / index ─────────────────────────────────────────────────────────
-    FieldGet(u16, u16, u16),      // dst, obj_reg, field_str_idx
-    FieldSet(u16, u16, u16),      // obj_reg, field_str_idx, val_reg
-    IndexGet(u16, u16, u16),      // dst, obj_reg, idx_reg
-    IndexSet(u16, u16, u16),      // obj_reg, idx_reg, val_reg
+    FieldGet(u16, u16, u16), // dst, obj_reg, field_str_idx
+    FieldSet(u16, u16, u16), // obj_reg, field_str_idx, val_reg
+    IndexGet(u16, u16, u16), // dst, obj_reg, idx_reg
+    IndexSet(u16, u16, u16), // obj_reg, idx_reg, val_reg
 
     // ── Vector constructors ───────────────────────────────────────────────────
     Vec2Ctor(u16, u16, u16),
@@ -1893,11 +2109,11 @@ pub enum Instr {
     Vec4Ctor(u16, u16, u16, u16, u16),
 
     // ── Range ─────────────────────────────────────────────────────────────────
-    RangeExcl(u16, u16, u16),     // dst, lo_reg, hi_reg
+    RangeExcl(u16, u16, u16), // dst, lo_reg, hi_reg
     RangeIncl(u16, u16, u16),
 
     // ── Grad ─────────────────────────────────────────────────────────────────
-    EnableGrad(u16, u16),         // dst, src (enables grad, returns same tensor)
+    EnableGrad(u16, u16), // dst, src (enables grad, returns same tensor)
 
     // ── Misc ─────────────────────────────────────────────────────────────────
     Nop,
@@ -1972,7 +2188,10 @@ impl Compiler {
     fn declare(&mut self, name: &str) -> u16 {
         let slot = self.next_slot;
         self.next_slot += 1;
-        self.scopes.last_mut().unwrap().insert(name.to_owned(), slot);
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .insert(name.to_owned(), slot);
         slot
     }
 
@@ -2025,17 +2244,14 @@ impl Compiler {
     /// Compile a block, returning the register holding the tail value.
     fn compile_block(&mut self, block: &Block, dst: u16) {
         self.push_scope();
-        let mut last_sig = false;
         for stmt in &block.stmts {
             self.compile_stmt(stmt);
             // If stmt itself ends in Return/Break/Continue we can stop.
         }
-        if !last_sig {
-            if let Some(tail) = &block.tail {
-                self.compile_expr_into(tail, dst);
-            } else {
-                self.emit(Instr::LoadUnit(dst));
-            }
+        if let Some(tail) = &block.tail {
+            self.compile_expr_into(tail, dst);
+        } else {
+            self.emit(Instr::LoadUnit(dst));
         }
         self.pop_scope();
     }
@@ -2096,7 +2312,9 @@ impl Compiler {
                 let back_offset = loop_start - self.instrs.len() as i32 - 1;
                 self.emit(Instr::Jump(back_offset));
             }
-            Stmt::If { cond, then, else_, .. } => {
+            Stmt::If {
+                cond, then, else_, ..
+            } => {
                 let cond_reg = self.tmp();
                 self.compile_expr_into(cond, cond_reg);
                 let else_jump = self.emit_jump_false(cond_reg);
@@ -2114,7 +2332,12 @@ impl Compiler {
                     self.patch_jump(else_jump);
                 }
             }
-            Stmt::ForIn { pattern, iter, body, .. } => {
+            Stmt::ForIn {
+                pattern,
+                iter,
+                body,
+                ..
+            } => {
                 // Evaluate iterator into a temporary array register.
                 let iter_reg = self.tmp();
                 self.compile_expr_into(iter, iter_reg);
@@ -2199,7 +2422,7 @@ impl Compiler {
                     // Normalise to Bool
                     let bool_reg = self.tmp();
                     self.emit(Instr::BinOp(bool_reg, BinOpKind::Ne, dst, dst)); // placeholder
-                    // Actually just leave dst as-is and patch
+                                                                                // Actually just leave dst as-is and patch
                     self.patch_jump(jmp);
                     return;
                 }
@@ -2223,7 +2446,9 @@ impl Compiler {
                 self.compile_expr_into(expr, s);
                 self.emit(Instr::UnOp(dst, *op, s));
             }
-            Expr::Assign { op, target, value, .. } => {
+            Expr::Assign {
+                op, target, value, ..
+            } => {
                 let rhs_reg = self.tmp();
                 self.compile_expr_into(value, rhs_reg);
                 match target.as_ref() {
@@ -2246,7 +2471,9 @@ impl Compiler {
                         let fi = self.intern(field);
                         self.emit(Instr::FieldSet(obj_reg, fi, rhs_reg));
                     }
-                    Expr::Index { object, indices, .. } => {
+                    Expr::Index {
+                        object, indices, ..
+                    } => {
                         let obj_reg = self.tmp();
                         self.compile_expr_into(object, obj_reg);
                         let idx_reg = self.tmp();
@@ -2265,7 +2492,9 @@ impl Compiler {
                 let fi = self.intern(field);
                 self.emit(Instr::FieldGet(dst, obj_reg, fi));
             }
-            Expr::Index { object, indices, .. } => {
+            Expr::Index {
+                object, indices, ..
+            } => {
                 let obj_reg = self.tmp();
                 self.compile_expr_into(object, obj_reg);
                 let idx_reg = self.tmp();
@@ -2298,7 +2527,12 @@ impl Compiler {
                     self.emit(Instr::Call(dst, fn_reg, args_start, arg_count));
                 }
             }
-            Expr::MethodCall { receiver, method, args, .. } => {
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+                ..
+            } => {
                 let recv_reg = self.tmp();
                 self.compile_expr_into(receiver, recv_reg);
                 let args_start = self.next_tmp;
@@ -2310,7 +2544,9 @@ impl Compiler {
                 let mi = self.intern(method);
                 self.emit(Instr::CallMethod(dst, recv_reg, mi, args_start, arg_count));
             }
-            Expr::IfExpr { cond, then, else_, .. } => {
+            Expr::IfExpr {
+                cond, then, else_, ..
+            } => {
                 let cond_reg = self.tmp();
                 self.compile_expr_into(cond, cond_reg);
                 let else_jump = self.emit_jump_false(cond_reg);
@@ -2346,20 +2582,37 @@ impl Compiler {
                 self.emit(Instr::NewTuple(dst, start, count));
             }
             Expr::VecCtor { size, elems, .. } => {
-                let regs: Vec<u16> = elems.iter().map(|e| {
-                    let r = self.tmp(); self.compile_expr_into(e, r); r
-                }).collect();
+                let regs: Vec<u16> = elems
+                    .iter()
+                    .map(|e| {
+                        let r = self.tmp();
+                        self.compile_expr_into(e, r);
+                        r
+                    })
+                    .collect();
                 match size {
                     VecSize::N2 => self.emit(Instr::Vec2Ctor(dst, regs[0], regs[1])),
                     VecSize::N3 => self.emit(Instr::Vec3Ctor(dst, regs[0], regs[1], regs[2])),
-                    VecSize::N4 => self.emit(Instr::Vec4Ctor(dst, regs[0], regs[1], regs[2], regs[3])),
+                    VecSize::N4 => {
+                        self.emit(Instr::Vec4Ctor(dst, regs[0], regs[1], regs[2], regs[3]))
+                    }
                 }
             }
-            Expr::Range { lo, hi, inclusive, .. } => {
+            Expr::Range {
+                lo, hi, inclusive, ..
+            } => {
                 let lo_reg = self.tmp();
                 let hi_reg = self.tmp();
-                if let Some(l) = lo { self.compile_expr_into(l, lo_reg); } else { self.emit(Instr::LoadI32(lo_reg, 0)); }
-                if let Some(h) = hi { self.compile_expr_into(h, hi_reg); } else { self.emit(Instr::LoadI32(hi_reg, 0)); }
+                if let Some(l) = lo {
+                    self.compile_expr_into(l, lo_reg);
+                } else {
+                    self.emit(Instr::LoadI32(lo_reg, 0));
+                }
+                if let Some(h) = hi {
+                    self.compile_expr_into(h, hi_reg);
+                } else {
+                    self.emit(Instr::LoadI32(hi_reg, 0));
+                }
                 if *inclusive {
                     self.emit(Instr::RangeIncl(dst, lo_reg, hi_reg));
                 } else {
@@ -2367,13 +2620,15 @@ impl Compiler {
                 }
             }
             Expr::MatMul { lhs, rhs, .. } => {
-                let l = self.tmp(); let r = self.tmp();
+                let l = self.tmp();
+                let r = self.tmp();
                 self.compile_expr_into(lhs, l);
                 self.compile_expr_into(rhs, r);
                 self.emit(Instr::MatMulInstr(dst, l, r));
             }
             Expr::Pow { base, exp, .. } => {
-                let b = self.tmp(); let e = self.tmp();
+                let b = self.tmp();
+                let e = self.tmp();
                 self.compile_expr_into(base, b);
                 self.compile_expr_into(exp, e);
                 self.emit(Instr::PowOp(dst, b, e));
@@ -2455,7 +2710,10 @@ pub fn compile_fn(decl: &FnDecl) -> CompiledFn {
     let mut c = Compiler::new(param_count);
     // Declare parameter slots in order.
     for (i, p) in decl.params.iter().enumerate() {
-        c.scopes.last_mut().unwrap().insert(p.name.clone(), i as u16);
+        c.scopes
+            .last_mut()
+            .unwrap()
+            .insert(p.name.clone(), i as u16);
     }
     let result_dst = c.next_slot;
     c.next_slot += 1;
@@ -2539,15 +2797,17 @@ pub fn vm_exec(
 
         match instr {
             Instr::Nop => {}
-            Instr::LoadUnit(d)        => *reg_mut!(*d) = Value::Unit,
-            Instr::LoadBool(d, b)     => *reg_mut!(*d) = Value::Bool(*b),
-            Instr::LoadI32(d, v)      => *reg_mut!(*d) = Value::I32(*v),
-            Instr::LoadI64(d, v)      => *reg_mut!(*d) = Value::I64(*v),
-            Instr::LoadF32(d, v)      => *reg_mut!(*d) = Value::F32(*v),
-            Instr::LoadF64(d, v)      => *reg_mut!(*d) = Value::F64(*v),
-            Instr::LoadStr(d, si)     => *reg_mut!(*d) = Value::Str(str_c!(*si).to_owned()),
-            Instr::LoadConst(d, ci)   => *reg_mut!(*d) = unsafe { const_pool.get_unchecked(*ci as usize) }.clone(),
-            Instr::LoadFn(d, si)  => {
+            Instr::LoadUnit(d) => *reg_mut!(*d) = Value::Unit,
+            Instr::LoadBool(d, b) => *reg_mut!(*d) = Value::Bool(*b),
+            Instr::LoadI32(d, v) => *reg_mut!(*d) = Value::I32(*v),
+            Instr::LoadI64(d, v) => *reg_mut!(*d) = Value::I64(*v),
+            Instr::LoadF32(d, v) => *reg_mut!(*d) = Value::F32(*v),
+            Instr::LoadF64(d, v) => *reg_mut!(*d) = Value::F64(*v),
+            Instr::LoadStr(d, si) => *reg_mut!(*d) = Value::Str(str_c!(*si).to_owned()),
+            Instr::LoadConst(d, ci) => {
+                *reg_mut!(*d) = unsafe { const_pool.get_unchecked(*ci as usize) }.clone()
+            }
+            Instr::LoadFn(d, si) => {
                 let name = str_c!(*si);
                 if name == "world" {
                     *reg_mut!(*d) = Value::World(interp.world.clone());
@@ -2559,9 +2819,18 @@ pub fn vm_exec(
                     *reg_mut!(*d) = Value::Unit;
                 }
             }
-            Instr::Move(d, s)         => { let v = reg!(*s).clone(); *reg_mut!(*d) = v; }
-            Instr::Load(d, slot)      => { let v = slot!(*slot).clone(); *reg_mut!(*d) = v; }
-            Instr::Store(slot, s)     => { let v = reg!(*s).clone(); *slot_mut!(*slot) = v; }
+            Instr::Move(d, s) => {
+                let v = reg!(*s).clone();
+                *reg_mut!(*d) = v;
+            }
+            Instr::Load(d, slot) => {
+                let v = slot!(*slot).clone();
+                *reg_mut!(*d) = v;
+            }
+            Instr::Store(slot, s) => {
+                let v = reg!(*s).clone();
+                *slot_mut!(*slot) = v;
+            }
 
             Instr::BinOp(d, op, l, r) => {
                 let lv = reg!(*l).clone();
@@ -2647,7 +2916,7 @@ pub fn vm_exec(
                 *reg_mut!(*d) = interp.eval_method(recv, method, call_args, &mut env)?;
             }
 
-            Instr::NewArray(d)  => *reg_mut!(*d) = Value::Array(Arc::new(Mutex::new(Vec::new()))),
+            Instr::NewArray(d) => *reg_mut!(*d) = Value::Array(Arc::new(Mutex::new(Vec::new()))),
             Instr::ArrayPush(arr, v) => {
                 if let Value::Array(a) = &reg!(*arr) {
                     let val = reg!(*v).clone();
@@ -2664,7 +2933,9 @@ pub fn vm_exec(
                 let v = reg!(*val).clone();
                 if let Value::Array(a) = &reg!(*arr) {
                     let mut lock = a.lock().unwrap();
-                    if i < lock.len() { lock[i] = v; }
+                    if i < lock.len() {
+                        lock[i] = v;
+                    }
                 }
             }
             Instr::NewHashMap(d) => {
@@ -2679,7 +2950,10 @@ pub fn vm_exec(
             }
             Instr::NewStruct(d, ni) => {
                 let name = str_c!(*ni).to_owned();
-                *reg_mut!(*d) = Value::Struct { name, fields: HashMap::new() };
+                *reg_mut!(*d) = Value::Struct {
+                    name,
+                    fields: HashMap::new(),
+                };
             }
             Instr::FieldGet(d, obj, fi) => {
                 let o = reg!(*obj).clone();
@@ -2690,7 +2964,9 @@ pub fn vm_exec(
                 let field = str_pool[*fi as usize].clone();
                 let v = reg!(*val).clone();
                 match &mut regs[*obj as usize] {
-                    Value::Struct { fields, .. } => { fields.insert(field, v); }
+                    Value::Struct { fields, .. } => {
+                        fields.insert(field, v);
+                    }
                     _ => {}
                 }
             }
@@ -2704,7 +2980,9 @@ pub fn vm_exec(
                 let v = reg!(*val).clone();
                 if let Value::Array(a) = &regs[*obj as usize] {
                     let mut lock = a.lock().unwrap();
-                    if i < lock.len() { lock[i] = v; }
+                    if i < lock.len() {
+                        lock[i] = v;
+                    }
                 }
             }
             Instr::Vec2Ctor(d, x, y) => {
@@ -2728,12 +3006,14 @@ pub fn vm_exec(
             Instr::RangeExcl(d, lo, hi) => {
                 let s = reg!(*lo).as_i64().unwrap_or(0) as i32;
                 let e = reg!(*hi).as_i64().unwrap_or(0) as i32;
-                *reg_mut!(*d) = Value::Array(Arc::new(Mutex::new((s..e).map(Value::I32).collect())));
+                *reg_mut!(*d) =
+                    Value::Array(Arc::new(Mutex::new((s..e).map(Value::I32).collect())));
             }
             Instr::RangeIncl(d, lo, hi) => {
                 let s = reg!(*lo).as_i64().unwrap_or(0) as i32;
                 let e = reg!(*hi).as_i64().unwrap_or(0) as i32;
-                *reg_mut!(*d) = Value::Array(Arc::new(Mutex::new((s..=e).map(Value::I32).collect())));
+                *reg_mut!(*d) =
+                    Value::Array(Arc::new(Mutex::new((s..=e).map(Value::I32).collect())));
             }
             Instr::MatMulInstr(d, l, r) => {
                 let lv = reg!(*l).clone();
@@ -2781,7 +3061,9 @@ fn vm_unop(op: UnOpKind, v: Value) -> Result<Value, RuntimeError> {
             Value::Tensor(t) => {
                 let data: Vec<f32> = t.read().unwrap().cpu_data().iter().map(|x| -x).collect();
                 let shape = t.read().unwrap().shape.clone();
-                Ok(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(shape, data)))))
+                Ok(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(
+                    shape, data,
+                )))))
             }
             _ => rt_err!("unary `-` on `{}`", v.type_name()),
         },
@@ -3187,7 +3469,8 @@ impl Interpreter {
             if !self.compiled_fns.contains_key(name) {
                 // Compile and cache.
                 let compiled = compile_fn(&closure.decl);
-                self.compiled_fns.insert(name.to_owned(), Arc::new(compiled));
+                self.compiled_fns
+                    .insert(name.to_owned(), Arc::new(compiled));
             }
             let compiled = self.compiled_fns[name].clone();
             #[cfg(feature = "phase3-jit")]
@@ -3197,8 +3480,7 @@ impl Interpreter {
                 } else {
                     self.pgo_call_counts.insert(name.to_owned(), 1);
                 }
-                if !self.pgo_window_done
-                    && self.pgo_started_at.elapsed() >= Duration::from_secs(1)
+                if !self.pgo_window_done && self.pgo_started_at.elapsed() >= Duration::from_secs(1)
                 {
                     self.pgo_window_done = true;
                     if let Some((hot_name, _)) = self
@@ -3217,9 +3499,7 @@ impl Interpreter {
             }
 
             // If the arg count matches expectation, run the VM.
-            if closure.capture.is_empty()
-                && args.len() == closure.decl.params.len()
-            {
+            if closure.capture.is_empty() && args.len() == closure.decl.params.len() {
                 #[cfg(feature = "phase3-jit")]
                 {
                     if let Some(native) = self.native_fns.get(name).cloned() {
@@ -3323,7 +3603,7 @@ impl Interpreter {
     // §11  STATEMENT EVALUATION
     // =========================================================================
 
-    #[inline(never)]  // Large match: keep out of the hot inlining budget.
+    #[inline(never)] // Large match: keep out of the hot inlining budget.
     pub fn eval_stmt(&mut self, stmt: &Stmt, env: &mut Env) -> Result<Value, RuntimeError> {
         match stmt {
             Stmt::Let { pattern, init, .. } => {
@@ -5107,10 +5387,9 @@ impl Interpreter {
                 Ok(Value::Bool(true))
             }
             "debug::set_advance_jit" => {
-                let enabled = args
-                    .first()
-                    .and_then(|v| v.as_bool())
-                    .ok_or_else(|| RuntimeError::new("debug::set_advance_jit(bool) requires bool"))?;
+                let enabled = args.first().and_then(|v| v.as_bool()).ok_or_else(|| {
+                    RuntimeError::new("debug::set_advance_jit(bool) requires bool")
+                })?;
                 self.set_advance_jit_enabled(enabled);
                 Ok(Value::Bool(enabled))
             }
@@ -5128,10 +5407,7 @@ impl Interpreter {
                 Ok(Value::HashMap(Arc::new(Mutex::new(state))))
             }
             "debug::runtime_profile" => {
-                let enabled = args
-                    .first()
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                let enabled = args.first().and_then(|v| v.as_bool()).unwrap_or(true);
                 self.runtime_profile_enabled = enabled;
                 Ok(Value::Bool(enabled))
             }
@@ -5140,11 +5416,7 @@ impl Interpreter {
                 Ok(Value::Bool(true))
             }
             "debug::runtime_hotspots" => {
-                let limit = args
-                    .first()
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(8)
-                    .max(1) as usize;
+                let limit = args.first().and_then(|v| v.as_i64()).unwrap_or(8).max(1) as usize;
                 let total_nanos: u128 = self.runtime_profile.values().map(|(_, n)| *n).sum();
                 let mut rows = self
                     .runtime_profile
@@ -7471,7 +7743,6 @@ impl GpuBackend for JulesGpuAdapter {
 /// Hot path: I32 × I32 and F32 × F32 are handled first to avoid the full
 /// numeric type dispatch on every inner-loop iteration.
 #[inline]
-#[inline]
 fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, RuntimeError> {
     // ── Ultra-fast path: I32 × I32 (loop counters, indices, most arithmetic) ──
     if let (Value::I32(a), Value::I32(b)) = (&l, &r) {
@@ -7480,20 +7751,35 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
             BinOpKind::Add => Ok(Value::I32(a.wrapping_add(b))),
             BinOpKind::Sub => Ok(Value::I32(a.wrapping_sub(b))),
             BinOpKind::Mul => Ok(Value::I32(a.wrapping_mul(b))),
-            BinOpKind::Div => if b == 0 { rt_err!("division by zero") } else { Ok(Value::I32(a / b)) },
-            BinOpKind::Rem => if b == 0 { rt_err!("modulo by zero") } else { Ok(Value::I32(a % b)) },
-            BinOpKind::Lt  => Ok(Value::Bool(a < b)),
-            BinOpKind::Le  => Ok(Value::Bool(a <= b)),
-            BinOpKind::Gt  => Ok(Value::Bool(a > b)),
-            BinOpKind::Ge  => Ok(Value::Bool(a >= b)),
-            BinOpKind::Eq  => Ok(Value::Bool(a == b)),
-            BinOpKind::Ne  => Ok(Value::Bool(a != b)),
+            BinOpKind::Div => {
+                if b == 0 {
+                    rt_err!("division by zero")
+                } else {
+                    Ok(Value::I32(a / b))
+                }
+            }
+            BinOpKind::Rem => {
+                if b == 0 {
+                    rt_err!("modulo by zero")
+                } else {
+                    Ok(Value::I32(a % b))
+                }
+            }
+            BinOpKind::Lt => Ok(Value::Bool(a < b)),
+            BinOpKind::Le => Ok(Value::Bool(a <= b)),
+            BinOpKind::Gt => Ok(Value::Bool(a > b)),
+            BinOpKind::Ge => Ok(Value::Bool(a >= b)),
+            BinOpKind::Eq => Ok(Value::Bool(a == b)),
+            BinOpKind::Ne => Ok(Value::Bool(a != b)),
             BinOpKind::BitAnd => Ok(Value::I32(a & b)),
-            BinOpKind::BitOr  => Ok(Value::I32(a | b)),
+            BinOpKind::BitOr => Ok(Value::I32(a | b)),
             BinOpKind::BitXor => Ok(Value::I32(a ^ b)),
-            BinOpKind::Shl    => Ok(Value::I32(a << (b as u32))),
-            BinOpKind::Shr    => Ok(Value::I32(a >> (b as u32))),
-            _ => Err(RuntimeError::new(format!("op {:?} not defined for i32", op))),
+            BinOpKind::Shl => Ok(Value::I32(a << (b as u32))),
+            BinOpKind::Shr => Ok(Value::I32(a >> (b as u32))),
+            _ => Err(RuntimeError::new(format!(
+                "op {:?} not defined for i32",
+                op
+            ))),
         };
     }
     // ── Fast path: F32 × F32 ─────────────────────────────────────────────────
@@ -7503,16 +7789,31 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
             BinOpKind::Add => Ok(Value::F32(a + b)),
             BinOpKind::Sub => Ok(Value::F32(a - b)),
             BinOpKind::Mul => Ok(Value::F32(a * b)),
-            BinOpKind::Div => if b == 0.0 { rt_err!("division by zero") } else { Ok(Value::F32(a / b)) },
+            BinOpKind::Div => {
+                if b == 0.0 {
+                    rt_err!("division by zero")
+                } else {
+                    Ok(Value::F32(a / b))
+                }
+            }
             BinOpKind::Rem => Ok(Value::F32(a % b)),
-            BinOpKind::FloorDiv => if b == 0.0 { rt_err!("floor division by zero") } else { Ok(Value::F32((a / b).floor())) },
-            BinOpKind::Lt  => Ok(Value::Bool(a < b)),
-            BinOpKind::Le  => Ok(Value::Bool(a <= b)),
-            BinOpKind::Gt  => Ok(Value::Bool(a > b)),
-            BinOpKind::Ge  => Ok(Value::Bool(a >= b)),
-            BinOpKind::Eq  => Ok(Value::Bool(a == b)),
-            BinOpKind::Ne  => Ok(Value::Bool(a != b)),
-            _ => Err(RuntimeError::new(format!("op {:?} not defined for f32", op))),
+            BinOpKind::FloorDiv => {
+                if b == 0.0 {
+                    rt_err!("floor division by zero")
+                } else {
+                    Ok(Value::F32((a / b).floor()))
+                }
+            }
+            BinOpKind::Lt => Ok(Value::Bool(a < b)),
+            BinOpKind::Le => Ok(Value::Bool(a <= b)),
+            BinOpKind::Gt => Ok(Value::Bool(a > b)),
+            BinOpKind::Ge => Ok(Value::Bool(a >= b)),
+            BinOpKind::Eq => Ok(Value::Bool(a == b)),
+            BinOpKind::Ne => Ok(Value::Bool(a != b)),
+            _ => Err(RuntimeError::new(format!(
+                "op {:?} not defined for f32",
+                op
+            ))),
         };
     }
     // Tensor arithmetic.
@@ -8481,8 +8782,12 @@ mod tests {
 
         let n = world.integrate_vec3_linear("pos", "vel", 0.5);
         assert_eq!(n, 2);
-        assert!(matches!(world.get_component(a, "pos"), Some(Value::Vec3(p)) if (p[0] - 1.0).abs() < 1e-6));
-        assert!(matches!(world.get_component(b, "pos"), Some(Value::Vec3(p)) if (p[1] - 0.0).abs() < 1e-6));
+        assert!(
+            matches!(world.get_component(a, "pos"), Some(Value::Vec3(p)) if (p[0] - 1.0).abs() < 1e-6)
+        );
+        assert!(
+            matches!(world.get_component(b, "pos"), Some(Value::Vec3(p)) if (p[1] - 0.0).abs() < 1e-6)
+        );
     }
 
     #[test]
@@ -8497,8 +8802,12 @@ mod tests {
 
         let n = world.integrate_vec3_linear_fused("pos", "vel", 0.5);
         assert_eq!(n, 2);
-        assert!(matches!(world.get_component(a, "pos"), Some(Value::Vec3(p)) if (p[0] - 1.0).abs() < 1e-6));
-        assert!(matches!(world.get_component(b, "pos"), Some(Value::Vec3(p)) if (p[1] - 0.0).abs() < 1e-6));
+        assert!(
+            matches!(world.get_component(a, "pos"), Some(Value::Vec3(p)) if (p[0] - 1.0).abs() < 1e-6)
+        );
+        assert!(
+            matches!(world.get_component(b, "pos"), Some(Value::Vec3(p)) if (p[1] - 0.0).abs() < 1e-6)
+        );
     }
 
     #[test]
@@ -8513,8 +8822,32 @@ mod tests {
 
         let n = world.integrate_vec3_chunked_precomputed("pos", "vel", 0.5, 64);
         assert_eq!(n, 2);
-        assert!(matches!(world.get_component(a, "pos"), Some(Value::Vec3(p)) if (p[0] - 1.0).abs() < 1e-6));
-        assert!(matches!(world.get_component(b, "pos"), Some(Value::Vec3(p)) if (p[1] - 0.0).abs() < 1e-6));
+        assert!(
+            matches!(world.get_component(a, "pos"), Some(Value::Vec3(p)) if (p[0] - 1.0).abs() < 1e-6)
+        );
+        assert!(
+            matches!(world.get_component(b, "pos"), Some(Value::Vec3(p)) if (p[1] - 0.0).abs() < 1e-6)
+        );
+    }
+
+    #[test]
+    fn test_ecs_integrate_vec3_superoptimizer() {
+        let mut world = EcsWorld::default();
+        let a = world.spawn();
+        world.insert_component(a, "pos", Value::Vec3([0.0, 0.0, 0.0]));
+        world.insert_component(a, "vel", Value::Vec3([2.0, 0.0, 0.0]));
+        let b = world.spawn();
+        world.insert_component(b, "pos", Value::Vec3([1.0, 1.0, 1.0]));
+        world.insert_component(b, "vel", Value::Vec3([0.0, -2.0, 0.0]));
+
+        let n = world.integrate_vec3_superoptimizer("pos", "vel", 0.5, 64);
+        assert_eq!(n, 2);
+        assert!(
+            matches!(world.get_component(a, "pos"), Some(Value::Vec3(p)) if (p[0] - 1.0).abs() < 1e-6)
+        );
+        assert!(
+            matches!(world.get_component(b, "pos"), Some(Value::Vec3(p)) if (p[1] - 0.0).abs() < 1e-6)
+        );
     }
 
     #[test]
@@ -8527,8 +8860,12 @@ mod tests {
         world.insert_component(e, "damage", Value::F32(2.0));
         let n = world.integrate_vec3_and_health_chunked("pos", "vel", "health", "damage", 0.5, 64);
         assert_eq!(n, 1);
-        assert!(matches!(world.get_component(e, "pos"), Some(Value::Vec3(p)) if (p[0] - 0.5).abs() < 1e-6));
-        assert!(matches!(world.get_component(e, "health"), Some(Value::F32(h)) if (h - 9.0).abs() < 1e-6));
+        assert!(
+            matches!(world.get_component(e, "pos"), Some(Value::Vec3(p)) if (p[0] - 0.5).abs() < 1e-6)
+        );
+        assert!(
+            matches!(world.get_component(e, "health"), Some(Value::F32(h)) if (h - 9.0).abs() < 1e-6)
+        );
     }
 
     // ── Interpreter ───────────────────────────────────────────────────────────
