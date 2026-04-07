@@ -87,8 +87,19 @@ impl Emitter {
     fn add_rax_rcx(&mut self) { self.b(0x48); self.b(0x01); self.b(0xC8); }
     fn sub_rax_rcx(&mut self) { self.b(0x48); self.b(0x29); self.b(0xC8); }
     fn imul_rax_rcx(&mut self) { self.b(0x48); self.b(0x0F); self.b(0xAF); self.b(0xC1); }
+    fn add_rax_imm32(&mut self, v: i32) { self.b(0x48); self.b(0x05); self.d(v); }
+    fn sub_rax_imm32(&mut self, v: i32) { self.b(0x48); self.b(0x2D); self.d(v); }
+    fn imul_rax_imm32(&mut self, v: i32) { self.b(0x48); self.b(0x69); self.b(0xC0); self.d(v); }
+    fn inc_rax(&mut self) { self.b(0x48); self.b(0xFF); self.b(0xC0); }
+    fn dec_rax(&mut self) { self.b(0x48); self.b(0xFF); self.b(0xC8); }
+    fn shl_rax_imm8(&mut self, v: u8) { self.b(0x48); self.b(0xC1); self.b(0xE0); self.b(v); }
+    fn xor_rax_rax(&mut self) { self.b(0x48); self.b(0x31); self.b(0xC0); }
+    fn lea_rax_rax_mul3(&mut self) { self.b(0x48); self.b(0x8D); self.b(0x04); self.b(0x40); } // rax = rax + rax*2
+    fn lea_rax_rax_mul5(&mut self) { self.b(0x48); self.b(0x8D); self.b(0x04); self.b(0x80); } // rax = rax + rax*4
+    fn lea_rax_rax_mul9(&mut self) { self.b(0x48); self.b(0x8D); self.b(0x04); self.b(0xC0); } // rax = rax + rax*8
 
     fn cmp_rax_rcx(&mut self) { self.b(0x48); self.b(0x39); self.b(0xC8); }
+    fn cmp_rax_imm32(&mut self, v: i32) { self.b(0x48); self.b(0x3D); self.d(v); }
     fn setcc_al(&mut self, cc: u8) { self.b(0x0F); self.b(cc); self.b(0xC0); }
     fn movzx_rax_al(&mut self) { self.b(0x48); self.b(0x0F); self.b(0xB6); self.b(0xC0); }
 
@@ -100,6 +111,7 @@ impl Emitter {
 
     fn jmp_rel32_placeholder(&mut self) -> usize { self.b(0xE9); let p=self.pos(); self.d(0); p }
     fn jz_rel32_placeholder(&mut self) -> usize { self.b(0x0F); self.b(0x84); let p=self.pos(); self.d(0); p }
+    fn jnz_rel32_placeholder(&mut self) -> usize { self.b(0x0F); self.b(0x85); let p=self.pos(); self.d(0); p }
 
     fn ret(&mut self) { self.b(0xC3); }
 }
@@ -124,6 +136,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             | Instr::BinOp(..)
             | Instr::Jump(..)
             | Instr::JumpFalse(..)
+            | Instr::JumpTrue(..)
             | Instr::Return(..)
             | Instr::ReturnUnit
             | Instr::Nop => {}
@@ -212,6 +225,295 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 em.mov_m_rdi_off_rax(slot_off(s));
             }
         };
+
+        // Superinstruction fusion:
+        //   LoadI32/LoadI64(tmp, c) ; BinOp(mid, op, x, tmp) ; JumpFalse/JumpTrue(mid, off)
+        // =>
+        //   compute with immediate form directly in rax and branch, without temporary slot store/load.
+        if pc + 2 < compiled.instrs.len() {
+            let maybe_imm = match &compiled.instrs[pc] {
+                Instr::LoadI32(tmp, v) => Some((*tmp, *v as i64)),
+                Instr::LoadI64(tmp, v) => Some((*tmp, *v)),
+                _ => None,
+            };
+            if let Some((tmp, c)) = maybe_imm {
+                if let (Instr::BinOp(mid, op, l, r), branch) =
+                    (&compiled.instrs[pc + 1], &compiled.instrs[pc + 2])
+                {
+                    let (is_jump_true, cond, off) = match branch {
+                        Instr::JumpFalse(cond, off) => (false, *cond, *off),
+                        Instr::JumpTrue(cond, off) => (true, *cond, *off),
+                        _ => (false, u16::MAX, 0),
+                    };
+                    if cond == *mid {
+                        if let Ok(imm) = i32::try_from(c) {
+                            let rhs_is_imm = *r == tmp;
+                            let lhs_is_imm = *l == tmp;
+                            let can_use = match op {
+                                BinOpKind::Add | BinOpKind::Mul => rhs_is_imm || lhs_is_imm,
+                                BinOpKind::Sub
+                                | BinOpKind::Eq
+                                | BinOpKind::Ne
+                                | BinOpKind::Lt
+                                | BinOpKind::Le
+                                | BinOpKind::Gt
+                                | BinOpKind::Ge => rhs_is_imm,
+                                _ => false,
+                            };
+                            if can_use {
+                                let target = ((pc as i32) + 3 + off) as usize;
+                                if target > compiled.instrs.len() {
+                                    return None;
+                                }
+                                let live_reg = if rhs_is_imm { *l } else { *r };
+                                load_slot_rax(&mut em, live_reg);
+                                match op {
+                                    BinOpKind::Add => {
+                                        if imm == 1 {
+                                            em.inc_rax();
+                                        } else if imm == -1 {
+                                            em.dec_rax();
+                                        } else if imm != 0 {
+                                            em.add_rax_imm32(imm);
+                                        }
+                                    }
+                                    BinOpKind::Mul => {
+                                        if imm == 0 {
+                                            em.xor_rax_rax();
+                                        } else if imm == 1 {
+                                        } else if imm == 3 {
+                                            em.lea_rax_rax_mul3();
+                                        } else if imm == 5 {
+                                            em.lea_rax_rax_mul5();
+                                        } else if imm == 9 {
+                                            em.lea_rax_rax_mul9();
+                                        } else if imm > 0 && (imm as u32).is_power_of_two() {
+                                            em.shl_rax_imm8((imm as u32).trailing_zeros() as u8);
+                                        } else {
+                                            em.imul_rax_imm32(imm);
+                                        }
+                                    }
+                                    BinOpKind::Sub => {
+                                        if imm == 1 {
+                                            em.dec_rax();
+                                        } else if imm == -1 {
+                                            em.inc_rax();
+                                        } else if imm != 0 {
+                                            em.sub_rax_imm32(imm);
+                                        }
+                                    }
+                                    BinOpKind::Eq => {
+                                        em.cmp_rax_imm32(imm);
+                                        em.setcc_al(0x94);
+                                        em.movzx_rax_al();
+                                    }
+                                    BinOpKind::Ne => {
+                                        em.cmp_rax_imm32(imm);
+                                        em.setcc_al(0x95);
+                                        em.movzx_rax_al();
+                                    }
+                                    BinOpKind::Lt => {
+                                        em.cmp_rax_imm32(imm);
+                                        em.setcc_al(0x9C);
+                                        em.movzx_rax_al();
+                                    }
+                                    BinOpKind::Le => {
+                                        em.cmp_rax_imm32(imm);
+                                        em.setcc_al(0x9E);
+                                        em.movzx_rax_al();
+                                    }
+                                    BinOpKind::Gt => {
+                                        em.cmp_rax_imm32(imm);
+                                        em.setcc_al(0x9F);
+                                        em.movzx_rax_al();
+                                    }
+                                    BinOpKind::Ge => {
+                                        em.cmp_rax_imm32(imm);
+                                        em.setcc_al(0x9D);
+                                        em.movzx_rax_al();
+                                    }
+                                    _ => {}
+                                }
+                                em.test_rax_rax();
+                                let disp_pos = if is_jump_true {
+                                    em.jnz_rel32_placeholder()
+                                } else {
+                                    em.jz_rel32_placeholder()
+                                };
+                                fixups.push((disp_pos, target));
+                                pc_to_off[pc + 1] = em.pos();
+                                pc_to_off[pc + 2] = em.pos();
+                                pc += 3;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Superinstruction fusion:
+        //   LoadI*/LoadBool/LoadUnit(tmp, c) ; JumpFalse/JumpTrue(tmp, off)
+        // =>
+        //   resolve branch at translation time, eliminating runtime condition checks.
+        if pc + 1 < compiled.instrs.len() {
+            let maybe_const = match &compiled.instrs[pc] {
+                Instr::LoadI32(tmp, v) => Some((*tmp, *v as i64)),
+                Instr::LoadI64(tmp, v) => Some((*tmp, *v)),
+                Instr::LoadBool(tmp, v) => Some((*tmp, i64::from(*v))),
+                Instr::LoadUnit(tmp) => Some((*tmp, 0)),
+                _ => None,
+            };
+            if let Some((tmp, c)) = maybe_const {
+                match &compiled.instrs[pc + 1] {
+                    Instr::JumpFalse(cond, off) if *cond == tmp => {
+                        let target = ((pc as i32) + 2 + *off) as usize;
+                        if target > compiled.instrs.len() {
+                            return None;
+                        }
+                        if c == 0 {
+                            let disp_pos = em.jmp_rel32_placeholder();
+                            fixups.push((disp_pos, target));
+                        }
+                    }
+                    Instr::JumpTrue(cond, off) if *cond == tmp => {
+                        let target = ((pc as i32) + 2 + *off) as usize;
+                        if target > compiled.instrs.len() {
+                            return None;
+                        }
+                        if c != 0 {
+                            let disp_pos = em.jmp_rel32_placeholder();
+                            fixups.push((disp_pos, target));
+                        }
+                    }
+                    _ => {}
+                }
+                let folded_branch = matches!(
+                    &compiled.instrs[pc + 1],
+                    Instr::JumpFalse(cond, _) if *cond == tmp
+                ) || matches!(
+                    &compiled.instrs[pc + 1],
+                    Instr::JumpTrue(cond, _) if *cond == tmp
+                );
+                if folded_branch {
+                    // Preserve old-pc targetability for branches.
+                    pc_to_off[pc + 1] = em.pos();
+                    pc += 2;
+                    continue;
+                }
+            }
+        }
+
+        // Superinstruction fusion:
+        //   LoadI32/LoadI64(tmp, c) ; BinOp(dst, op, x, tmp)
+        // =>
+        //   use immediate arithmetic/compare forms to avoid extra load/move.
+        if pc + 1 < compiled.instrs.len() {
+            let maybe_imm = match &compiled.instrs[pc] {
+                Instr::LoadI32(tmp, v) => Some((*tmp, *v as i64)),
+                Instr::LoadI64(tmp, v) => Some((*tmp, *v)),
+                _ => None,
+            };
+            if let Some((tmp, c)) = maybe_imm {
+                if let Instr::BinOp(dst, op, l, r) = &compiled.instrs[pc + 1] {
+                    if let Ok(imm) = i32::try_from(c) {
+                        let rhs_is_imm = *r == tmp;
+                        let lhs_is_imm = *l == tmp;
+                        let can_use = match op {
+                            BinOpKind::Add | BinOpKind::Mul => rhs_is_imm || lhs_is_imm,
+                            BinOpKind::Sub
+                            | BinOpKind::Eq
+                            | BinOpKind::Ne
+                            | BinOpKind::Lt
+                            | BinOpKind::Le
+                            | BinOpKind::Gt
+                            | BinOpKind::Ge => rhs_is_imm,
+                            _ => false,
+                        };
+                        if can_use {
+                            let live_reg = if rhs_is_imm { *l } else { *r };
+                            load_slot_rax(&mut em, live_reg);
+                            match op {
+                                BinOpKind::Add => {
+                                    if imm == 1 {
+                                        em.inc_rax();
+                                    } else if imm == -1 {
+                                        em.dec_rax();
+                                    } else if imm != 0 {
+                                        em.add_rax_imm32(imm);
+                                    }
+                                }
+                                BinOpKind::Mul => {
+                                    if imm == 0 {
+                                        em.xor_rax_rax();
+                                    } else if imm == 1 {
+                                        // no-op
+                                    } else if imm == 3 {
+                                        // Superoptimizer-selected sequence (shorter than imul imm32).
+                                        em.lea_rax_rax_mul3();
+                                    } else if imm == 5 {
+                                        // Superoptimizer-selected sequence (shorter than imul imm32).
+                                        em.lea_rax_rax_mul5();
+                                    } else if imm == 9 {
+                                        // Superoptimizer-selected sequence (shorter than imul imm32).
+                                        em.lea_rax_rax_mul9();
+                                    } else if imm > 0 && (imm as u32).is_power_of_two() {
+                                        em.shl_rax_imm8((imm as u32).trailing_zeros() as u8);
+                                    } else {
+                                        em.imul_rax_imm32(imm);
+                                    }
+                                }
+                                BinOpKind::Sub => {
+                                    if imm == 1 {
+                                        em.dec_rax();
+                                    } else if imm == -1 {
+                                        em.inc_rax();
+                                    } else if imm != 0 {
+                                        em.sub_rax_imm32(imm);
+                                    }
+                                }
+                                BinOpKind::Eq => {
+                                    em.cmp_rax_imm32(imm);
+                                    em.setcc_al(0x94);
+                                    em.movzx_rax_al();
+                                }
+                                BinOpKind::Ne => {
+                                    em.cmp_rax_imm32(imm);
+                                    em.setcc_al(0x95);
+                                    em.movzx_rax_al();
+                                }
+                                BinOpKind::Lt => {
+                                    em.cmp_rax_imm32(imm);
+                                    em.setcc_al(0x9C);
+                                    em.movzx_rax_al();
+                                }
+                                BinOpKind::Le => {
+                                    em.cmp_rax_imm32(imm);
+                                    em.setcc_al(0x9E);
+                                    em.movzx_rax_al();
+                                }
+                                BinOpKind::Gt => {
+                                    em.cmp_rax_imm32(imm);
+                                    em.setcc_al(0x9F);
+                                    em.movzx_rax_al();
+                                }
+                                BinOpKind::Ge => {
+                                    em.cmp_rax_imm32(imm);
+                                    em.setcc_al(0x9D);
+                                    em.movzx_rax_al();
+                                }
+                                _ => {}
+                            }
+                            store_rax_slot(&mut em, *dst);
+                            // Preserve old-pc targetability for branches.
+                            pc_to_off[pc + 1] = em.pos();
+                            pc += 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
 
         // Superinstruction fusion:
         //   BinOp(tmp, op, l, r) ; Store(slot, tmp)
@@ -348,6 +650,77 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
         }
 
+        // Superinstruction fusion:
+        //   BinOp(tmp, op, l, r) ; JumpTrue(tmp, off)
+        // =>
+        //   fused arithmetic/comparison + branch without temporary store/load.
+        if pc + 1 < compiled.instrs.len() {
+            if let (Instr::BinOp(tmp, op, l, r), Instr::JumpTrue(cond, off)) =
+                (&compiled.instrs[pc], &compiled.instrs[pc + 1])
+            {
+                if tmp == cond {
+                    let target = ((pc as i32) + 2 + *off) as usize;
+                    if target > compiled.instrs.len() {
+                        return None;
+                    }
+                    load_slot_rax(&mut em, *l);
+                    load_slot_rcx(&mut em, *r);
+                    match op {
+                        BinOpKind::Add => em.add_rax_rcx(),
+                        BinOpKind::Sub => em.sub_rax_rcx(),
+                        BinOpKind::Mul => em.imul_rax_rcx(),
+                        BinOpKind::Div => {
+                            em.cqo();
+                            em.idiv_rcx();
+                        }
+                        BinOpKind::Rem => {
+                            em.cqo();
+                            em.idiv_rcx();
+                            em.mov_rax_rdx();
+                        }
+                        BinOpKind::Eq => {
+                            em.cmp_rax_rcx();
+                            em.setcc_al(0x94);
+                            em.movzx_rax_al();
+                        }
+                        BinOpKind::Ne => {
+                            em.cmp_rax_rcx();
+                            em.setcc_al(0x95);
+                            em.movzx_rax_al();
+                        }
+                        BinOpKind::Lt => {
+                            em.cmp_rax_rcx();
+                            em.setcc_al(0x9C);
+                            em.movzx_rax_al();
+                        }
+                        BinOpKind::Le => {
+                            em.cmp_rax_rcx();
+                            em.setcc_al(0x9E);
+                            em.movzx_rax_al();
+                        }
+                        BinOpKind::Gt => {
+                            em.cmp_rax_rcx();
+                            em.setcc_al(0x9F);
+                            em.movzx_rax_al();
+                        }
+                        BinOpKind::Ge => {
+                            em.cmp_rax_rcx();
+                            em.setcc_al(0x9D);
+                            em.movzx_rax_al();
+                        }
+                        _ => return None,
+                    }
+                    em.test_rax_rax();
+                    let disp_pos = em.jnz_rel32_placeholder();
+                    fixups.push((disp_pos, target));
+                    // Preserve old-pc targetability for branches.
+                    pc_to_off[pc + 1] = em.pos();
+                    pc += 2;
+                    continue;
+                }
+            }
+        }
+
         match &compiled.instrs[pc] {
             Instr::LoadI32(d, v) => {
                 em.mov_rax_imm64(*v as i64);
@@ -404,6 +777,14 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 load_slot_rax(&mut em, *cond);
                 em.test_rax_rax();
                 let disp_pos = em.jz_rel32_placeholder();
+                fixups.push((disp_pos, target));
+            }
+            Instr::JumpTrue(cond, off) => {
+                let target = ((pc as i32) + 1 + *off) as usize;
+                if target > compiled.instrs.len() { return None; }
+                load_slot_rax(&mut em, *cond);
+                em.test_rax_rax();
+                let disp_pos = em.jnz_rel32_placeholder();
                 fixups.push((disp_pos, target));
             }
             Instr::Return(r) => {

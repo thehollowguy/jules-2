@@ -1,0 +1,4 @@
+[build]
+# Favor host-specific code generation for local performance benchmarking.
+# Override with `RUSTFLAGS` in CI/distribution builds when portability is required.
+rustflags = ["-C", "target-cpu=native"]

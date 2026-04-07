@@ -57,3 +57,14 @@ phase4-llvm = []
 phase5-cow = []
 phase6-simd = []
 full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "phase4-llvm", "phase5-cow", "phase6-simd"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false
+
+[profile.bench]
+inherits = "release"
