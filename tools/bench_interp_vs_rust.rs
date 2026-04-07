@@ -1,7 +1,9 @@
 use std::fs;
+use std::hint::black_box;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
+use std::time::SystemTime;
 
 use jules::{CompileUnit, Pipeline, PipelineResult};
 
@@ -19,21 +21,28 @@ fn main() {
         .unwrap_or(2_000_000);
     let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(15);
     let mode = parse_mode(args.get(3).map(String::as_str));
+    let mut seed: i64 = args
+        .get(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(default_seed);
     let samples: usize = 10;
 
-    println!("bench-interp-vs-rust n={n} iters={iters} mode={mode:?}");
+    println!("bench-interp-vs-rust n={n} iters={iters} mode={mode:?} seed={seed}");
 
     let jules_src = format!(
         r#"
 fn main() {{
-  let mut s = 0;
+  let mut s = {seed};
   let mut i = 0;
   while i < {n} {{
-    s = s + ((i * 1664525 + 1013904223) % 97);
+    s = ((s * 1664525 + (i * 1013904223) + math::rand_int(0, 97)) % 2147483647);
     i = i + 1;
   }}
+  return s;
 }}
-"#
+"#,
+        seed = seed,
+        n = n
     );
 
     // Jules compile benchmark (10 runs, averaged)
@@ -86,12 +95,26 @@ fn main() {{
     let mut interp = jules::interp::Interpreter::new();
     interp.load_program(&program.expect("program should exist"));
     let mut jules_runtime_s = 0.0f64;
+    let mut jules_checksum = 0i64;
     for _ in 0..samples {
         let run_start = Instant::now();
         for _ in 0..iters {
-            if let Err(e) = interp.call_fn("main", vec![]) {
-                eprintln!("runtime error: {}", e.message);
-                std::process::exit(1);
+            seed = next_seed(seed);
+            match interp.call_fn("main", vec![]) {
+                Ok(jules::interp::Value::I64(v)) => {
+                    jules_checksum = jules_checksum.wrapping_add(black_box(v));
+                }
+                Ok(jules::interp::Value::I32(v)) => {
+                    jules_checksum = jules_checksum.wrapping_add(black_box(v as i64));
+                }
+                Ok(v) => {
+                    eprintln!("unexpected return value from jules kernel: {v:?}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("runtime error: {}", e.message);
+                    std::process::exit(1);
+                }
             }
         }
         jules_runtime_s += run_start.elapsed().as_secs_f64();
@@ -104,7 +127,8 @@ fn main() {{
     for _ in 0..samples {
         let rust_runtime_start = Instant::now();
         for _ in 0..iters {
-            rust_checksum ^= rust_kernel(n);
+            seed = next_seed(seed);
+            rust_checksum = rust_checksum.wrapping_add(rust_kernel(n, seed));
         }
         rust_runtime_s += rust_runtime_start.elapsed().as_secs_f64();
     }
@@ -119,9 +143,10 @@ fn main() {{
         jules_compile_s / iters as f64
     );
     println!(
-        "Jules runtime(avg {samples}): {:.6}s total ({:.6}s/iter)",
+        "Jules runtime(avg {samples}): {:.6}s total ({:.6}s/iter) checksum={}",
         jules_runtime_s,
-        jules_runtime_s / iters as f64
+        jules_runtime_s / iters as f64,
+        jules_checksum
     );
     println!(
         "Rust runtime(avg {samples}): {:.6}s total ({:.6}s/iter) checksum={}",
@@ -151,12 +176,18 @@ fn parse_mode(raw: Option<&str>) -> BenchMode {
     }
 }
 
-fn rust_kernel(n: usize) -> i64 {
-    let mut s: i64 = 0;
-    for i in 0..n as i64 {
-        s += (i * 1_664_525 + 1_013_904_223) % 97;
+fn rust_kernel(n: usize, seed: i64) -> i64 {
+    let n = black_box(n as i64);
+    let mut s: i64 = black_box(seed);
+    for i in 0..n {
+        s = black_box(
+            s.wrapping_mul(1_664_525)
+                .wrapping_add(i.wrapping_mul(1_013_904_223))
+                .wrapping_add(97)
+                % 2_147_483_647,
+        );
     }
-    s
+    black_box(s)
 }
 
 fn rustc_compile_baseline(n: usize) -> Option<f64> {
@@ -168,14 +199,22 @@ fn rustc_compile_baseline(n: usize) -> Option<f64> {
     let src = format!(
         r#"
 #[inline(never)]
-fn kernel(n: usize) -> i64 {{
-    let mut s: i64 = 0;
+fn kernel(n: usize, seed: i64) -> i64 {{
+    let mut s: i64 = std::hint::black_box(seed);
     for i in 0..n as i64 {{
-        s += (i * 1_664_525 + 1_013_904_223) % 97;
+        s = std::hint::black_box(
+            s.wrapping_mul(1_664_525)
+                .wrapping_add(i.wrapping_mul(1_013_904_223))
+                .wrapping_add(97)
+                % 2_147_483_647
+        );
     }}
-    s
+    std::hint::black_box(s)
 }}
-fn main() {{ let _ = kernel({n}); }}
+fn main() {{
+    let seed = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+    println!("{{}}", kernel({n}, seed));
+}}
 "#
     );
     if fs::write(&src_path, src).is_err() {
@@ -200,4 +239,15 @@ fn main() {{ let _ = kernel({n}); }}
     } else {
         None
     }
+}
+
+fn next_seed(seed: i64) -> i64 {
+    seed.wrapping_mul(6364136223846793005_i64).wrapping_add(1)
+}
+
+fn default_seed() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(1)
 }

@@ -36,6 +36,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap; // retained for rolling const_prop state in codegen
+use std::ptr::NonNull;
 
 use libc::{mmap, munmap, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
 
@@ -54,18 +55,106 @@ pub struct NativeCode {
 struct ExecMem {
     ptr: *mut u8,
     len: usize,
+    arena_backed: bool,
+}
+
+struct ExecArena {
+    base: NonNull<u8>,
+    len: usize,
+    cursor: usize,
+}
+
+impl Drop for ExecArena {
+    fn drop(&mut self) {
+        unsafe { munmap(self.base.as_ptr().cast(), self.len) };
+    }
+}
+
+impl ExecArena {
+    const DEFAULT_LEN: usize = 16 * 1024 * 1024;
+
+    fn try_new() -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        let ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                Self::DEFAULT_LEN,
+                PROT_READ | PROT_WRITE | PROT_EXEC,
+                MAP_PRIVATE | MAP_ANON | libc::MAP_HUGETLB,
+                -1,
+                0,
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        let ptr = std::ptr::null_mut();
+
+        let ptr = if ptr.is_null() || ptr == libc::MAP_FAILED {
+            unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    Self::DEFAULT_LEN,
+                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                    MAP_PRIVATE | MAP_ANON,
+                    -1,
+                    0,
+                )
+            }
+        } else {
+            ptr
+        };
+        if ptr.is_null() || ptr == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Self {
+            base: NonNull::new(ptr.cast::<u8>())?,
+            len: Self::DEFAULT_LEN,
+            cursor: 0,
+        })
+    }
+
+    fn alloc(&mut self, bytes: usize) -> Option<*mut u8> {
+        let aligned = (bytes + 15) & !15;
+        let next = self.cursor.checked_add(aligned)?;
+        if next > self.len {
+            return None;
+        }
+        let out = unsafe { self.base.as_ptr().add(self.cursor) };
+        self.cursor = next;
+        Some(out)
+    }
 }
 
 impl Drop for ExecMem {
     fn drop(&mut self) {
-        if !self.ptr.is_null() && self.len > 0 {
+        if !self.arena_backed && !self.ptr.is_null() && self.len > 0 {
             unsafe { munmap(self.ptr.cast(), self.len) };
         }
     }
 }
 
+thread_local! {
+    static TLS_EXEC_ARENA: RefCell<Option<ExecArena>> = const { RefCell::new(None) };
+}
+
 impl ExecMem {
     fn new(code: &[u8]) -> Option<Self> {
+        if let Some(mem) = TLS_EXEC_ARENA.with(|arena_cell| {
+            let mut arena = arena_cell.borrow_mut();
+            if arena.is_none() {
+                *arena = ExecArena::try_new();
+            }
+            let arena = arena.as_mut()?;
+            let ptr = arena.alloc(code.len().max(1))?;
+            unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len()) };
+            Some(Self {
+                ptr,
+                len: code.len().max(1),
+                arena_backed: true,
+            })
+        }) {
+            return Some(mem);
+        }
+
         let len = code.len().max(1);
         let ptr = unsafe {
             mmap(
@@ -878,7 +967,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     }
 
     // Gate: bail out early if any instruction is outside our supported set.
-    for instr in &compiled.instrs {
+    for instr in &optimized_instrs {
         match instr {
             Instr::LoadI32(..)
             | Instr::LoadI64(..)
