@@ -35,7 +35,7 @@
 //!    INC/DEC for ±1, TEST+Jcc, SETCC for branchless comparisons.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::HashMap; // retained for rolling const_prop state in codegen
 
 use libc::{mmap, munmap, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
 
@@ -243,7 +243,7 @@ const ALLOC_POOL: &[u8] = &[
     12, 13, 14, 15, 3, // r12-r15, rbx (callee-saved — require push/pop)
 ];
 
-const CALLEE_SAVED_IN_POOL: &[u8] = &[12, 13, 14, 15, 3];
+/// Callee-saved regs in the pool — checked inline via matches!() in linear_scan.
 
 /// Where a bytecode slot lives at runtime.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -253,15 +253,18 @@ enum RegLoc {
 }
 
 struct RegAlloc {
-    map: HashMap<u16, RegLoc>,
+    /// Direct Vec indexed by slot number; pre-filled with Spill defaults.
+    /// O(1) lookup vs HashMap for every load/store in the hot codegen loop.
+    slots: Vec<RegLoc>,
     /// Callee-saved registers actually used — must be pushed in prologue.
     used_callee_saved: Vec<u8>,
 }
 
 impl RegAlloc {
+    #[inline(always)]
     fn location(&self, slot: u16) -> RegLoc {
-        self.map.get(&slot).copied()
-            .unwrap_or(RegLoc::Spill((slot as i32) * 8))
+        // Safety: slots is pre-allocated to cover all valid slot indices.
+        unsafe { *self.slots.get_unchecked(slot as usize) }
     }
 }
 
@@ -273,13 +276,16 @@ struct LiveInterval {
     last:  usize, // index of last instruction that uses this slot
 }
 
-fn compute_live_intervals(instrs: &[Instr]) -> Vec<LiveInterval> {
-    let mut first_def: HashMap<u16, usize> = HashMap::new();
-    let mut last_use:  HashMap<u16, usize> = HashMap::new();
+fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterval> {
+    const UNDEF: usize = usize::MAX;
+    let cap = slot_count + 1;
+    let mut first_def = vec![UNDEF; cap];
+    let mut last_use  = vec![UNDEF; cap];
 
-    // Register a definition (first occurrence only) and a use (always latest).
-    macro_rules! def { ($s:expr, $pc:expr) => { first_def.entry($s).or_insert($pc); }; }
-    macro_rules! use_{ ($s:expr, $pc:expr) => { last_use.insert($s, $pc); }; }
+    // Ensure slot fits in our vecs; grow if needed (shouldn't happen with correct slot_count).
+    macro_rules! ensure { ($s:expr) => { let s = $s as usize; if s >= first_def.len() { first_def.resize(s+1, UNDEF); last_use.resize(s+1, UNDEF); } }; }
+    macro_rules! def  { ($s:expr, $pc:expr) => { ensure!($s); let s=$s as usize; if first_def[s]==UNDEF { first_def[s]=$pc; } }; }
+    macro_rules! use_ { ($s:expr, $pc:expr) => { ensure!($s); last_use[$s as usize]=$pc; }; }
 
     for (pc, instr) in instrs.iter().enumerate() {
         match instr {
@@ -294,77 +300,97 @@ fn compute_live_intervals(instrs: &[Instr]) -> Vec<LiveInterval> {
         }
     }
 
-    // Slots that appear only as uses (never defined in bytecode) are argument
-    // slots — treat them as defined at pc=0 so they get a register at entry.
-    for (&slot, &last) in &last_use {
-        first_def.entry(slot).or_insert(0);
-        let _ = last;
+    // Slots that appear only as uses (never defined) are argument slots — treat as defined at 0.
+    let mut intervals: Vec<LiveInterval> = Vec::new();
+    for slot in 0..first_def.len() {
+        let lu = last_use[slot];
+        let fd = first_def[slot];
+        if fd == UNDEF && lu == UNDEF { continue; }
+        let first = if fd == UNDEF { 0 } else { fd };
+        let last  = if lu == UNDEF { first } else { lu };
+        intervals.push(LiveInterval { slot: slot as u16, first, last });
     }
-
-    let mut intervals: Vec<LiveInterval> = first_def.into_iter().map(|(slot, first)| {
-        let last = last_use.get(&slot).copied().unwrap_or(first);
-        LiveInterval { slot, first, last }
-    }).collect();
     intervals.sort_unstable_by_key(|i| (i.first, i.slot));
     intervals
 }
 
 // ── Linear-scan allocator ─────────────────────────────────────────────────────
 
-fn linear_scan(intervals: &[LiveInterval], slot_offsets: &[i32]) -> RegAlloc {
-    let spill_off = |slot: u16| -> i32 {
-        slot_offsets.get(slot as usize).copied().unwrap_or((slot as i32) * 8)
+fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
+    // Pre-fill slots with their default Spill locations (slot * 8 offset).
+    let cap = slot_count + 1;
+    let mut slots: Vec<RegLoc> = (0..cap)
+        .map(|s| RegLoc::Spill((s as i32) * 8))
+        .collect();
+
+    // Grow helper in case any slot exceeds slot_count (shouldn't happen normally).
+    let ensure_slot = |slots: &mut Vec<RegLoc>, slot: u16| {
+        let idx = slot as usize;
+        if idx >= slots.len() {
+            slots.resize(idx + 1, RegLoc::Spill((idx as i32) * 8));
+        }
     };
 
     // Free list: iterate ALLOC_POOL in reverse so pop() gives caller-saved first.
     let mut free: Vec<u8> = ALLOC_POOL.iter().rev().copied().collect();
-    // Active set sorted by interval end (ascending) for O(n) expire passes.
+    // Active set sorted by interval end (ascending).
     let mut active: Vec<(usize, u16, u8)> = Vec::new(); // (end, slot, reg)
-    let mut map: HashMap<u16, RegLoc> = HashMap::new();
     let mut used_callee_saved: Vec<u8> = Vec::new();
+    // Bitmask to avoid O(n) contains() on used_callee_saved (regs 0-15 fit in u16).
+    let mut callee_saved_mask: u16 = 0;
+
+    #[inline(always)]
+    fn is_callee_saved(reg: u8) -> bool { matches!(reg, 3 | 12..=15) }
 
     for iv in intervals {
-        // Expire intervals that ended strictly before this one starts.
-        {
-            let mut freed_regs = Vec::new();
-            active.retain(|(end, _, reg)| {
-                if *end < iv.first { freed_regs.push(*reg); false } else { true }
-            });
-            for r in freed_regs { free.push(r); }
+        // Expire intervals ended strictly before this one's start — no temp Vec needed.
+        let mut freed_count = 0usize;
+        let active_len = active.len();
+        for i in 0..active_len {
+            if active[i].0 < iv.first {
+                free.push(active[i].2);
+                freed_count += 1;
+            }
+        }
+        if freed_count > 0 {
+            // Partition: keep entries where end >= iv.first.
+            active.retain(|(end, _, _)| *end >= iv.first);
         }
 
-        if let Some(reg) = free.pop() {
-            if CALLEE_SAVED_IN_POOL.contains(&reg) && !used_callee_saved.contains(&reg) {
+        let mut track_callee = |reg: u8| {
+            if is_callee_saved(reg) && (callee_saved_mask & (1u16 << reg)) == 0 {
+                callee_saved_mask |= 1u16 << reg;
                 used_callee_saved.push(reg);
             }
-            map.insert(iv.slot, RegLoc::Reg(reg));
-            // Insert keeping active sorted by end ascending.
+        };
+
+        if let Some(reg) = free.pop() {
+            track_callee(reg);
+            ensure_slot(&mut slots, iv.slot);
+            slots[iv.slot as usize] = RegLoc::Reg(reg);
             let pos = active.partition_point(|(e, _, _)| *e <= iv.last);
             active.insert(pos, (iv.last, iv.slot, reg));
         } else {
-            // Spill decision: evict the interval with the latest end if it
-            // ends later than the current one (standard linear-scan heuristic).
             match active.last().copied() {
                 Some((end, spill_slot, reg)) if end > iv.last => {
-                    map.insert(spill_slot, RegLoc::Spill(spill_off(spill_slot)));
+                    ensure_slot(&mut slots, spill_slot);
+                    slots[spill_slot as usize] = RegLoc::Spill((spill_slot as i32) * 8);
                     active.pop();
-                    if CALLEE_SAVED_IN_POOL.contains(&reg) && !used_callee_saved.contains(&reg) {
-                        used_callee_saved.push(reg);
-                    }
-                    map.insert(iv.slot, RegLoc::Reg(reg));
+                    track_callee(reg);
+                    ensure_slot(&mut slots, iv.slot);
+                    slots[iv.slot as usize] = RegLoc::Reg(reg);
                     let pos = active.partition_point(|(e, _, _)| *e <= iv.last);
                     active.insert(pos, (iv.last, iv.slot, reg));
                 }
                 _ => {
-                    // All active intervals end before/at us, or there are none —
-                    // just spill the current interval.
-                    map.insert(iv.slot, RegLoc::Spill(spill_off(iv.slot)));
+                    ensure_slot(&mut slots, iv.slot);
+                    // Already pre-filled with Spill; nothing to do.
                 }
             }
         }
     }
 
-    RegAlloc { map, used_callee_saved }
+    RegAlloc { slots, used_callee_saved }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -388,42 +414,9 @@ fn fold_binop(op: BinOpKind, l: i64, r: i64) -> Option<i64> {
     })
 }
 
-/// Forward constant-propagation pass.
-///
-/// Returns one `HashMap<slot, const_value>` *per instruction* representing
-/// the known constant state **before** that instruction executes.
-/// At every branch the state is conservatively cleared (no per-edge tracking).
-fn const_prop(instrs: &[Instr]) -> Vec<HashMap<u16, i64>> {
-    let n = instrs.len();
-    let mut states: Vec<HashMap<u16, i64>> = vec![HashMap::new(); n + 1];
-
-    for (pc, instr) in instrs.iter().enumerate() {
-        let mut s = states[pc].clone();
-        match instr {
-            Instr::LoadI32(d, v)  => { s.insert(*d, *v as i64); }
-            Instr::LoadI64(d, v)  => { s.insert(*d, *v); }
-            Instr::LoadBool(d, v) => { s.insert(*d, i64::from(*v)); }
-            Instr::LoadUnit(d)    => { s.insert(*d, 0); }
-            Instr::Move(d, src) | Instr::Load(d, src) => {
-                if let Some(&c) = s.get(src) { s.insert(*d, c); } else { s.remove(d); }
-            }
-            Instr::Store(slot, src) => {
-                if let Some(&c) = s.get(src) { s.insert(*slot, c); } else { s.remove(slot); }
-            }
-            Instr::BinOp(d, op, l, r) => {
-                let v = s.get(l).copied().zip(s.get(r).copied())
-                    .and_then(|(lv, rv)| fold_binop(*op, lv, rv));
-                match v { Some(c) => { s.insert(*d, c); } None => { s.remove(d); } }
-            }
-            // Conservative: clear everything at branches (could be jumped to from
-            // anywhere with unknown slot values).
-            Instr::Jump(_) | Instr::JumpFalse(_, _) | Instr::JumpTrue(_, _) => { s.clear(); }
-            _ => {}
-        }
-        states[pc + 1] = s;
-    }
-    states
-}
+// (Constant propagation is now maintained as a rolling inline state
+//  in the main codegen loop — see `const_at` in `translate`. This
+//  eliminates O(n) HashMap clones that the old pre-pass required.)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Emission helpers
@@ -454,6 +447,7 @@ fn store_rax(em: &mut Emitter, slot: u16, ra: &RegAlloc) {
 }
 
 /// Returns true when `op` is in the set we know how to emit.
+#[inline(always)]
 fn is_supported_binop(op: BinOpKind) -> bool {
     matches!(
         op,
@@ -555,14 +549,13 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     }
 
     let instrs        = &compiled.instrs;
-    let slot_offsets: Vec<i32> = (0..=compiled.slot_count).map(|s| (s as i32) * 8).collect();
+    let slot_count    = compiled.slot_count as usize;
 
-    // ── Pass 1: constant propagation ──────────────────────────────────────
-    let const_states = const_prop(instrs);
-
-    // ── Pass 2: liveness + linear-scan register allocation ───────────────
-    let intervals = compute_live_intervals(instrs);
-    let ra        = linear_scan(&intervals, &slot_offsets);
+    // ── Pass 1: liveness + linear-scan register allocation ───────────────
+    // (const_prop state is maintained inline in the codegen loop below,
+    //  eliminating the O(n) HashMap-clone pre-pass entirely.)
+    let intervals = compute_live_intervals(instrs, slot_count);
+    let ra        = linear_scan(&intervals, slot_count);
 
     // ── Emission ──────────────────────────────────────────────────────────
     let mut em         = Emitter::new();
@@ -579,13 +572,13 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // load zero (execute() zeroes the array) which is overwritten before first use.
     // Tracks by register so each physical register is loaded exactly once.
     {
-        let mut preloaded: std::collections::HashSet<u8> = std::collections::HashSet::new();
+        let mut preloaded: u32 = 0u32; // bitmask for regs 0-31
         for iv in &intervals {
             if let RegLoc::Reg(r) = ra.location(iv.slot) {
-                if preloaded.insert(r) {
-                    let off = slot_offsets.get(iv.slot as usize)
-                        .copied()
-                        .unwrap_or((iv.slot as i32) * 8);
+                let bit = 1u32 << r;
+                if preloaded & bit == 0 {
+                    preloaded |= bit;
+                    let off = (iv.slot as i32) * 8;
                     em.load_reg_mem(r, off);
                 }
             }
@@ -593,11 +586,12 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     }
 
     // ── Main translation loop ─────────────────────────────────────────────
+    // Inline constant-propagation state: avoids pre-allocating O(n) HashMaps.
+    let mut const_at: HashMap<u16, i64> = HashMap::new();
 
     let mut pc = 0usize;
     while pc < instrs.len() {
         pc_to_off[pc] = em.pos();
-        let const_at = &const_states[pc];
 
         // ════════════════════════════════════════════════════════════════════
         // 3-INSTRUCTION FUSIONS
@@ -826,6 +820,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             {
                 em.mov_rax_imm_opt(v);
                 store_rax(&mut em, *d, &ra);
+                const_at.insert(*d, v);
                 pc += 1;
                 continue;
             }
@@ -837,28 +832,36 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
         match &instrs[pc] {
             Instr::LoadI32(d, v) => {
-                em.mov_rax_imm_opt(*v as i64);
+                let cv = *v as i64;
+                em.mov_rax_imm_opt(cv);
                 store_rax(&mut em, *d, &ra);
+                const_at.insert(*d, cv);
             }
             Instr::LoadI64(d, v) => {
                 em.mov_rax_imm_opt(*v);
                 store_rax(&mut em, *d, &ra);
+                const_at.insert(*d, *v);
             }
             Instr::LoadBool(d, v) => {
-                em.mov_rax_imm_opt(i64::from(*v));
+                let cv = i64::from(*v);
+                em.mov_rax_imm_opt(cv);
                 store_rax(&mut em, *d, &ra);
+                const_at.insert(*d, cv);
             }
             Instr::LoadUnit(d) => {
                 em.xor_rax_rax();
                 store_rax(&mut em, *d, &ra);
+                const_at.insert(*d, 0);
             }
             Instr::Move(d, s) | Instr::Load(d, s) => {
                 load_rax(&mut em, *s, &ra);
                 store_rax(&mut em, *d, &ra);
+                if let Some(&c) = const_at.get(s).map(|c| c) { const_at.insert(*d, c); } else { const_at.remove(d); }
             }
             Instr::Store(slot, s) => {
                 load_rax(&mut em, *s, &ra);
                 store_rax(&mut em, *slot, &ra);
+                if let Some(&c) = const_at.get(s) { const_at.insert(*slot, c); } else { const_at.remove(slot); }
             }
             Instr::BinOp(d, op, l, r) => {
                 if !is_supported_binop(*op) { return None; }
@@ -866,12 +869,16 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 load_rcx(&mut em, *r, &ra);
                 emit_binop_rax_rcx(&mut em, *op);
                 store_rax(&mut em, *d, &ra);
+                let folded = const_at.get(l).copied().zip(const_at.get(r).copied())
+                    .and_then(|(lv, rv)| fold_binop(*op, lv, rv));
+                match folded { Some(c) => { const_at.insert(*d, c); } None => { const_at.remove(d); } }
             }
             Instr::Jump(off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
                 if target > instrs.len() { return None; }
                 let p = em.jmp_rel32_placeholder();
                 fixups.push((p, target));
+                const_at.clear(); // conservative: branch target may have unknown state
             }
             Instr::JumpFalse(cond, off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
@@ -880,6 +887,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 em.test_rax_rax();
                 let p = em.jz_rel32_placeholder();
                 fixups.push((p, target));
+                const_at.clear();
             }
             Instr::JumpTrue(cond, off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
@@ -888,6 +896,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 em.test_rax_rax();
                 let p = em.jnz_rel32_placeholder();
                 fixups.push((p, target));
+                const_at.clear();
             }
             Instr::Return(r) => {
                 load_rax(&mut em, *r, &ra);
