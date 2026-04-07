@@ -34,8 +34,6 @@ It covers runtime, compiler/JIT, ML kernels, memory behavior, and benchmark tool
   - Eliminates temporary slot roundtrip before branch.
 - `LoadI32/LoadI64(tmp, c)` + `BinOp(dst, op, x, tmp)` fusion:
   - Uses immediate arithmetic/compare opcodes directly.
-- `LoadI32/LoadI64(tmp, c)` + `BinOp(mid, op, x, tmp)` + `JumpFalse/JumpTrue(mid, off)` fusion:
-  - Eliminates temporary materialization and fuses compute+branch in one lowered sequence.
 - `LoadI*/LoadBool/LoadUnit(tmp, c)` + `JumpFalse(tmp, off)`:
   - Branch resolved at translation time.
   - Emits unconditional jump only when needed; otherwise branch is removed.
