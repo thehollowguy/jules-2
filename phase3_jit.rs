@@ -1,5 +1,4 @@
-//! JIT backend — maximum-performance x86-64 machine-code generator.
-//!
+//! JIT backend 
 //! # Performance model
 //!
 //! Every optimization targets one of three front-end/back-end bottlenecks:
