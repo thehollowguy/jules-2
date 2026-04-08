@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
 // Module declarations for the Jules compiler/interpreter.
 // In this repository layout the source files live in the crate root.
 mod ast;

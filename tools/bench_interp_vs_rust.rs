@@ -98,6 +98,7 @@ fn bench() -> i32 {{
     interp.set_jit_enabled(using_jit);
     interp.set_advance_jit_enabled(using_jit);
     interp.load_program(&program.expect("program should exist"));
+    interp.reset_jit_counters();
     let mut check_jules = match interp.call_fn("bench", vec![]) {
         Ok(jules::interp::Value::I64(v)) => v,
         Ok(jules::interp::Value::I32(v)) => v as i64,
@@ -164,6 +165,16 @@ fn bench() -> i32 {{
         jules_runtime_s += run_start.elapsed().as_secs_f64();
     }
     jules_runtime_s /= samples as f64;
+    let (jit_native_calls, jit_vm_calls, jit_fallback_calls) = interp.jit_counters();
+    let effective_mode = if !using_jit {
+        "interp"
+    } else if jit_native_calls > 0 {
+        "JIT-native"
+    } else if jit_vm_calls > 0 {
+        "JIT-vm"
+    } else {
+        "interp-fallback"
+    };
 
     // Rust runtime baseline
     let mut rust_runtime_s = 0.0f64;
@@ -186,8 +197,8 @@ fn bench() -> i32 {{
         jules_compile_s / iters as f64
     );
     println!(
-        "Jules runtime {}(avg {samples}): {:.6}s total ({:.6}s/iter) checksum={}",
-        if using_jit { "[JIT]" } else { "[interp]" },
+        "Jules runtime [{}](avg {samples}): {:.6}s total ({:.6}s/iter) checksum={}",
+        effective_mode,
         jules_runtime_s,
         jules_runtime_s / iters as f64,
         jules_checksum
@@ -209,8 +220,14 @@ fn bench() -> i32 {{
     }
     println!(
         "Runtime ratio (Jules {} / Rust native): {:.2}x",
-        if using_jit { "JIT" } else { "interp" },
+        effective_mode,
         jules_runtime_s / rust_runtime_s.max(1e-9)
+    );
+    println!(
+        "JIT counters: native={} vm={} fallback={}",
+        jit_native_calls,
+        jit_vm_calls,
+        jit_fallback_calls
     );
 }
 

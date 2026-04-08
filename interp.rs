@@ -148,9 +148,6 @@
     clippy::large_enum_variant,
     clippy::too_many_arguments
 )]
-#![feature(core_intrinsics)]
-#![feature(maybe_uninit_uninit_array)]
-#![feature(maybe_uninit_slice)]
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -165,12 +162,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 // ── Branch prediction hints using compiler intrinsics ─────────────────────────
 #[inline(always)]
 fn likely(b: bool) -> bool {
-    unsafe { std::intrinsics::likely(b) }
+    b
 }
 
 #[inline(always)]
 fn unlikely(b: bool) -> bool {
-    unsafe { std::intrinsics::unlikely(b) }
+    b
 }
 
 // ── Cache-line padding to prevent false sharing ───────────────────────────────
@@ -2660,10 +2657,12 @@ impl EcsWorld {
                 let dmg_ptr = damage_set.dense_vals.as_ptr();
 
                 // Prefetch data for next iteration
-                _mm_prefetch(pos_ptr as *const i8, _MM_HINT_T0);
-                _mm_prefetch(vel_ptr as *const i8, _MM_HINT_T0);
-                _mm_prefetch(hp_ptr as *const i8, _MM_HINT_T0);
-                _mm_prefetch(dmg_ptr as *const i8, _MM_HINT_T0);
+                unsafe {
+                    _mm_prefetch(pos_ptr as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(vel_ptr as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(hp_ptr as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(dmg_ptr as *const i8, _MM_HINT_T0);
+                }
 
                 let mut i = 0usize;
                 while unlikely(i + 7 < chunk.len()) {
@@ -3619,15 +3618,39 @@ impl Compiler {
     /// Compile a block, returning the register holding the tail value.
     fn compile_block(&mut self, block: &Block, dst: u16) {
         self.push_scope();
-        for stmt in &block.stmts {
-            self.compile_stmt(stmt);
-            // If stmt itself ends in Return/Break/Continue we can stop.
-        }
+
+        // Prefer explicit AST tail when present.
         if let Some(tail) = &block.tail {
+            for stmt in &block.stmts {
+                self.compile_stmt(stmt);
+            }
             self.compile_expr_into(tail, dst);
-        } else {
-            self.emit(Instr::LoadUnit(dst));
+            self.pop_scope();
+            return;
         }
+
+        // Some parser/lowering paths keep the final value-producing expression
+        // as `Stmt::Expr { has_semi: false }` instead of filling `block.tail`.
+        // Preserve implicit return semantics for VM/JIT by compiling that final
+        // expression into `dst` rather than discarding it.
+        if let Some((last, rest)) = block.stmts.split_last() {
+            for stmt in rest {
+                self.compile_stmt(stmt);
+            }
+            if let Stmt::Expr {
+                expr,
+                has_semi: false,
+                ..
+            } = last
+            {
+                self.compile_expr_into(expr, dst);
+                self.pop_scope();
+                return;
+            }
+            self.compile_stmt(last);
+        }
+
+        self.emit(Instr::LoadUnit(dst));
         self.pop_scope();
     }
 
@@ -4102,6 +4125,69 @@ pub fn compile_fn(decl: &FnDecl) -> CompiledFn {
     c.finish(decl.name.clone(), param_count)
 }
 
+fn compiled_fn_is_structurally_valid(func: &CompiledFn, expects_non_unit: bool) -> bool {
+    if func.instrs.is_empty() {
+        return false;
+    }
+
+    let mut has_any_return = false;
+    let mut has_value_return = false;
+    for (idx, instr) in func.instrs.iter().enumerate() {
+        match instr {
+            Instr::Return(_) => {
+                has_any_return = true;
+                has_value_return = true;
+            }
+            Instr::ReturnUnit => {
+                has_any_return = true;
+            }
+            Instr::Jump(off) => {
+                let target = idx as i32 + 1 + *off;
+                if target < 0 || target as usize >= func.instrs.len() {
+                    return false;
+                }
+            }
+            Instr::JumpFalse(_, off) | Instr::JumpTrue(_, off) => {
+                let target = idx as i32 + 1 + *off;
+                if target < 0 || target as usize >= func.instrs.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    has_any_return && (!expects_non_unit || has_value_return)
+}
+
+fn maybe_superoptimize(compiled: &mut CompiledFn, expects_non_unit: bool, max_instr: usize) {
+    if !compiled.vm_supported || compiled.instrs.len() > max_instr {
+        return;
+    }
+    let cfg = SuperoptConfig {
+        run_stoke: compiled.instrs.len() >= 4,
+        stoke_budget: if compiled.instrs.len() < 8 {
+            50_000
+        } else if compiled.instrs.len() < 40 {
+            100_000
+        } else {
+            200_000
+        },
+        ..SuperoptConfig::default()
+    };
+
+    let mut candidate = compiled.clone();
+    superoptimize_fn(&mut candidate, &cfg);
+    if compiled_fn_is_structurally_valid(&candidate, expects_non_unit) {
+        *compiled = candidate;
+    } else if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+        eprintln!(
+            "[jit-debug] rejected superoptimized `{}` due to invalid control-flow/return shape",
+            compiled.name
+        );
+    }
+}
+
 // ── Shorthand runtime error macro ────────────────────────────────────────────
 macro_rules! rt_err {
     ($msg:expr) => { Err(RuntimeError::new($msg)) };
@@ -4158,17 +4244,17 @@ impl Drop for VmRegsGuard {
 pub fn vm_exec(
     interp: &mut Interpreter,
     func: &CompiledFn,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> Result<Value, RuntimeError> {
     let reg_len = func.slot_count as usize + 32;
     let mut regs_guard = VmRegsGuard::new(reg_len);
     let regs = regs_guard.regs_mut();
 
     // Load arguments.
-    for (i, arg) in args.into_iter().enumerate() {
+    for (i, arg) in args.iter().enumerate() {
         if i < reg_len {
             // SAFETY: `i < reg_len == regs.len()` guarded above.
-            unsafe { *regs.get_unchecked_mut(i) = arg };
+            unsafe { *regs.get_unchecked_mut(i) = arg.clone() };
         }
     }
 
@@ -7476,6 +7562,13 @@ pub struct Interpreter {
     jit_enabled: bool,
     /// If enabled, compile all top-level functions at load time to remove first-call latency.
     advance_jit_enabled: bool,
+    /// Lightweight JIT dispatch counters for benchmark/debug visibility.
+    jit_native_calls: u64,
+    jit_vm_calls: u64,
+    jit_fallback_calls: u64,
+    fn_call_counts: FxHashMap<String, u64>,
+    jit_hot_threshold: u64,
+    jit_superopt_max_instr: usize,
     // ── Inline caches for hot path optimization ───────────────────────────────
     /// Polymorphic inline cache for field lookups (struct/entity component access)
     field_cache: CachePadded<PolymorphicInlineCache>,
@@ -7518,6 +7611,12 @@ impl Interpreter {
             runtime_profile: FxHashMap::default(),
             jit_enabled: true,
             advance_jit_enabled: true,
+            jit_native_calls: 0,
+            jit_vm_calls: 0,
+            jit_fallback_calls: 0,
+            fn_call_counts: FxHashMap::default(),
+            jit_hot_threshold: std::env::var("JULES_JIT_HOT_THRESHOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+            jit_superopt_max_instr: std::env::var("JULES_JIT_SUPEROPT_MAX_INSTR").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
             // Initialize inline caches with cache-line padding to prevent false sharing
             field_cache: CachePadded::new(PolymorphicInlineCache::new()),
             method_cache: CachePadded::new(PolymorphicInlineCache::new()),
@@ -7547,6 +7646,7 @@ impl Interpreter {
         self.jit_enabled = enabled;
         if !enabled {
             self.compiled_fns.clear();
+            self.fn_call_counts.clear();
             #[cfg(feature = "phase3-jit")]
             self.native_fns.clear();
         }
@@ -7557,8 +7657,22 @@ impl Interpreter {
         self.advance_jit_enabled = enabled;
     }
 
+    pub fn reset_jit_counters(&mut self) {
+        self.jit_native_calls = 0;
+        self.jit_vm_calls = 0;
+        self.jit_fallback_calls = 0;
+        self.fn_call_counts.clear();
+    }
+
+    pub fn jit_counters(&self) -> (u64, u64, u64) {
+        (self.jit_native_calls, self.jit_vm_calls, self.jit_fallback_calls)
+    }
+
     fn precompile_loaded_functions(&mut self) {
         if !self.jit_enabled || !self.advance_jit_enabled {
+            return;
+        }
+        if self.jit_hot_threshold > 1 {
             return;
         }
         let names: Vec<String> = self.fns.keys().cloned().collect();
@@ -7571,14 +7685,7 @@ impl Interpreter {
                 // ── Research-grade superoptimizer ─────────────────────────────
                 // Run on all VM-supported functions. Use a lighter STOKE budget
                 // for trivial functions (< 4 instrs) and heavier for larger ones.
-                if compiled.vm_supported {
-                    let cfg = SuperoptConfig {
-                        run_stoke: compiled.instrs.len() >= 4,
-                        stoke_budget: if compiled.instrs.len() < 8 { 50_000 } else if compiled.instrs.len() < 40 { 100_000 } else { 200_000 },
-                        ..SuperoptConfig::default()
-                    };
-                    superoptimize_fn(&mut compiled, &cfg);
-                }
+                maybe_superoptimize(&mut compiled, closure.decl.ret_ty.is_some(), self.jit_superopt_max_instr);
                 self.compiled_fns.insert(name, Arc::new(compiled));
             }
         }
@@ -7649,55 +7756,89 @@ impl Interpreter {
             .get(name)
             .cloned()
             .ok_or_else(|| RuntimeError::new(format!("undefined function `{name}`")))?;
+        let expects_non_unit = closure.decl.ret_ty.is_some();
+
+        let call_count = {
+            let entry = self.fn_call_counts.entry(name.to_owned()).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+        let jit_hot = call_count >= self.jit_hot_threshold.max(1);
 
         // ── Bytecode fast path ────────────────────────────────────────────────
-        if self.jit_enabled {
+        if self.jit_enabled && jit_hot {
             // Compile and cache once, then reuse by direct hash lookup.
             let compiled = self
                 .compiled_fns
                 .entry(name.to_owned())
                 .or_insert_with(|| {
                     let mut compiled = compile_fn(&closure.decl);
-                    if compiled.vm_supported {
-                        let cfg = SuperoptConfig {
-                            run_stoke: compiled.instrs.len() >= 4,
-                            stoke_budget: if compiled.instrs.len() < 8 { 50_000 } else if compiled.instrs.len() < 40 { 100_000 } else { 200_000 },
-                            ..SuperoptConfig::default()
-                        };
-                        superoptimize_fn(&mut compiled, &cfg);
-                    }
+                    maybe_superoptimize(&mut compiled, closure.decl.ret_ty.is_some(), self.jit_superopt_max_instr);
                     Arc::new(compiled)
                 })
                 .clone();
             #[cfg(feature = "phase3-jit")]
             {
-                if let Some(native) = self.native_fns.get(name).cloned() {
-                    if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
-                        return Ok(v);
+                let native_enabled = std::env::var_os("JULES_ENABLE_NATIVE_JIT").is_some();
+                if native_enabled {
+                    if let Some(native) = self.native_fns.get(name).cloned() {
+                        if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
+                            if !matches!(v, Value::Unit) || !expects_non_unit {
+                                self.jit_native_calls = self.jit_native_calls.saturating_add(1);
+                                return Ok(v);
+                            }
+                            if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+                                eprintln!("[jit-debug] native path returned Unit for `{name}`, falling back");
+                            }
+                        }
+                    } else if let Some(native) = crate::phase3_jit::translate(&compiled) {
+                        let native = Arc::new(native);
+                        self.native_fns.insert(name.to_owned(), native.clone());
+                        if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
+                            if !matches!(v, Value::Unit) || !expects_non_unit {
+                                self.jit_native_calls = self.jit_native_calls.saturating_add(1);
+                                return Ok(v);
+                            }
+                            if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+                                eprintln!("[jit-debug] native path returned Unit for `{name}`, falling back");
+                            }
+                        }
                     }
-                } else if let Some(native) = crate::phase3_jit::translate(&compiled) {
-                    let native = Arc::new(native);
-                    self.native_fns.insert(name.to_owned(), native.clone());
-                    if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
-                        return Ok(v);
-                    }
+                } else if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+                    eprintln!("[jit-debug] native JIT disabled (set JULES_ENABLE_NATIVE_JIT=1 to enable)");
                 }
             }
 
             // If lowering is lossless and arg count matches expectation, run the VM.
+            if !compiled.vm_supported && std::env::var_os("JULES_JIT_DEBUG").is_some() {
+                eprintln!(
+                    "[jit-debug] `{name}` is not VM-lowerable; reasons={:?}; using tree-walker fallback",
+                    compiled.unsupported_features
+                );
+            }
             if compiled.vm_supported
                 && closure.capture.is_empty()
                 && args.len() == closure.decl.params.len()
             {
-                let result = vm_exec(self, &compiled, args).map(|r| match r {
+                let result = vm_exec(self, &compiled, &args).map(|r| match r {
                     Value::Return(v) => *v,
                     other => other,
-                });
-                return result;
+                })?;
+                if !matches!(result, Value::Unit) || !expects_non_unit {
+                    self.jit_vm_calls = self.jit_vm_calls.saturating_add(1);
+                    return Ok(result);
+                }
+                if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+                    eprintln!("[jit-debug] VM path returned Unit for `{name}`, falling back to tree-walker");
+                }
             }
         }
 
         // ── Fallback: tree-walker (captures, mismatched args, etc.) ──────────
+        if self.jit_enabled && !jit_hot && std::env::var_os("JULES_JIT_DEBUG").is_some() {
+            eprintln!("[jit-debug] `{}` below hot threshold ({}/{}), using tree-walker", name, call_count, self.jit_hot_threshold);
+        }
+        self.jit_fallback_calls = self.jit_fallback_calls.saturating_add(1);
         let mut env = Env::new();
         env.push();
         // Inject captured environment for closures.
@@ -9564,7 +9705,7 @@ impl Interpreter {
                 Ok(Value::Bool(enabled))
             }
             "debug::jit_state" => {
-                let mut state = HashMap::default();
+                let mut state = FxHashMap::default();
                 state.insert("jit_enabled".to_string(), Value::Bool(self.jit_enabled));
                 state.insert(
                     "advance_jit_enabled".to_string(),
@@ -9587,7 +9728,7 @@ impl Interpreter {
             }
             "debug::runtime_hotspots" => {
                 let limit = args.first().and_then(|v| v.as_i64()).unwrap_or(8).max(1) as usize;
-                let total_nanos: u128 = self.runtime_profile.values().map(|(_, n)| *n).sum();
+                let total_nanos: u128 = self.runtime_profile.values().map(|(_, n)| *n as u128).sum();
                 let mut rows = self
                     .runtime_profile
                     .iter()
@@ -9596,7 +9737,7 @@ impl Interpreter {
                 rows.sort_by(|a, b| b.2.cmp(&a.2));
                 let mut out = Vec::new();
                 for (name, calls, nanos) in rows.into_iter().take(limit) {
-                    let mut row = HashMap::default();
+                    let mut row = FxHashMap::default();
                     let total_ms = nanos as f64 / 1_000_000.0;
                     let avg_us = if calls == 0 {
                         0.0
