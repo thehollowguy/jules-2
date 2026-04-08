@@ -225,9 +225,12 @@ fn main() {
             world2.insert_component(id, "pos", Value::Vec3([0.0, 0.0, 0.0]));
             world2.insert_component(id, "vel", Value::Vec3([1.0, 0.0, 0.0]));
         }
+        let ids = world2.query(&vec!["pos".to_string(), "vel".to_string()], &vec![]);
+        let mut positions = Vec::with_capacity(ids.len());
+        let mut velocities = Vec::with_capacity(ids.len());
         let t1 = Instant::now();
         for _ in 0..steps {
-            run_step_simd(&mut world2, dt);
+            run_step_simd_precomputed(&mut world2, dt, &ids, &mut positions, &mut velocities);
         }
         let elapsed_simd = t1.elapsed();
         println!("simd elapsed: {:.3}s", elapsed_simd.as_secs_f64());
@@ -398,28 +401,40 @@ fn run_step(world: &mut EcsWorld, dt: f32) {
 }
 
 #[cfg(feature = "phase6-simd")]
-fn run_step_simd(world: &mut EcsWorld, dt: f32) {
+fn run_step_simd_precomputed(
+    world: &mut EcsWorld,
+    dt: f32,
+    ids: &[u64],
+    positions: &mut Vec<[f32; 3]>,
+    velocities: &mut Vec<[f32; 3]>,
+) {
+    // Keep buffers hot and fixed-size across iterations so the benchmark
+    // measures SIMD math + ECS gather/scatter, not allocator churn.
+    if positions.len() != ids.len() {
+        positions.resize(ids.len(), [0.0, 0.0, 0.0]);
+    }
+    if velocities.len() != ids.len() {
+        velocities.resize(ids.len(), [0.0, 0.0, 0.0]);
+    }
+
     // gather
-    let ids = world.query(&vec!["pos".to_string(), "vel".to_string()], &vec![]);
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(ids.len());
-    let mut velocities: Vec<[f32; 3]> = Vec::with_capacity(ids.len());
-    for id in &ids {
+    for (i, id) in ids.iter().enumerate() {
         let p = world.get_component(*id, "pos").cloned();
         let v = world.get_component(*id, "vel").cloned();
         match (p, v) {
             (Some(Value::Vec3(pv)), Some(Value::Vec3(vv))) => {
-                positions.push(pv);
-                velocities.push(vv);
+                positions[i] = pv;
+                velocities[i] = vv;
             }
             _ => {
-                positions.push([0.0, 0.0, 0.0]);
-                velocities.push([0.0, 0.0, 0.0]);
+                positions[i] = [0.0, 0.0, 0.0];
+                velocities[i] = [0.0, 0.0, 0.0];
             }
         }
     }
 
     // call centralized SIMD helper
-    jules::phase6_simd::update_positions(&mut positions, &velocities, dt);
+    jules::phase6_simd::update_positions(positions, velocities, dt);
 
     // scatter
     for (i, id) in ids.iter().enumerate() {

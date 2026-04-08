@@ -575,7 +575,7 @@ impl Expr {
 
 // ─── Binary Operators ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOpKind {
     // Arithmetic
     Add,
@@ -604,7 +604,7 @@ pub enum BinOpKind {
 
 // ─── Unary Operators ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnOpKind {
     Neg,    // `-x`
     Not,    // `!x` / `~x`

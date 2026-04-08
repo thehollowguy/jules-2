@@ -30,6 +30,9 @@
 #[inline(always)]
 pub fn simd_available() -> bool { true }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use std::arch::x86_64::{__m128, __m256, __m512};
+
 // ── Public dispatch ───────────────────────────────────────────────────────────
 //
 // #[inline(never)]: keeps caller code lean; branch predictor locks on first call.
@@ -278,7 +281,6 @@ unsafe fn update_sse2(
 //
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse2")]
-#[inline(always)]
 unsafe fn load_aos4(ptr: *const f32) -> (__m128, __m128, __m128) {
     use std::arch::x86_64::*;
     let a = _mm_loadu_ps(ptr);
@@ -292,15 +294,15 @@ unsafe fn load_aos4(ptr: *const f32) -> (__m128, __m128, __m128) {
 
     let xa = _mm_shuffle_ps(t0, t1, 0xA0); // [x0 x0 x1 x1]
     let xb = _mm_shuffle_ps(t3, t2, 0xF0); // [x2 x2 x3 x3]
-    let x  = _mm_shuffle_ps(xa, xb, 0x88); // [x0 x1 x2 x3] ✓
+    let x  = _mm_shuffle_ps(xa, xb, 0x88); // [x0 x1 x2 x3]
 
     let ya = _mm_shuffle_ps(t0, t0, 0x5A); // [y0 y0 y1 y1]
     let yb = _mm_shuffle_ps(t3, t3, 0x5A); // [y2 y2 y3 y3]
-    let y  = _mm_shuffle_ps(ya, yb, 0x88); // [y0 y1 y2 y3] ✓
+    let y  = _mm_shuffle_ps(ya, yb, 0x88); // [y0 y1 y2 y3]
 
     let za = _mm_shuffle_ps(t1, t2, 0xA0); // [z0 z0 z1 z1]
     let zb = _mm_shuffle_ps(t2, t3, 0xF5); // [z2 z2 z3 z3]
-    let z  = _mm_shuffle_ps(za, zb, 0x88); // [z0 z1 z2 z3] ✓
+    let z  = _mm_shuffle_ps(za, zb, 0x88); // [z0 z1 z2 z3]
 
     (x, y, z)
 }
@@ -334,21 +336,20 @@ unsafe fn load_aos4(ptr: *const f32) -> (__m128, __m128, __m128) {
 //
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse2")]
-#[inline(always)]
 unsafe fn store_aos4(ptr: *mut f32, x: __m128, y: __m128, z: __m128) {
     use std::arch::x86_64::*;
     let p_lo = _mm_unpacklo_ps(x, y); // [x0 y0 x1 y1]
     let p_hi = _mm_unpackhi_ps(x, y); // [x2 y2 x3 y3]
 
-    let q0   = _mm_shuffle_ps(z, x, 0x50);   // [z0 z0 x1 x1]
-    let out0 = _mm_shuffle_ps(p_lo, q0, 0x84); // [x0 y0 z0 x1] ✓
+    let q0   = _mm_shuffle_ps(z, x, 0x50);    // [z0 z0 x1 x1]
+    let out0 = _mm_shuffle_ps(p_lo, q0, 0x84); // [x0 y0 z0 x1]
 
-    let r1   = _mm_shuffle_ps(p_lo, z,  0x5F);  // [y1 y1 z1 z1]
-    let out1 = _mm_shuffle_ps(r1,   p_hi, 0x48); // [y1 z1 x2 y2] ✓
+    let r1   = _mm_shuffle_ps(p_lo, z,  0x5F); // [y1 y1 z1 z1]
+    let out1 = _mm_shuffle_ps(r1,   p_hi, 0x48); // [y1 z1 x2 y2]
 
-    let q2   = _mm_shuffle_ps(z, x,  0xFA);   // [z2 z2 x3 x3]
+    let q2   = _mm_shuffle_ps(z, x,  0xFA);  // [z2 z2 x3 x3]
     let r2   = _mm_shuffle_ps(p_hi, z, 0xFF); // [y3 y3 z3 z3]
-    let out2 = _mm_shuffle_ps(q2, r2, 0x88);  // [z2 x3 y3 z3] ✓
+    let out2 = _mm_shuffle_ps(q2, r2, 0x88); // [z2 x3 y3 z3]
 
     _mm_storeu_ps(ptr,        out0);
     _mm_storeu_ps(ptr.add(4), out1);
@@ -365,7 +366,6 @@ unsafe fn store_aos4(ptr: *mut f32, x: __m128, y: __m128, z: __m128) {
 //
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-#[inline(always)]
 unsafe fn load_aos8(ptr: *const f32) -> (__m256, __m256, __m256) {
     use std::arch::x86_64::*;
     let (x_lo, y_lo, z_lo) = load_aos4(ptr);
@@ -380,7 +380,6 @@ unsafe fn load_aos8(ptr: *const f32) -> (__m256, __m256, __m256) {
 // ── store_aos8 (AVX2) ─────────────────────────────────────────────────────────
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-#[inline(always)]
 unsafe fn store_aos8(ptr: *mut f32, x: __m256, y: __m256, z: __m256) {
     use std::arch::x86_64::*;
     store_aos4(
@@ -403,7 +402,6 @@ unsafe fn store_aos8(ptr: *mut f32, x: __m256, y: __m256, z: __m256) {
 //
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx2")]
-#[inline(always)]
 unsafe fn load_aos16(ptr: *const f32) -> (__m512, __m512, __m512) {
     use std::arch::x86_64::*;
     let (x_lo, y_lo, z_lo) = load_aos8(ptr);
@@ -418,7 +416,6 @@ unsafe fn load_aos16(ptr: *const f32) -> (__m512, __m512, __m512) {
 // ── store_aos16 (AVX-512F) ────────────────────────────────────────────────────
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx2")]
-#[inline(always)]
 unsafe fn store_aos16(ptr: *mut f32, x: __m512, y: __m512, z: __m512) {
     use std::arch::x86_64::*;
     store_aos8(
