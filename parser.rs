@@ -1965,6 +1965,11 @@ impl Parser {
     fn parse_model_layer(&mut self) -> ParseResult<ModelLayer> {
         let span = self.current_span();
         match self.peek().kind.clone() {
+            TokenKind::KwLayer => {
+                // Optional `layer` prefix: `layer dense 128 relu`
+                self.advance();
+                return self.parse_model_layer();
+            }
             TokenKind::KwInput => {
                 self.advance();
                 let size = self.expect_u64()?;

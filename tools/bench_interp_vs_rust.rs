@@ -9,7 +9,8 @@ use jules::{CompileUnit, Pipeline, PipelineResult};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BenchMode {
-    Full,
+    FullJit,
+    FullInterp,
     AotTime,
 }
 
@@ -31,14 +32,14 @@ fn main() {
 
     let jules_src = format!(
         r#"
-fn main() {{
+fn bench() -> i32 {{
   let mut s = {seed};
   let mut i = 0;
   while i < {n} {{
     s = ((s * 1664525 + (i * 1013904223) + 97) % 2147483647);
     i = i + 1;
   }}
-  return s;
+  s
 }}
 "#,
         seed = seed,
@@ -55,7 +56,7 @@ fn main() {{
             let mut unit = CompileUnit::new(format!("<bench:{sample}:{i}>"), &jules_src);
             let result = pipeline.run(&mut unit);
             if unit.has_errors() {
-                eprintln!("compile diagnostics: {}", unit.diags.len());
+                eprintln!("compile diagnostics: {} => {:?}", unit.diags.len(), unit.diags);
                 std::process::exit(1);
             }
             if i + 1 == iters && sample + 1 == samples {
@@ -91,12 +92,18 @@ fn main() {{
         return;
     }
 
-    // Jules runtime benchmark (interpreter)
+    // Jules runtime benchmark
     let mut interp = jules::interp::Interpreter::new();
+    let mut using_jit = matches!(mode, BenchMode::FullJit);
+    interp.set_jit_enabled(using_jit);
+    interp.set_advance_jit_enabled(using_jit);
     interp.load_program(&program.expect("program should exist"));
-    let check_jules = match interp.call_fn("main", vec![]) {
+    let mut check_jules = match interp.call_fn("bench", vec![]) {
         Ok(jules::interp::Value::I64(v)) => v,
         Ok(jules::interp::Value::I32(v)) => v as i64,
+        Ok(jules::interp::Value::Unit) => {
+            i64::MIN
+        }
         Ok(v) => {
             eprintln!("unexpected return value from jules kernel: {v:?}");
             std::process::exit(1);
@@ -106,6 +113,24 @@ fn main() {{
             std::process::exit(1);
         }
     };
+    if check_jules == i64::MIN && using_jit {
+        eprintln!("JIT path returned Unit for `bench`; retrying benchmark on interpreter path.");
+        using_jit = false;
+        interp.set_jit_enabled(false);
+        interp.set_advance_jit_enabled(false);
+        check_jules = match interp.call_fn("bench", vec![]) {
+            Ok(jules::interp::Value::I64(v)) => v,
+            Ok(jules::interp::Value::I32(v)) => v as i64,
+            Ok(v) => {
+                eprintln!("unexpected return value from jules kernel: {v:?}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("runtime error: {}", e.message);
+                std::process::exit(1);
+            }
+        };
+    }
     let check_rust = rust_kernel(n, seed);
     if check_jules != check_rust {
         eprintln!(
@@ -119,7 +144,7 @@ fn main() {{
     for _ in 0..samples {
         let run_start = Instant::now();
         for _ in 0..iters {
-            match interp.call_fn("main", vec![]) {
+            match interp.call_fn("bench", vec![]) {
                 Ok(jules::interp::Value::I64(v)) => {
                     jules_checksum = jules_checksum.wrapping_add(black_box(v));
                 }
@@ -161,7 +186,8 @@ fn main() {{
         jules_compile_s / iters as f64
     );
     println!(
-        "Jules runtime(avg {samples}): {:.6}s total ({:.6}s/iter) checksum={}",
+        "Jules runtime {}(avg {samples}): {:.6}s total ({:.6}s/iter) checksum={}",
+        if using_jit { "[JIT]" } else { "[interp]" },
         jules_runtime_s,
         jules_runtime_s / iters as f64,
         jules_checksum
@@ -182,7 +208,8 @@ fn main() {{
         println!("Rust compile:   skipped (rustc unavailable)");
     }
     println!(
-        "Runtime ratio (Jules interp / Rust native): {:.2}x",
+        "Runtime ratio (Jules {} / Rust native): {:.2}x",
+        if using_jit { "JIT" } else { "interp" },
         jules_runtime_s / rust_runtime_s.max(1e-9)
     );
 }
@@ -190,7 +217,9 @@ fn main() {{
 fn parse_mode(raw: Option<&str>) -> BenchMode {
     match raw {
         Some("aot") | Some("aot-time") => BenchMode::AotTime,
-        _ => BenchMode::Full,
+        Some("interp") => BenchMode::FullInterp,
+        Some("jit") => BenchMode::FullJit,
+        _ => BenchMode::FullJit,
     }
 }
 

@@ -4397,6 +4397,10 @@ pub fn dce_pass(instrs: &mut Vec<Instr>) -> u32 {
         for u in &uses { live.insert(*u); }
     }
 
+    // Dedupe in case a pass marks the same instruction multiple times.
+    dead_indices.sort_unstable();
+    dead_indices.dedup();
+
     let removed = dead_indices.len() as u32;
     // Remove dead instructions in reverse order to keep indices valid.
     for &idx in dead_indices.iter().rev() {
@@ -6468,7 +6472,7 @@ impl Interpreter {
             Item::Fn(f) => {
                 let closure = FnClosure {
                     decl: f.clone(),
-                    capture: Frame::new(),
+                    capture: Frame::default(),
                 };
                 self.fns.insert(f.name.clone(), Arc::new(closure));
             }
@@ -7168,7 +7172,7 @@ impl Interpreter {
 
             Expr::Closure { params, body, .. } => {
                 // Capture current environment.
-                let mut capture = Frame::new();
+                let mut capture = Frame::default();
                 for (k, v) in env.iter_all() {
                     capture.insert(k.to_owned(), v.clone());
                 }

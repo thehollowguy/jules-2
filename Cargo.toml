@@ -45,6 +45,7 @@ clap = { version = "4", features = ["derive"] }
 colored = "2"
 rustyline = "12"
 rustc-hash = "1"
+rayon = "1"
 
 [features]
 default = ["ffi-c", "phase1", "phase2", "phase3-jit"]

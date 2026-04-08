@@ -2,10 +2,9 @@
 // Minimal, non-invasive API intended for future expansion into a full
 // frame debugger with history, inspection, and rewind.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::interp::{EcsWorld, WorldSnapshot, Value, EntityId};
+use crate::interp::{ComponentMap, EcsWorld, EntityId, Value, WorldSnapshot};
 
 /// Simple frame debugger storing a bounded history of world snapshots.
 pub struct Debugger {
@@ -40,7 +39,7 @@ impl Debugger {
     }
 
     /// Inspect the most recent snapshot for a given entity's components.
-    pub fn inspect_entity(&self, entity: EntityId) -> Option<HashMap<String, Value>> {
+    pub fn inspect_entity(&self, entity: EntityId) -> Option<ComponentMap> {
         if let Some(snap) = self.history.last() {
             for (id, comps) in &snap.entities {
                 if *id == entity {

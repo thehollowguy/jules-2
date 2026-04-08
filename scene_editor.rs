@@ -7,7 +7,7 @@ use std::path::Path;
 
 use serde::{Serialize, Deserialize};
 
-use crate::interp::{EcsWorld, WorldSnapshot, Value, EntityId};
+use crate::interp::{ComponentMap, EcsWorld, EntityId, Value, WorldSnapshot};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SerializableValue {
@@ -81,7 +81,7 @@ pub fn load_scene<P: AsRef<Path>>(path: P, world: &mut EcsWorld) -> Result<(), S
     let scene: SceneFile = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
     let mut snap = WorldSnapshot { entities: Vec::new() };
     for ent in scene.entities {
-        let mut comps = HashMap::new();
+        let mut comps = ComponentMap::default();
         for (k, sv) in ent.comps {
             comps.insert(k, serializable_to_value(&sv));
         }
