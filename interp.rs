@@ -953,6 +953,8 @@ pub struct EcsWorld {
     events: FxHashMap<String, Vec<EntityId>>,
     vec3_plan_cache: FxHashMap<String, Vec3PlanCache>,
     fused_plan_cache: FxHashMap<String, FusedPlanCache>,
+    adaptive_vec3_cache: FxHashMap<u64, AdaptiveVec3Cache>,
+    profile: EcsProfile,
 }
 
 /// Sparse-set component storage.
@@ -982,6 +984,27 @@ struct FusedPlanCache {
     damage_version: u64,
     chunk_size: usize,
     tuples: Vec<(usize, usize, usize, usize)>,
+}
+
+#[derive(Debug, Default)]
+struct EcsProfile {
+    component_hits: FxHashMap<String, u64>,
+    pair_hits: FxHashMap<(String, String), u64>,
+    stable_pair_len: FxHashMap<(String, String), (usize, u32)>,
+}
+
+#[derive(Debug, Default)]
+struct AdaptiveVec3Cache {
+    layout_fp: u64,
+    stable_ticks: u32,
+    pairs: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EcsLayoutPlan {
+    pub suggested_packs: Vec<(String, String, u64)>,
+    pub hot_components: Vec<String>,
+    pub cold_components: Vec<String>,
 }
 
 impl SparseSet {
@@ -1032,6 +1055,53 @@ impl SparseSet {
 }
 
 impl EcsWorld {
+    #[inline]
+    fn pair_key(a: &str, b: &str) -> (String, String) {
+        if a <= b {
+            (a.to_owned(), b.to_owned())
+        } else {
+            (b.to_owned(), a.to_owned())
+        }
+    }
+
+    #[inline]
+    fn profile_component_hit(&mut self, comp: &str) {
+        *self.profile.component_hits.entry(comp.to_owned()).or_insert(0) += 1;
+    }
+
+    #[inline]
+    fn profile_pair_hit(&mut self, a: &str, b: &str) {
+        let key = Self::pair_key(a, b);
+        *self.profile.pair_hits.entry(key).or_insert(0) += 1;
+    }
+
+    #[inline]
+    fn profile_stable_pair_len(&mut self, a: &str, b: &str, len: usize) -> u32 {
+        let key = Self::pair_key(a, b);
+        let (last_len, streak) = self.profile.stable_pair_len.entry(key).or_insert((0, 0));
+        if *last_len == len {
+            *streak = streak.saturating_add(1);
+        } else {
+            *last_len = len;
+            *streak = 1;
+        }
+        *streak
+    }
+
+    #[inline]
+    fn pair_hash(a: &str, b: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        if a <= b {
+            a.hash(&mut h);
+            b.hash(&mut h);
+        } else {
+            b.hash(&mut h);
+            a.hash(&mut h);
+        }
+        h.finish()
+    }
+
     #[inline]
     fn plan_key2(a: &str, b: &str) -> String {
         format!("{a}|{b}")
@@ -1121,6 +1191,16 @@ impl EcsWorld {
         out
     }
 
+    pub fn query_profiled(&mut self, with: &[String], without: &[String]) -> Vec<EntityId> {
+        for c in with {
+            self.profile_component_hit(c);
+        }
+        if with.len() == 2 {
+            self.profile_pair_hit(&with[0], &with[1]);
+        }
+        self.query(with, without)
+    }
+
     /// Allocation-lean query for the common 2-component include case.
     #[inline]
     pub fn query2(&self, c1: &str, c2: &str) -> Vec<EntityId> {
@@ -1141,12 +1221,128 @@ impl EcsWorld {
         out
     }
 
+    #[inline]
+    pub fn query2_profiled(&mut self, c1: &str, c2: &str) -> Vec<EntityId> {
+        self.profile_component_hit(c1);
+        self.profile_component_hit(c2);
+        self.profile_pair_hit(c1, c2);
+        self.query2(c1, c2)
+    }
+
     /// Emit an event signal for the training loop.
     pub fn emit_event(&mut self, signal: &str, entity: EntityId) {
         self.events
             .entry(signal.to_owned())
             .or_default()
             .push(entity);
+    }
+
+    /// Derive a profile-guided ECS memory/layout plan from observed queries.
+    ///
+    /// - `suggested_packs`: component pairs frequently co-accessed in queries
+    /// - `hot_components`: top-half frequently accessed components
+    /// - `cold_components`: low-frequency components suitable for cold pools
+    pub fn optimize_layout_plan(&self) -> EcsLayoutPlan {
+        if self.profile.component_hits.is_empty() {
+            return EcsLayoutPlan::default();
+        }
+        let mut by_hits: Vec<(String, u64)> = self
+            .profile
+            .component_hits
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        by_hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let max_hits = by_hits[0].1.max(1);
+        let cold_cutoff = (max_hits / 16).max(1);
+        let hot_cutoff = (max_hits / 2).max(1);
+        let mut hot_components = Vec::new();
+        let mut cold_components = Vec::new();
+        for (name, hits) in &by_hits {
+            if *hits >= hot_cutoff {
+                hot_components.push(name.clone());
+            } else if *hits <= cold_cutoff {
+                cold_components.push(name.clone());
+            }
+        }
+
+        let mut suggested_packs: Vec<(String, String, u64)> = self
+            .profile
+            .pair_hits
+            .iter()
+            .map(|((a, b), n)| (a.clone(), b.clone(), *n))
+            .collect();
+        suggested_packs.sort_by(|a, b| b.2.cmp(&a.2));
+        suggested_packs.truncate(8);
+
+        EcsLayoutPlan {
+            suggested_packs,
+            hot_components,
+            cold_components,
+        }
+    }
+
+    /// Adaptive vec3 integration with profile-guided AOT/JIT style dispatch.
+    ///
+    /// After several consecutive ticks with a stable join size, this upgrades
+    /// from generic fused loops to the precomputed superoptimizer kernel.
+    pub fn integrate_vec3_adaptive(&mut self, pos_comp: &str, vel_comp: &str, dt: f32) -> usize {
+        self.profile_component_hit(pos_comp);
+        self.profile_component_hit(vel_comp);
+        self.profile_pair_hit(pos_comp, vel_comp);
+
+        let key = Self::pair_hash(pos_comp, vel_comp);
+        let live_fp = self.vec3_layout_fingerprint(pos_comp, vel_comp).unwrap_or(0);
+        let mut cache = self.adaptive_vec3_cache.remove(&key).unwrap_or_default();
+        if cache.layout_fp != live_fp {
+            cache.layout_fp = live_fp;
+            cache.stable_ticks = 0;
+            cache.pairs = self.build_vec3_join_plan(pos_comp, vel_comp);
+        } else {
+            cache.stable_ticks = cache.stable_ticks.saturating_add(1);
+        }
+
+        let updated = if cache.stable_ticks >= 8 && !cache.pairs.is_empty() {
+            self.integrate_vec3_superoptimizer_precomputed(pos_comp, vel_comp, dt, 256, &cache.pairs)
+        } else {
+            self.integrate_vec3_linear_fused(pos_comp, vel_comp, dt)
+        };
+        self.adaptive_vec3_cache.insert(key, cache);
+        updated
+    }
+
+    /// Adaptive fused step:
+    /// - if `health` and `damage` are present, run fused pos/vel + health pass
+    /// - otherwise run vec3 adaptive integration only.
+    pub fn integrate_step_adaptive(
+        &mut self,
+        pos_comp: &str,
+        vel_comp: &str,
+        health_comp: &str,
+        damage_comp: &str,
+        dt: f32,
+    ) -> usize {
+        let have_fused = self.components.contains_key(pos_comp)
+            && self.components.contains_key(vel_comp)
+            && self.components.contains_key(health_comp)
+            && self.components.contains_key(damage_comp);
+        if have_fused {
+            self.profile_component_hit(pos_comp);
+            self.profile_component_hit(vel_comp);
+            self.profile_component_hit(health_comp);
+            self.profile_component_hit(damage_comp);
+            self.profile_pair_hit(pos_comp, vel_comp);
+            return self.integrate_vec3_and_health_chunked(
+                pos_comp,
+                vel_comp,
+                health_comp,
+                damage_comp,
+                dt,
+                256,
+            );
+        }
+        self.integrate_vec3_adaptive(pos_comp, vel_comp, dt)
     }
 
     /// Tight linear integration pass for the common `pos += vel * dt` case.
@@ -6871,8 +7067,8 @@ impl Interpreter {
     ) -> Result<Value, RuntimeError> {
         // Snapshot the matching entity list (safe: world locked briefly).
         let entity_ids = {
-            let w = self.world.lock().unwrap();
-            w.query(&query.with, &query.without)
+            let mut w = self.world.lock().unwrap();
+            w.query_profiled(&query.with, &query.without)
         };
 
         // Apply optional filter expression.
@@ -10219,6 +10415,86 @@ impl Interpreter {
                     unreachable!()
                 }
             }
+            (Value::World(_), "integrate_vec3_adaptive") => {
+                if let Value::World(w) = recv {
+                    match (args.get(0), args.get(1), args.get(2)) {
+                        (Some(Value::Str(pos)), Some(Value::Str(vel)), Some(dtv)) => {
+                            let dt = dtv
+                                .as_f64()
+                                .ok_or_else(|| RuntimeError::new("integrate_vec3_adaptive expects numeric dt"))?
+                                as f32;
+                            let n = w.lock().unwrap().integrate_vec3_adaptive(pos, vel, dt);
+                            Ok(Value::I64(n as i64))
+                        }
+                        _ => rt_err!("integrate_vec3_adaptive(pos:str, vel:str, dt:number)"),
+                    }
+                } else {
+                    unreachable!()
+                }
+            }
+            (Value::World(_), "integrate_step_adaptive") => {
+                if let Value::World(w) = recv {
+                    match (
+                        args.get(0),
+                        args.get(1),
+                        args.get(2),
+                        args.get(3),
+                        args.get(4),
+                    ) {
+                        (
+                            Some(Value::Str(pos)),
+                            Some(Value::Str(vel)),
+                            Some(Value::Str(health)),
+                            Some(Value::Str(damage)),
+                            Some(dtv),
+                        ) => {
+                            let dt = dtv
+                                .as_f64()
+                                .ok_or_else(|| RuntimeError::new("integrate_step_adaptive expects numeric dt"))?
+                                as f32;
+                            let n = w
+                                .lock()
+                                .unwrap()
+                                .integrate_step_adaptive(pos, vel, health, damage, dt);
+                            Ok(Value::I64(n as i64))
+                        }
+                        _ => rt_err!(
+                            "integrate_step_adaptive(pos:str, vel:str, health:str, damage:str, dt:number)"
+                        ),
+                    }
+                } else {
+                    unreachable!()
+                }
+            }
+            (Value::World(_), "optimize_layout_plan") => {
+                if let Value::World(w) = recv {
+                    let plan = w.lock().unwrap().optimize_layout_plan();
+                    let mut map = FxHashMap::default();
+                    let packs: Vec<Value> = plan
+                        .suggested_packs
+                        .into_iter()
+                        .map(|(a, b, n)| {
+                            Value::Tuple(vec![Value::Str(a), Value::Str(b), Value::I64(n as i64)])
+                        })
+                        .collect();
+                    let hot: Vec<Value> = plan
+                        .hot_components
+                        .into_iter()
+                        .map(Value::Str)
+                        .collect();
+                    let cold: Vec<Value> = plan
+                        .cold_components
+                        .into_iter()
+                        .map(Value::Str)
+                        .collect();
+                    map.insert("suggested_packs".to_string(), Value::Array(Arc::new(Mutex::new(packs))));
+                    map.insert("hot_components".to_string(), Value::Array(Arc::new(Mutex::new(hot))));
+                    map.insert("cold_components".to_string(), Value::Array(Arc::new(Mutex::new(cold))));
+                    Ok(Value::HashMap(Arc::new(Mutex::new(map))))
+                } else {
+                    unreachable!()
+                }
+            }
             // ── Array / string methods ─────────────────────────────────────────
             (Value::Array(_), "len") => {
                 if let Value::Array(a) = recv {
@@ -11816,6 +12092,27 @@ mod tests {
     }
 
     #[test]
+    fn test_ecs_layout_plan_profiled() {
+        let mut world = EcsWorld::default();
+        let e = world.spawn();
+        world.insert_component(e, "pos", Value::Vec3([0.0, 0.0, 0.0]));
+        world.insert_component(e, "vel", Value::Vec3([1.0, 0.0, 0.0]));
+        world.insert_component(e, "debug", Value::Bool(true));
+        for _ in 0..32 {
+            let _ = world.query2_profiled("pos", "vel");
+        }
+        let _ = world.query_profiled(&["debug".to_string()], &[]);
+        let plan = world.optimize_layout_plan();
+        assert!(!plan.suggested_packs.is_empty());
+        assert!(plan
+            .suggested_packs
+            .iter()
+            .any(|(a, b, _)| (a == "pos" && b == "vel") || (a == "vel" && b == "pos")));
+        assert!(plan.hot_components.iter().any(|c| c == "pos" || c == "vel"));
+        assert!(plan.cold_components.iter().any(|c| c == "debug"));
+    }
+
+    #[test]
     fn test_ecs_query_without() {
         let mut world = EcsWorld::default();
         let alive = world.spawn();
@@ -11916,6 +12213,40 @@ mod tests {
         );
         assert!(
             matches!(world.get_component(b, "pos"), Some(Value::Vec3(p)) if (p[1] - 0.0).abs() < 1e-6)
+        );
+    }
+
+    #[test]
+    fn test_ecs_integrate_vec3_adaptive() {
+        let mut world = EcsWorld::default();
+        let a = world.spawn();
+        world.insert_component(a, "pos", Value::Vec3([0.0, 0.0, 0.0]));
+        world.insert_component(a, "vel", Value::Vec3([2.0, 0.0, 0.0]));
+        for _ in 0..12 {
+            let n = world.integrate_vec3_adaptive("pos", "vel", 0.1);
+            assert_eq!(n, 1);
+        }
+        assert!(
+            matches!(world.get_component(a, "pos"), Some(Value::Vec3(p)) if p[0] > 2.3 && p[0] < 2.5)
+        );
+    }
+
+    #[test]
+    fn test_ecs_integrate_step_adaptive_fused() {
+        let mut world = EcsWorld::default();
+        let e = world.spawn();
+        world.insert_component(e, "pos", Value::Vec3([0.0, 0.0, 0.0]));
+        world.insert_component(e, "vel", Value::Vec3([1.0, 0.0, 0.0]));
+        world.insert_component(e, "health", Value::F32(10.0));
+        world.insert_component(e, "damage", Value::F32(2.0));
+
+        let n = world.integrate_step_adaptive("pos", "vel", "health", "damage", 0.5);
+        assert_eq!(n, 1);
+        assert!(
+            matches!(world.get_component(e, "pos"), Some(Value::Vec3(p)) if (p[0] - 0.5).abs() < 1e-6)
+        );
+        assert!(
+            matches!(world.get_component(e, "health"), Some(Value::F32(h)) if (h - 9.0).abs() < 1e-6)
         );
     }
 
