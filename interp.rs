@@ -48,8 +48,10 @@
 )]
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::mem;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -1200,47 +1202,8 @@ impl EcsWorld {
             self.vec3_plan_cache.insert(key, cache);
             return 0;
         };
-        let mut updated = 0usize;
-        for chunk in cache.pairs.chunks(cache.chunk_size) {
-            let mut i = 0usize;
-            while i + 3 < chunk.len() {
-                let slots = [chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]];
-                if Self::simd_update_vec3_x4(&mut pos_set, vel_set, slots, dt) {
-                    updated += 4;
-                    i += 4;
-                    continue;
-                }
-                for (pi, vi) in slots {
-                    let (p, v) = unsafe {
-                        let p = pos_set.dense_vals.get_unchecked_mut(pi);
-                        let v = vel_set.dense_vals.get_unchecked(vi);
-                        (p, v)
-                    };
-                    if let (Value::Vec3(p3), Value::Vec3(v3)) = (p, v) {
-                        p3[0] = v3[0].mul_add(dt, p3[0]);
-                        p3[1] = v3[1].mul_add(dt, p3[1]);
-                        p3[2] = v3[2].mul_add(dt, p3[2]);
-                        updated += 1;
-                    }
-                }
-                i += 4;
-            }
-            while i < chunk.len() {
-                let (pi, vi) = chunk[i];
-                let (p, v) = unsafe {
-                    let p = pos_set.dense_vals.get_unchecked_mut(pi);
-                    let v = vel_set.dense_vals.get_unchecked(vi);
-                    (p, v)
-                };
-                if let (Value::Vec3(p3), Value::Vec3(v3)) = (p, v) {
-                    p3[0] = v3[0].mul_add(dt, p3[0]);
-                    p3[1] = v3[1].mul_add(dt, p3[1]);
-                    p3[2] = v3[2].mul_add(dt, p3[2]);
-                    updated += 1;
-                }
-                i += 1;
-            }
-        }
+        let updated =
+            Self::run_vec3_superoptimizer_kernel(&mut pos_set, vel_set, dt, cache.chunk_size, &cache.pairs);
         self.components.insert(pos_comp.to_owned(), pos_set);
         self.vec3_plan_cache.insert(key, cache);
         updated
@@ -1304,8 +1267,21 @@ impl EcsWorld {
             self.components.insert(pos_comp.to_owned(), pos_set);
             return 0;
         };
+        let updated =
+            Self::run_vec3_superoptimizer_kernel(&mut pos_set, vel_set, dt, chunk_size.max(1), pairs);
+        self.components.insert(pos_comp.to_owned(), pos_set);
+        updated
+    }
+
+    #[inline(always)]
+    fn run_vec3_superoptimizer_kernel(
+        pos_set: &mut SparseSet,
+        vel_set: &SparseSet,
+        dt: f32,
+        chunk_size: usize,
+        pairs: &[(usize, usize)],
+    ) -> usize {
         let mut updated = 0usize;
-        let chunk_size = chunk_size.max(1);
         for chunk in pairs.chunks(chunk_size) {
             let mut i = 0usize;
             while i + 15 < chunk.len() {
@@ -1327,7 +1303,7 @@ impl EcsWorld {
                     chunk[i + 14],
                     chunk[i + 15],
                 ];
-                if Self::simd_update_vec3_x16_unrolled(&mut pos_set, vel_set, slots, dt) {
+                if Self::simd_update_vec3_x16_unrolled(pos_set, vel_set, slots, dt) {
                     updated += 16;
                     i += 16;
                     continue;
@@ -1345,7 +1321,7 @@ impl EcsWorld {
                     chunk[i + 6],
                     chunk[i + 7],
                 ];
-                if Self::simd_update_vec3_x8(&mut pos_set, vel_set, slots, dt) {
+                if Self::simd_update_vec3_x8(pos_set, vel_set, slots, dt) {
                     updated += 8;
                     i += 8;
                     continue;
@@ -1354,7 +1330,7 @@ impl EcsWorld {
             }
             while i + 3 < chunk.len() {
                 let slots = [chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]];
-                if Self::simd_update_vec3_x4(&mut pos_set, vel_set, slots, dt) {
+                if Self::simd_update_vec3_x4(pos_set, vel_set, slots, dt) {
                     updated += 4;
                     i += 4;
                     continue;
@@ -1390,7 +1366,6 @@ impl EcsWorld {
                 i += 1;
             }
         }
-        self.components.insert(pos_comp.to_owned(), pos_set);
         updated
     }
 
@@ -2366,6 +2341,10 @@ pub struct CompiledFn {
     pub str_pool: Vec<String>,
     /// Arbitrary Value constants (e.g. pre-built empty arrays).
     pub const_pool: Vec<Value>,
+    /// False when the bytecode compiler had to degrade semantics for unsupported AST nodes.
+    pub vm_supported: bool,
+    /// Short hints describing unsupported constructs seen during lowering.
+    pub unsupported_features: Vec<String>,
 }
 
 // ── Compiler ─────────────────────────────────────────────────────────────────
@@ -2383,6 +2362,8 @@ struct Compiler {
     next_tmp: u16,
     /// Captured closure variables from outer scope.
     captures: FxHashMap<String, u16>,
+    /// Collected unsupported/lossy lowerings to prevent silent misexecution.
+    unsupported_features: Vec<String>,
 }
 
 impl Compiler {
@@ -2396,6 +2377,15 @@ impl Compiler {
             next_slot: param_count,
             next_tmp: 512, // temporaries live above the 512 slot mark
             captures: FxHashMap::default(),
+            unsupported_features: Vec::new(),
+        }
+    }
+
+    fn mark_unsupported(&mut self, reason: &str) {
+        if self.unsupported_features.len() < 8
+            && !self.unsupported_features.iter().any(|r| r == reason)
+        {
+            self.unsupported_features.push(reason.to_owned());
         }
     }
 
@@ -2604,9 +2594,8 @@ impl Compiler {
             }
             // Fallthrough: complex stmts fall back at runtime via tree-walker.
             _ => {
-                // Emit a sentinel that signals "exec this stmt via tree-walker".
-                // (In practice the compiler only gets called for functions where
-                //  all stmts are compilable; others take the tree-walk path.)
+                self.mark_unsupported("statement kind not lowered to VM");
+                // Keep instruction stream valid, but disable VM execution for this fn.
                 self.emit(Instr::Nop);
             }
         }
@@ -2889,16 +2878,15 @@ impl Compiler {
                 let ti = self.intern(&type_str);
                 // Re-use FieldGet slot with a special sentinel.
                 self.emit(Instr::LoadStr(dst, ti));
-                // Fallback: emit a builtin call to "cast"
-                self.emit(Instr::Move(dst, s)); // no-op cast; full cast via tree-walker
+                self.mark_unsupported("cast expression lowered as no-op");
+                self.emit(Instr::Move(dst, s));
             }
-            Expr::Closure { params, body, .. } => {
-                // Closures fall back to const pool.
+            Expr::Closure { .. } => {
+                self.mark_unsupported("closure expression not lowered to VM");
                 self.emit(Instr::LoadUnit(dst));
             }
             _ => {
-                // Unrecognised expression: emit unit and let the tree-walker
-                // handle it if the function takes the slow path.
+                self.mark_unsupported("expression kind not lowered to VM");
                 self.emit(Instr::LoadUnit(dst));
             }
         }
@@ -2920,12 +2908,15 @@ impl Compiler {
                     self.compile_pattern_bind(p, v);
                 }
             }
-            _ => {}
+            _ => {
+                self.mark_unsupported("pattern kind not lowered to VM");
+            }
         }
     }
 
     fn finish(self, name: String, param_count: u16) -> CompiledFn {
         let slot_count = self.next_tmp.max(self.next_slot);
+        let vm_supported = self.unsupported_features.is_empty();
         CompiledFn {
             name,
             param_count,
@@ -2933,6 +2924,8 @@ impl Compiler {
             instrs: self.instrs,
             str_pool: self.str_pool,
             const_pool: self.const_pool,
+            vm_supported,
+            unsupported_features: self.unsupported_features,
         }
     }
 }
@@ -2963,6 +2956,47 @@ macro_rules! rt_err {
     ($fmt:literal $(, $arg:expr)*) => { Err(RuntimeError::new(format!($fmt $(, $arg)*))) };
 }
 
+thread_local! {
+    /// Reusable VM register scratch buffer to avoid per-call allocations.
+    static EXEC_REGS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+}
+
+struct VmRegsGuard {
+    regs: Option<Vec<Value>>,
+}
+
+impl VmRegsGuard {
+    #[inline]
+    fn new(reg_len: usize) -> Self {
+        let regs = EXEC_REGS.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let mut regs = mem::take(&mut *scratch);
+            regs.clear();
+            regs.resize(reg_len, Value::Unit);
+            regs
+        });
+        Self { regs: Some(regs) }
+    }
+
+    #[inline]
+    fn regs_mut(&mut self) -> &mut Vec<Value> {
+        self.regs
+            .as_mut()
+            .expect("vm regs guard must be initialized")
+    }
+}
+
+impl Drop for VmRegsGuard {
+    fn drop(&mut self) {
+        if let Some(mut regs) = self.regs.take() {
+            regs.clear();
+            EXEC_REGS.with(|scratch| {
+                *scratch.borrow_mut() = regs;
+            });
+        }
+    }
+}
+
 // ── Register-based VM executor ───────────────────────────────────────────────
 
 /// Execute a compiled function on the VM.
@@ -2974,13 +3008,15 @@ pub fn vm_exec(
     func: &CompiledFn,
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
-    // Allocate register file.
-    let mut regs: Vec<Value> = vec![Value::Unit; func.slot_count as usize + 32];
+    let reg_len = func.slot_count as usize + 32;
+    let mut regs_guard = VmRegsGuard::new(reg_len);
+    let regs = regs_guard.regs_mut();
 
     // Load arguments.
     for (i, arg) in args.into_iter().enumerate() {
-        if i < regs.len() {
-            regs[i] = arg;
+        if i < reg_len {
+            // SAFETY: `i < reg_len == regs.len()` guarded above.
+            unsafe { *regs.get_unchecked_mut(i) = arg };
         }
     }
 
@@ -3105,9 +3141,7 @@ pub fn vm_exec(
                 }
             }
 
-            Instr::Return(r) => {
-                return Ok(reg!(*r).clone());
-            }
+            Instr::Return(r) => return Ok(reg!(*r).clone()),
             Instr::ReturnUnit => {
                 return Ok(Value::Unit);
             }
@@ -3698,14 +3732,12 @@ impl Interpreter {
 
         // ── Bytecode fast path ────────────────────────────────────────────────
         if self.jit_enabled {
-            // Check if we already have a compiled version.
-            if !self.compiled_fns.contains_key(name) {
-                // Compile and cache.
-                let compiled = compile_fn(&closure.decl);
-                self.compiled_fns
-                    .insert(name.to_owned(), Arc::new(compiled));
-            }
-            let compiled = self.compiled_fns[name].clone();
+            // Compile and cache once, then reuse by direct hash lookup.
+            let compiled = self
+                .compiled_fns
+                .entry(name.to_owned())
+                .or_insert_with(|| Arc::new(compile_fn(&closure.decl)))
+                .clone();
             #[cfg(feature = "phase3-jit")]
             {
                 if let Some(count) = self.pgo_call_counts.get_mut(name) {
@@ -3731,8 +3763,11 @@ impl Interpreter {
                 }
             }
 
-            // If the arg count matches expectation, run the VM.
-            if closure.capture.is_empty() && args.len() == closure.decl.params.len() {
+            // If lowering is lossless and arg count matches expectation, run the VM.
+            if compiled.vm_supported
+                && closure.capture.is_empty()
+                && args.len() == closure.decl.params.len()
+            {
                 #[cfg(feature = "phase3-jit")]
                 {
                     if let Some(native) = self.native_fns.get(name).cloned() {
