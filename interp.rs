@@ -155,10 +155,13 @@ pub enum Value {
     Array(Arc<Mutex<Vec<Value>>>),
     Struct {
         name: String,
-        fields: HashMap<String, Value>,
+        // Boxed so Value stays small: struct fields are heap-allocated once,
+        // not copied on every enum move/assignment. Reduces Value size by ~80 bytes.
+        fields: Box<FxHashMap<String, Value>>,
     },
-    /// HashMap: key -> value pairs (keys currently strings)
-    HashMap(Arc<Mutex<HashMap<String, Value>>>),
+    /// HashMap: key -> value pairs (keys currently strings).
+    /// FxHashMap inner: ~2× faster than SipHash for short string keys.
+    HashMap(Arc<Mutex<FxHashMap<String, Value>>>),
 
     // ── Option / Result types ─────────────────────────────────────────────────
     /// `Some(value)` or `None` (for Option<T>)
@@ -2034,7 +2037,7 @@ impl EcsWorld {
 
 // Lightweight snapshot of the ECS world used by the frame debugger and scene
 // editor. This captures the set of live entities and their components.
-pub type ComponentMap = std::collections::HashMap<String, Value>;
+pub type ComponentMap = FxHashMap<String, Value>;
 
 #[derive(Debug, Clone)]
 pub struct WorldSnapshot {
@@ -2051,7 +2054,7 @@ impl EcsWorld {
     pub fn snapshot(&self) -> WorldSnapshot {
         let mut entities: Vec<(EntityId, ComponentMap)> = Vec::new();
         for &id in self.alive.iter() {
-            let mut comps: ComponentMap = HashMap::new();
+            let mut comps: ComponentMap = FxHashMap::default();
             for c in self.component_types() {
                 if let Some(v) = self.get_component(id, &c) {
                     comps.insert(c.clone(), v.clone());
@@ -2614,7 +2617,7 @@ impl Env {
 }
 
 // Keep type alias for closure capture maps (used by FnClosure).
-// FxHashMap: ~2x faster for short string keys than std SipHash.
+// FxHashMap: ~2× faster than SipHash for the short string keys used as variable names.
 type Frame = FxHashMap<String, Value>;
 
 // =============================================================================
@@ -3603,7 +3606,7 @@ pub fn vm_exec(
                 }
             }
             Instr::NewHashMap(d) => {
-                *reg_mut!(*d) = Value::HashMap(Arc::new(Mutex::new(HashMap::new())));
+                *reg_mut!(*d) = Value::HashMap(Arc::new(Mutex::new(FxHashMap::default())));
             }
             Instr::NewTuple(d, start, count) => {
                 let mut vals = Vec::with_capacity(*count as usize);
@@ -3616,7 +3619,7 @@ pub fn vm_exec(
                 let name = str_c!(*ni).to_owned();
                 *reg_mut!(*d) = Value::Struct {
                     name,
-                    fields: HashMap::new(),
+                    fields: Box::new(FxHashMap::default()),
                 };
             }
             Instr::FieldGet(d, obj, fi) => {
@@ -6294,15 +6297,15 @@ pub fn stoke_optimize_enhanced(
 /// The main tree-walking interpreter.
 pub struct Interpreter {
     /// Top-level function registry.
-    pub fns: HashMap<String, Arc<FnClosure>>,
+    pub fns: FxHashMap<String, Arc<FnClosure>>,
     /// Top-level model registry (AST decls; instantiated on demand).
-    pub model_decls: HashMap<String, ModelDecl>,
+    pub model_decls: FxHashMap<String, ModelDecl>,
     /// Live model instances.
-    pub models: HashMap<String, Arc<Mutex<NnModel>>>,
+    pub models: FxHashMap<String, Arc<Mutex<NnModel>>>,
     /// Agent declarations.
-    pub agent_decls: HashMap<String, AgentDecl>,
+    pub agent_decls: FxHashMap<String, AgentDecl>,
     /// Struct/component type registry (name → field list).
-    pub types: HashMap<String, Vec<String>>,
+    pub types: FxHashMap<String, Vec<String>>,
     /// ECS world (global singleton for now).
     pub world: Arc<Mutex<EcsWorld>>,
     /// GPU dispatch backend (None = CPU-only).
@@ -6318,12 +6321,12 @@ pub struct Interpreter {
     /// Computation graph for autodiff (ML integration)
     pub computation_graph: Option<Arc<Mutex<ComputationGraph>>>,
     /// Active optimizers indexed by ID (ML integration)
-    pub optimizers: HashMap<String, (Optimizer, OptimizerState)>,
+    pub optimizers: FxHashMap<String, (Optimizer, OptimizerState)>,
     /// Deterministic simulation worlds (`sim` module)
-    sim_worlds: HashMap<i64, SimWorldState>,
+    sim_worlds: FxHashMap<i64, SimWorldState>,
     next_sim_world_id: i64,
     /// Headless window state handles (`window` module)
-    windows: HashMap<i64, WindowState>,
+    windows: FxHashMap<i64, WindowState>,
     next_window_id: i64,
     // ── Bytecode cache ────────────────────────────────────────────────────────
     /// Maps function name → compiled bytecode (compiled once, reused forever).
@@ -6348,11 +6351,11 @@ pub struct Interpreter {
 impl Interpreter {
     pub fn new() -> Self {
         Interpreter {
-            fns: HashMap::new(),
-            model_decls: HashMap::new(),
-            models: HashMap::new(),
-            agent_decls: HashMap::new(),
-            types: HashMap::new(),
+            fns: FxHashMap::default(),
+            model_decls: FxHashMap::default(),
+            models: FxHashMap::default(),
+            agent_decls: FxHashMap::default(),
+            types: FxHashMap::default(),
             world: Arc::new(Mutex::new(EcsWorld::default())),
             gpu: Some(Box::new(JulesGpuAdapter::new())),
             n_threads: 4,
@@ -6360,10 +6363,10 @@ impl Interpreter {
             render_state: Some(Arc::new(Mutex::new(RenderState::new()))),
             input_state: Some(Arc::new(Mutex::new(InputState::new()))),
             computation_graph: Some(Arc::new(Mutex::new(ComputationGraph::new()))),
-            optimizers: HashMap::new(),
-            sim_worlds: HashMap::new(),
+            optimizers: FxHashMap::default(),
+            sim_worlds: FxHashMap::default(),
             next_sim_world_id: 1,
-            windows: HashMap::new(),
+            windows: FxHashMap::default(),
             next_window_id: 1,
             compiled_fns: FxHashMap::default(),
             #[cfg(feature = "phase3-jit")]
@@ -7189,13 +7192,13 @@ impl Interpreter {
             Expr::Block(b) => self.eval_block(b, env),
 
             Expr::StructLit { name, fields, .. } => {
-                let mut field_vals = HashMap::new();
+                let mut field_vals = FxHashMap::default();
                 for (fname, fexpr) in fields {
                     field_vals.insert(fname.clone(), self.eval_expr(fexpr, env)?);
                 }
                 Ok(Value::Struct {
                     name: name.clone(),
-                    fields: field_vals,
+                    fields: Box::new(field_vals),
                 })
             }
             Expr::KronProd { lhs, rhs, .. } => {
@@ -7712,7 +7715,7 @@ impl Interpreter {
                 ],
             ),
         ];
-        let mut out = HashMap::new();
+        let mut out = FxHashMap::default();
         for (module, names) in modules {
             let vals = names
                 .iter()
@@ -8630,7 +8633,7 @@ impl Interpreter {
                 let mut out = Vec::with_capacity(ids.len());
                 for id in ids {
                     if let Some(e) = world.entities.get(&id) {
-                        let mut row = HashMap::new();
+                        let mut row = FxHashMap::default();
                         row.insert("id".into(), Value::I64(id));
                         row.insert(
                             "position".into(),
@@ -8954,7 +8957,7 @@ impl Interpreter {
             }
 
             // ── HashMap / Collection constructors ──────────────────────────────
-            "HashMap::new" => Ok(Value::HashMap(Arc::new(Mutex::new(HashMap::new())))),
+            "HashMap::new" => Ok(Value::HashMap(Arc::new(Mutex::new(FxHashMap::default())))),
 
             // ── File I/O ───────────────────────────────────────────────────────
             "read_file" => {
@@ -9125,7 +9128,7 @@ impl Interpreter {
                 if let Some(Value::Str(path)) = args.first() {
                     match std::fs::metadata(path) {
                         Ok(md) => {
-                            let mut out = HashMap::new();
+                            let mut out = FxHashMap::default();
                             out.insert("is_file".into(), Value::Bool(md.is_file()));
                             out.insert("is_dir".into(), Value::Bool(md.is_dir()));
                             out.insert("len".into(), Value::I64(md.len() as i64));
@@ -9213,7 +9216,7 @@ impl Interpreter {
                         .output();
                     match output {
                         Ok(out) => {
-                            let mut result = HashMap::new();
+                            let mut result = FxHashMap::default();
                             result.insert("ok".into(), Value::Bool(out.status.success()));
                             result.insert(
                                 "code".into(),
@@ -9249,7 +9252,7 @@ impl Interpreter {
                     let output = std::process::Command::new(program).args(&parsed).output();
                     match output {
                         Ok(out) => {
-                            let mut result = HashMap::new();
+                            let mut result = FxHashMap::default();
                             result.insert("ok".into(), Value::Bool(out.status.success()));
                             result.insert(
                                 "code".into(),
@@ -9289,7 +9292,7 @@ impl Interpreter {
                         .output();
                     match output {
                         Ok(out) => {
-                            let mut result = HashMap::new();
+                            let mut result = FxHashMap::default();
                             result.insert("ok".into(), Value::Bool(out.status.success()));
                             result.insert(
                                 "code".into(),
@@ -9553,7 +9556,7 @@ impl Interpreter {
                 let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
                 let mut out = Vec::with_capacity(render.command_buffer.len());
                 for cmd in render.command_buffer.drain(..) {
-                    let mut entry = HashMap::with_capacity(8);
+                    let mut entry = FxHashMap::with_capacity_and_hasher(8, Default::default());
                     match cmd {
                         RenderCommand::Clear { color } => {
                             entry.insert("kind".into(), Value::Str("clear".into()));
@@ -9616,7 +9619,7 @@ impl Interpreter {
             }
             "render::stats" => {
                 let render = self.render_state.as_ref().unwrap().lock().unwrap();
-                let mut map = HashMap::new();
+                let mut map = FxHashMap::default();
                 map.insert("width".into(), Value::I64(render.width as i64));
                 map.insert("height".into(), Value::I64(render.height as i64));
                 map.insert(
@@ -12310,7 +12313,7 @@ mod tests {
             _ => panic!("expected world id"),
         };
 
-        let mut entity = HashMap::new();
+        let mut entity = FxHashMap::default();
         entity.insert(
             "position".into(),
             Value::Array(Arc::new(Mutex::new(vec![Value::F32(0.0), Value::F32(0.0)]))),
@@ -12516,7 +12519,7 @@ mod tests {
         };
 
         for i in 0..128 {
-            let mut entity = HashMap::new();
+            let mut entity = FxHashMap::default();
             let x = (i % 16) as f32 * 0.4;
             let y = (i / 16) as f32 * 0.4;
             entity.insert(
@@ -12776,7 +12779,7 @@ mod tests {
         };
 
         let mk_ent = |x: f32, y: f32| {
-            let mut entity = HashMap::new();
+            let mut entity = FxHashMap::default();
             entity.insert(
                 "position".into(),
                 Value::Array(Arc::new(Mutex::new(vec![Value::F32(x), Value::F32(y)]))),
