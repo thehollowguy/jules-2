@@ -500,17 +500,19 @@ fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterv
     let mut first_def = vec![UNDEF; cap];
     let mut last_use  = vec![UNDEF; cap];
 
-    macro_rules! ensure { ($s:expr) => {
+    macro_rules! ensure { ($s:expr) => {{
         let s = $s as usize;
-        if s >= first_def.len() { first_def.resize(s+1, UNDEF); last_use.resize(s+1, UNDEF); }
-    }; }
-    macro_rules! def { ($s:expr, $pc:expr) => {
-        ensure!($s); let s = $s as usize;
+        if s >= first_def.len() { first_def.resize(s + 1, UNDEF); last_use.resize(s + 1, UNDEF); }
+    }}; }
+    macro_rules! def { ($s:expr, $pc:expr) => {{
+        ensure!($s);
+        let s = $s as usize;
         if first_def[s] == UNDEF { first_def[s] = $pc; }
-    }; }
-    macro_rules! use_ { ($s:expr, $pc:expr) => {
-        ensure!($s); last_use[$s as usize] = $pc;
-    }; }
+    }}; }
+    macro_rules! use_ { ($s:expr, $pc:expr) => {{
+        ensure!($s);
+        last_use[$s as usize] = $pc;
+    }}; }
 
     for (pc, instr) in instrs.iter().enumerate() {
         match instr {
