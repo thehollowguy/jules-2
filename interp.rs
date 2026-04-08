@@ -1246,6 +1246,239 @@ impl EcsWorld {
         updated
     }
 
+    /// Build a reusable dense join plan for `pos += vel * dt`.
+    #[inline]
+    pub fn build_vec3_join_plan(&self, pos_comp: &str, vel_comp: &str) -> Vec<(usize, usize)> {
+        let Some(pos_set_ref) = self.components.get(pos_comp) else {
+            return Vec::new();
+        };
+        let Some(vel_set_ref) = self.components.get(vel_comp) else {
+            return Vec::new();
+        };
+        let mut pairs = Vec::with_capacity(pos_set_ref.dense_ids.len().min(vel_set_ref.dense_ids.len()));
+        for (pi, id) in pos_set_ref.dense_ids.iter().enumerate() {
+            if let Some(&vi) = vel_set_ref.sparse.get(id) {
+                pairs.push((pi, vi));
+            }
+        }
+        pairs
+    }
+
+    /// Lightweight fingerprint for validating a cached vec3 join plan.
+    /// Uses component versions and dense lengths (no per-entity hashing).
+    #[inline]
+    pub fn vec3_layout_fingerprint(&self, pos_comp: &str, vel_comp: &str) -> Option<u64> {
+        let pos = self.components.get(pos_comp)?;
+        let vel = self.components.get(vel_comp)?;
+        let mut fp = 0xcbf29ce484222325u64;
+        fp = fp.wrapping_mul(0x100000001b3).wrapping_add(pos.version as u64);
+        fp = fp
+            .wrapping_mul(0x100000001b3)
+            .wrapping_add(vel.version as u64);
+        fp = fp
+            .wrapping_mul(0x100000001b3)
+            .wrapping_add(pos.dense_ids.len() as u64);
+        fp = fp
+            .wrapping_mul(0x100000001b3)
+            .wrapping_add(vel.dense_ids.len() as u64);
+        Some(fp)
+    }
+
+    /// Superoptimizer kernel over a precomputed join plan.
+    #[inline(always)]
+    pub fn integrate_vec3_superoptimizer_precomputed(
+        &mut self,
+        pos_comp: &str,
+        vel_comp: &str,
+        dt: f32,
+        chunk_size: usize,
+        pairs: &[(usize, usize)],
+    ) -> usize {
+        if pos_comp == vel_comp || pairs.is_empty() {
+            return 0;
+        }
+        let Some(mut pos_set) = self.components.remove(pos_comp) else {
+            return 0;
+        };
+        let Some(vel_set) = self.components.get(vel_comp) else {
+            self.components.insert(pos_comp.to_owned(), pos_set);
+            return 0;
+        };
+        let mut updated = 0usize;
+        let chunk_size = chunk_size.max(1);
+        for chunk in pairs.chunks(chunk_size) {
+            let mut i = 0usize;
+            while i + 15 < chunk.len() {
+                let slots = [
+                    chunk[i],
+                    chunk[i + 1],
+                    chunk[i + 2],
+                    chunk[i + 3],
+                    chunk[i + 4],
+                    chunk[i + 5],
+                    chunk[i + 6],
+                    chunk[i + 7],
+                    chunk[i + 8],
+                    chunk[i + 9],
+                    chunk[i + 10],
+                    chunk[i + 11],
+                    chunk[i + 12],
+                    chunk[i + 13],
+                    chunk[i + 14],
+                    chunk[i + 15],
+                ];
+                if Self::simd_update_vec3_x16_unrolled(&mut pos_set, vel_set, slots, dt) {
+                    updated += 16;
+                    i += 16;
+                    continue;
+                }
+                break;
+            }
+            while i + 7 < chunk.len() {
+                let slots = [
+                    chunk[i],
+                    chunk[i + 1],
+                    chunk[i + 2],
+                    chunk[i + 3],
+                    chunk[i + 4],
+                    chunk[i + 5],
+                    chunk[i + 6],
+                    chunk[i + 7],
+                ];
+                if Self::simd_update_vec3_x8(&mut pos_set, vel_set, slots, dt) {
+                    updated += 8;
+                    i += 8;
+                    continue;
+                }
+                break;
+            }
+            while i + 3 < chunk.len() {
+                let slots = [chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]];
+                if Self::simd_update_vec3_x4(&mut pos_set, vel_set, slots, dt) {
+                    updated += 4;
+                    i += 4;
+                    continue;
+                }
+                for (pi, vi) in slots {
+                    let (p, v) = unsafe {
+                        let p = pos_set.dense_vals.get_unchecked_mut(pi);
+                        let v = vel_set.dense_vals.get_unchecked(vi);
+                        (p, v)
+                    };
+                    if let (Value::Vec3(p3), Value::Vec3(v3)) = (p, v) {
+                        p3[0] = v3[0].mul_add(dt, p3[0]);
+                        p3[1] = v3[1].mul_add(dt, p3[1]);
+                        p3[2] = v3[2].mul_add(dt, p3[2]);
+                        updated += 1;
+                    }
+                }
+                i += 4;
+            }
+            while i < chunk.len() {
+                let (pi, vi) = chunk[i];
+                let (p, v) = unsafe {
+                    let p = pos_set.dense_vals.get_unchecked_mut(pi);
+                    let v = vel_set.dense_vals.get_unchecked(vi);
+                    (p, v)
+                };
+                if let (Value::Vec3(p3), Value::Vec3(v3)) = (p, v) {
+                    p3[0] = v3[0].mul_add(dt, p3[0]);
+                    p3[1] = v3[1].mul_add(dt, p3[1]);
+                    p3[2] = v3[2].mul_add(dt, p3[2]);
+                    updated += 1;
+                }
+                i += 1;
+            }
+        }
+        self.components.insert(pos_comp.to_owned(), pos_set);
+        updated
+    }
+
+    #[inline]
+    fn simd_update_vec3_x16_unrolled(
+        pos_set: &mut SparseSet,
+        vel_set: &SparseSet,
+        slots: [(usize, usize); 16],
+        dt: f32,
+    ) -> bool {
+        let lo = [
+            slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7],
+        ];
+        let hi = [
+            slots[8], slots[9], slots[10], slots[11], slots[12], slots[13], slots[14], slots[15],
+        ];
+        if !Self::simd_update_vec3_x8(pos_set, vel_set, lo, dt) {
+            return false;
+        }
+        Self::simd_update_vec3_x8(pos_set, vel_set, hi, dt)
+    }
+
+    #[inline]
+    fn simd_update_vec3_x8(
+        pos_set: &mut SparseSet,
+        vel_set: &SparseSet,
+        slots: [(usize, usize); 8],
+        dt: f32,
+    ) -> bool {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+                return false;
+            }
+            let mut px = [0f32; 8];
+            let mut py = [0f32; 8];
+            let mut pz = [0f32; 8];
+            let mut vx = [0f32; 8];
+            let mut vy = [0f32; 8];
+            let mut vz = [0f32; 8];
+
+            let pos_ptr = pos_set.dense_vals.as_mut_ptr();
+            let vel_ptr = vel_set.dense_vals.as_ptr();
+            for (lane, (pi, vi)) in slots.iter().enumerate() {
+                let p = &mut *pos_ptr.add(*pi);
+                let v = &*vel_ptr.add(*vi);
+                if let (Value::Vec3(p3), Value::Vec3(v3)) = (p, v) {
+                    px[lane] = p3[0];
+                    py[lane] = p3[1];
+                    pz[lane] = p3[2];
+                    vx[lane] = v3[0];
+                    vy[lane] = v3[1];
+                    vz[lane] = v3[2];
+                } else {
+                    return false;
+                }
+            }
+
+            let dtv = _mm256_set1_ps(dt);
+            let pxv = _mm256_loadu_ps(px.as_ptr());
+            let pyv = _mm256_loadu_ps(py.as_ptr());
+            let pzv = _mm256_loadu_ps(pz.as_ptr());
+            let vxv = _mm256_loadu_ps(vx.as_ptr());
+            let vyv = _mm256_loadu_ps(vy.as_ptr());
+            let vzv = _mm256_loadu_ps(vz.as_ptr());
+            let out_x = _mm256_fmadd_ps(vxv, dtv, pxv);
+            let out_y = _mm256_fmadd_ps(vyv, dtv, pyv);
+            let out_z = _mm256_fmadd_ps(vzv, dtv, pzv);
+            _mm256_storeu_ps(px.as_mut_ptr(), out_x);
+            _mm256_storeu_ps(py.as_mut_ptr(), out_y);
+            _mm256_storeu_ps(pz.as_mut_ptr(), out_z);
+
+            for (lane, (pi, _)) in slots.iter().enumerate() {
+                if let Value::Vec3(p3) = &mut *pos_ptr.add(*pi) {
+                    p3[0] = px[lane];
+                    p3[1] = py[lane];
+                    p3[2] = pz[lane];
+                } else {
+                    return false;
+                }
+            }
+            return true;
+        }
+        #[allow(unreachable_code)]
+        false
+    }
+
     #[inline]
     fn simd_update_vec3_x4(
         pos_set: &mut SparseSet,
