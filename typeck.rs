@@ -3205,6 +3205,7 @@ impl TypeCk {
             }
         }
 
+        let mut has_learning_rate = false;
         for arg in args {
             if let crate::ast::Expr::Assign { target, value, .. } = arg {
                 let key = match &**target {
@@ -3225,6 +3226,7 @@ impl TypeCk {
                         }
                     }
                     "lr" | "learning_rate" => {
+                        has_learning_rate = true;
                         if let Some(v) = self.ai_number_literal(value) {
                             if v <= 0.0 {
                                 self.diag.error(
@@ -3236,6 +3238,36 @@ impl TypeCk {
                             self.diag.error(
                                 value.span(),
                                 format!("@{} learning rate must be numeric", dec),
+                            );
+                        }
+                    }
+                    "gamma" => {
+                        if let Some(v) = self.ai_number_literal(value) {
+                            if !(0.0..=1.0).contains(&v) {
+                                self.diag.error(
+                                    value.span(),
+                                    format!("@{} gamma must be in [0, 1]", dec),
+                                );
+                            }
+                        } else {
+                            self.diag.error(
+                                value.span(),
+                                format!("@{} gamma must be numeric", dec),
+                            );
+                        }
+                    }
+                    "lambda" => {
+                        if let Some(v) = self.ai_number_literal(value) {
+                            if !(0.0..=1.0).contains(&v) {
+                                self.diag.error(
+                                    value.span(),
+                                    format!("@{} lambda must be in [0, 1]", dec),
+                                );
+                            }
+                        } else {
+                            self.diag.error(
+                                value.span(),
+                                format!("@{} lambda must be numeric", dec),
                             );
                         }
                     }
@@ -3255,6 +3287,10 @@ impl TypeCk {
                     _ => {}
                 }
             }
+        }
+
+        if dec == "PPO" && !has_learning_rate {
+            self.diag.error(a.span, "@PPO requires `learning_rate` (or `lr`)".to_string());
         }
 
         let _ = a;

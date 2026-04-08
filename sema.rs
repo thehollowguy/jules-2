@@ -567,6 +567,11 @@ impl SemaCtx {
             self.decls.mark_used("main");
         }
 
+        // ── Pass 2: analyse item bodies / statements / expressions. ──────────
+        for item in &program.items {
+            self.analyse_item(item);
+        }
+
         // ── Post-pass checks that need the complete picture. ──────────────────
         self.check_unused_decls();
         self.check_system_aliasing();
