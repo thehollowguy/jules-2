@@ -7579,6 +7579,7 @@ pub struct Interpreter {
     execution_list: Vec<usize>,
     /// Generation counter for entity/component validation
     entity_generations: Vec<u32>,
+    loaded_program_hash: Option<u64>,
 }
 
 impl Interpreter {
@@ -7620,6 +7621,7 @@ impl Interpreter {
             execution_list: Vec::with_capacity(64),
             // Entity generation tracking for validation
             entity_generations: Vec::with_capacity(1024),
+            loaded_program_hash: None,
         }
     }
 
@@ -7674,7 +7676,7 @@ impl Interpreter {
                 continue;
             }
             if let Some(closure) = self.fns.get(&name) {
-                let mut compiled = compile_fn(&closure.decl);
+                let compiled = compile_fn(&closure.decl);
                 // ── Research-grade superoptimizer ─────────────────────────────
                 // Run on all VM-supported functions. Use a lighter STOKE budget
                 // for trivial functions (< 4 instrs) and heavier for larger ones.
@@ -7688,14 +7690,28 @@ impl Interpreter {
 
     /// Load all top-level declarations from a parsed program into the interpreter.
     pub fn load_program(&mut self, program: &Program) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", program).hash(&mut hasher);
+        let new_hash = hasher.finish();
+        if self.loaded_program_hash == Some(new_hash) {
+            return;
+        }
+
         // Avoid stale bytecode when reloading/redefining functions.
         self.compiled_fns.clear();
+        self.fn_call_counts.clear();
         #[cfg(feature = "phase3-jit")]
         self.native_fns.clear();
+        self.fns.clear();
+        self.types.clear();
+        self.agent_decls.clear();
+        self.model_decls.clear();
         for item in &program.items {
             self.load_item(item);
         }
         self.precompile_loaded_functions();
+        self.loaded_program_hash = Some(new_hash);
     }
 
     fn load_item(&mut self, item: &Item) {
