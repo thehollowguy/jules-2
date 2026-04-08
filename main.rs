@@ -17,10 +17,6 @@ mod gpu_backend;
 // Optional, phase-gated modules (added per performance phase protocol)
 #[cfg(feature = "phase3-jit")]
 mod phase3_jit;
-#[cfg(feature = "phase4-llvm")]
-mod phase4_llvm;
-#[cfg(feature = "phase5-cow")]
-mod phase5_cow;
 #[cfg(feature = "phase6-simd")]
 pub mod phase6_simd;
 
