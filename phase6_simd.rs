@@ -1,4 +1,3 @@
-// Phase 6: Research-Grade SIMD  (feature: `phase6-simd`)
 //
 // ┌─ Architecture overview ────────────────────────────────────────────────────┐
 // │  Runtime dispatch:  AVX-512F → AVX2+FMA → AVX → SSE2 → scalar            │
