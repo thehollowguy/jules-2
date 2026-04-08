@@ -4125,6 +4125,69 @@ pub fn compile_fn(decl: &FnDecl) -> CompiledFn {
     c.finish(decl.name.clone(), param_count)
 }
 
+fn compiled_fn_is_structurally_valid(func: &CompiledFn, expects_non_unit: bool) -> bool {
+    if func.instrs.is_empty() {
+        return false;
+    }
+
+    let mut has_any_return = false;
+    let mut has_value_return = false;
+    for (idx, instr) in func.instrs.iter().enumerate() {
+        match instr {
+            Instr::Return(_) => {
+                has_any_return = true;
+                has_value_return = true;
+            }
+            Instr::ReturnUnit => {
+                has_any_return = true;
+            }
+            Instr::Jump(off) => {
+                let target = idx as i32 + 1 + *off;
+                if target < 0 || target as usize >= func.instrs.len() {
+                    return false;
+                }
+            }
+            Instr::JumpFalse(_, off) | Instr::JumpTrue(_, off) => {
+                let target = idx as i32 + 1 + *off;
+                if target < 0 || target as usize >= func.instrs.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    has_any_return && (!expects_non_unit || has_value_return)
+}
+
+fn maybe_superoptimize(compiled: &mut CompiledFn, expects_non_unit: bool, max_instr: usize) {
+    if !compiled.vm_supported || compiled.instrs.len() > max_instr {
+        return;
+    }
+    let cfg = SuperoptConfig {
+        run_stoke: compiled.instrs.len() >= 4,
+        stoke_budget: if compiled.instrs.len() < 8 {
+            50_000
+        } else if compiled.instrs.len() < 40 {
+            100_000
+        } else {
+            200_000
+        },
+        ..SuperoptConfig::default()
+    };
+
+    let mut candidate = compiled.clone();
+    superoptimize_fn(&mut candidate, &cfg);
+    if compiled_fn_is_structurally_valid(&candidate, expects_non_unit) {
+        *compiled = candidate;
+    } else if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+        eprintln!(
+            "[jit-debug] rejected superoptimized `{}` due to invalid control-flow/return shape",
+            compiled.name
+        );
+    }
+}
+
 // ── Shorthand runtime error macro ────────────────────────────────────────────
 macro_rules! rt_err {
     ($msg:expr) => { Err(RuntimeError::new($msg)) };
@@ -7577,6 +7640,7 @@ impl Interpreter {
         self.jit_enabled = enabled;
         if !enabled {
             self.compiled_fns.clear();
+            self.fn_call_counts.clear();
             #[cfg(feature = "phase3-jit")]
             self.native_fns.clear();
         }
@@ -7601,6 +7665,9 @@ impl Interpreter {
         if !self.jit_enabled || !self.advance_jit_enabled {
             return;
         }
+        if self.jit_hot_threshold > 1 {
+            return;
+        }
         let names: Vec<String> = self.fns.keys().cloned().collect();
         for name in names {
             if self.compiled_fns.contains_key(&name) {
@@ -7611,14 +7678,7 @@ impl Interpreter {
                 // ── Research-grade superoptimizer ─────────────────────────────
                 // Run on all VM-supported functions. Use a lighter STOKE budget
                 // for trivial functions (< 4 instrs) and heavier for larger ones.
-                if compiled.vm_supported {
-                    let cfg = SuperoptConfig {
-                        run_stoke: compiled.instrs.len() >= 4,
-                        stoke_budget: if compiled.instrs.len() < 8 { 50_000 } else if compiled.instrs.len() < 40 { 100_000 } else { 200_000 },
-                        ..SuperoptConfig::default()
-                    };
-                    superoptimize_fn(&mut compiled, &cfg);
-                }
+                maybe_superoptimize(&mut compiled, closure.decl.ret_ty.is_some(), self.jit_superopt_max_instr);
                 self.compiled_fns.insert(name, Arc::new(compiled));
             }
         }
@@ -7692,21 +7752,14 @@ impl Interpreter {
         let expects_non_unit = closure.decl.ret_ty.is_some();
 
         // ── Bytecode fast path ────────────────────────────────────────────────
-        if self.jit_enabled {
+        if self.jit_enabled && jit_hot {
             // Compile and cache once, then reuse by direct hash lookup.
             let compiled = self
                 .compiled_fns
                 .entry(name.to_owned())
                 .or_insert_with(|| {
                     let mut compiled = compile_fn(&closure.decl);
-                    if compiled.vm_supported {
-                        let cfg = SuperoptConfig {
-                            run_stoke: compiled.instrs.len() >= 4,
-                            stoke_budget: if compiled.instrs.len() < 8 { 50_000 } else if compiled.instrs.len() < 40 { 100_000 } else { 200_000 },
-                            ..SuperoptConfig::default()
-                        };
-                        superoptimize_fn(&mut compiled, &cfg);
-                    }
+                    maybe_superoptimize(&mut compiled, closure.decl.ret_ty.is_some(), self.jit_superopt_max_instr);
                     Arc::new(compiled)
                 })
                 .clone();
@@ -7734,6 +7787,8 @@ impl Interpreter {
                             eprintln!("[jit-debug] native path returned Unit for `{name}`, falling back");
                         }
                     }
+                } else if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+                    eprintln!("[jit-debug] native JIT disabled (set JULES_ENABLE_NATIVE_JIT=1 to enable)");
                 }
             }
 

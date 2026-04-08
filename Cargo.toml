@@ -9,7 +9,7 @@ autobenches = false
 
 [lib]
 name = "jules"
-path = "main.rs"
+path = "lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
