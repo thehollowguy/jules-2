@@ -4125,6 +4125,69 @@ pub fn compile_fn(decl: &FnDecl) -> CompiledFn {
     c.finish(decl.name.clone(), param_count)
 }
 
+fn compiled_fn_is_structurally_valid(func: &CompiledFn, expects_non_unit: bool) -> bool {
+    if func.instrs.is_empty() {
+        return false;
+    }
+
+    let mut has_any_return = false;
+    let mut has_value_return = false;
+    for (idx, instr) in func.instrs.iter().enumerate() {
+        match instr {
+            Instr::Return(_) => {
+                has_any_return = true;
+                has_value_return = true;
+            }
+            Instr::ReturnUnit => {
+                has_any_return = true;
+            }
+            Instr::Jump(off) => {
+                let target = idx as i32 + 1 + *off;
+                if target < 0 || target as usize >= func.instrs.len() {
+                    return false;
+                }
+            }
+            Instr::JumpFalse(_, off) | Instr::JumpTrue(_, off) => {
+                let target = idx as i32 + 1 + *off;
+                if target < 0 || target as usize >= func.instrs.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    has_any_return && (!expects_non_unit || has_value_return)
+}
+
+fn maybe_superoptimize(compiled: &mut CompiledFn, expects_non_unit: bool, max_instr: usize) {
+    if !compiled.vm_supported || compiled.instrs.len() > max_instr {
+        return;
+    }
+    let cfg = SuperoptConfig {
+        run_stoke: compiled.instrs.len() >= 4,
+        stoke_budget: if compiled.instrs.len() < 8 {
+            50_000
+        } else if compiled.instrs.len() < 40 {
+            100_000
+        } else {
+            200_000
+        },
+        ..SuperoptConfig::default()
+    };
+
+    let mut candidate = compiled.clone();
+    superoptimize_fn(&mut candidate, &cfg);
+    if compiled_fn_is_structurally_valid(&candidate, expects_non_unit) {
+        *compiled = candidate;
+    } else if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+        eprintln!(
+            "[jit-debug] rejected superoptimized `{}` due to invalid control-flow/return shape",
+            compiled.name
+        );
+    }
+}
+
 // ── Shorthand runtime error macro ────────────────────────────────────────────
 macro_rules! rt_err {
     ($msg:expr) => { Err(RuntimeError::new($msg)) };
@@ -7503,8 +7566,6 @@ pub struct Interpreter {
     jit_native_calls: u64,
     jit_vm_calls: u64,
     jit_fallback_calls: u64,
-    fn_call_counts: FxHashMap<String, u64>,
-    jit_hot_threshold: u64,
     // ── Inline caches for hot path optimization ───────────────────────────────
     /// Polymorphic inline cache for field lookups (struct/entity component access)
     field_cache: CachePadded<PolymorphicInlineCache>,
@@ -7551,8 +7612,6 @@ impl Interpreter {
             jit_native_calls: 0,
             jit_vm_calls: 0,
             jit_fallback_calls: 0,
-            fn_call_counts: FxHashMap::default(),
-            jit_hot_threshold: std::env::var("JULES_JIT_HOT_THRESHOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(32),
             // Initialize inline caches with cache-line padding to prevent false sharing
             field_cache: CachePadded::new(PolymorphicInlineCache::new()),
             method_cache: CachePadded::new(PolymorphicInlineCache::new()),
@@ -7598,7 +7657,6 @@ impl Interpreter {
         self.jit_native_calls = 0;
         self.jit_vm_calls = 0;
         self.jit_fallback_calls = 0;
-        self.fn_call_counts.clear();
     }
 
     pub fn jit_counters(&self) -> (u64, u64, u64) {
@@ -7622,6 +7680,7 @@ impl Interpreter {
                 // ── Research-grade superoptimizer ─────────────────────────────
                 // Run on all VM-supported functions. Use a lighter STOKE budget
                 // for trivial functions (< 4 instrs) and heavier for larger ones.
+                maybe_superoptimize(&mut compiled, closure.decl.ret_ty.is_some(), self.jit_superopt_max_instr);
                 self.compiled_fns.insert(name, Arc::new(compiled));
             }
         }
@@ -7708,13 +7767,6 @@ impl Interpreter {
             .ok_or_else(|| RuntimeError::new(format!("undefined function `{name}`")))?;
         let expects_non_unit = closure.decl.ret_ty.is_some();
 
-        let call_count = {
-            let entry = self.fn_call_counts.entry(name.to_owned()).or_insert(0);
-            *entry = entry.saturating_add(1);
-            *entry
-        };
-        let jit_hot = call_count >= self.jit_hot_threshold.max(1);
-
         // ── Bytecode fast path ────────────────────────────────────────────────
         if self.jit_enabled && jit_hot {
             // Compile and cache once, then reuse by direct hash lookup.
@@ -7722,35 +7774,33 @@ impl Interpreter {
                 .compiled_fns
                 .entry(name.to_owned())
                 .or_insert_with(|| {
-                    let compiled = compile_fn(&closure.decl);
+                    let mut compiled = compile_fn(&closure.decl);
+                    maybe_superoptimize(&mut compiled, closure.decl.ret_ty.is_some(), self.jit_superopt_max_instr);
                     Arc::new(compiled)
                 })
                 .clone();
             #[cfg(feature = "phase3-jit")]
             {
-                let native_enabled = std::env::var_os("JULES_ENABLE_NATIVE_JIT").is_some();
-                if native_enabled {
-                    if let Some(native) = self.native_fns.get(name).cloned() {
-                        if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
-                            if !matches!(v, Value::Unit) || !expects_non_unit {
-                                self.jit_native_calls = self.jit_native_calls.saturating_add(1);
-                                return Ok(v);
-                            }
-                            if std::env::var_os("JULES_JIT_DEBUG").is_some() {
-                                eprintln!("[jit-debug] native path returned Unit for `{name}`, falling back");
-                            }
+                if let Some(native) = self.native_fns.get(name).cloned() {
+                    if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
+                        if !matches!(v, Value::Unit) || !expects_non_unit {
+                            self.jit_native_calls = self.jit_native_calls.saturating_add(1);
+                            return Ok(v);
                         }
-                    } else if let Some(native) = crate::phase3_jit::translate(&compiled) {
-                        let native = Arc::new(native);
-                        self.native_fns.insert(name.to_owned(), native.clone());
-                        if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
-                            if !matches!(v, Value::Unit) || !expects_non_unit {
-                                self.jit_native_calls = self.jit_native_calls.saturating_add(1);
-                                return Ok(v);
-                            }
-                            if std::env::var_os("JULES_JIT_DEBUG").is_some() {
-                                eprintln!("[jit-debug] native path returned Unit for `{name}`, falling back");
-                            }
+                        if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+                            eprintln!("[jit-debug] native path returned Unit for `{name}`, falling back");
+                        }
+                    }
+                } else if let Some(native) = crate::phase3_jit::translate(&compiled) {
+                    let native = Arc::new(native);
+                    self.native_fns.insert(name.to_owned(), native.clone());
+                    if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
+                        if !matches!(v, Value::Unit) || !expects_non_unit {
+                            self.jit_native_calls = self.jit_native_calls.saturating_add(1);
+                            return Ok(v);
+                        }
+                        if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+                            eprintln!("[jit-debug] native path returned Unit for `{name}`, falling back");
                         }
                     }
                 } else if std::env::var_os("JULES_JIT_DEBUG").is_some() {
@@ -7760,10 +7810,7 @@ impl Interpreter {
 
             // If lowering is lossless and arg count matches expectation, run the VM.
             if !compiled.vm_supported && std::env::var_os("JULES_JIT_DEBUG").is_some() {
-                eprintln!(
-                    "[jit-debug] `{name}` is not VM-lowerable; reasons={:?}; using tree-walker fallback",
-                    compiled.unsupported_features
-                );
+                eprintln!("[jit-debug] `{name}` is not VM-lowerable; using tree-walker fallback");
             }
             if compiled.vm_supported
                 && closure.capture.is_empty()
@@ -7784,9 +7831,6 @@ impl Interpreter {
         }
 
         // ── Fallback: tree-walker (captures, mismatched args, etc.) ──────────
-        if self.jit_enabled && !jit_hot && std::env::var_os("JULES_JIT_DEBUG").is_some() {
-            eprintln!("[jit-debug] `{}` below hot threshold ({}/{}), using tree-walker", name, call_count, self.jit_hot_threshold);
-        }
         self.jit_fallback_calls = self.jit_fallback_calls.saturating_add(1);
         let mut env = Env::new();
         env.push();
