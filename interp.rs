@@ -1308,6 +1308,32 @@ impl EcsWorld {
         let chunk_size = chunk_size.max(1);
         for chunk in pairs.chunks(chunk_size) {
             let mut i = 0usize;
+            while i + 15 < chunk.len() {
+                let slots = [
+                    chunk[i],
+                    chunk[i + 1],
+                    chunk[i + 2],
+                    chunk[i + 3],
+                    chunk[i + 4],
+                    chunk[i + 5],
+                    chunk[i + 6],
+                    chunk[i + 7],
+                    chunk[i + 8],
+                    chunk[i + 9],
+                    chunk[i + 10],
+                    chunk[i + 11],
+                    chunk[i + 12],
+                    chunk[i + 13],
+                    chunk[i + 14],
+                    chunk[i + 15],
+                ];
+                if Self::simd_update_vec3_x16_unrolled(&mut pos_set, vel_set, slots, dt) {
+                    updated += 16;
+                    i += 16;
+                    continue;
+                }
+                break;
+            }
             while i + 7 < chunk.len() {
                 let slots = [
                     chunk[i],
@@ -1319,7 +1345,6 @@ impl EcsWorld {
                     chunk[i + 6],
                     chunk[i + 7],
                 ];
-                Self::prefetch_next_vec3_slots(&pos_set, vel_set, chunk.get(i + 8));
                 if Self::simd_update_vec3_x8(&mut pos_set, vel_set, slots, dt) {
                     updated += 8;
                     i += 8;
@@ -1370,21 +1395,22 @@ impl EcsWorld {
     }
 
     #[inline]
-    fn prefetch_next_vec3_slots(
-        pos_set: &SparseSet,
+    fn simd_update_vec3_x16_unrolled(
+        pos_set: &mut SparseSet,
         vel_set: &SparseSet,
-        next: Option<&(usize, usize)>,
-    ) {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        unsafe {
-            use std::arch::x86_64::*;
-            if let Some((pi, vi)) = next {
-                let p = pos_set.dense_vals.as_ptr().add(*pi) as *const i8;
-                let v = vel_set.dense_vals.as_ptr().add(*vi) as *const i8;
-                _mm_prefetch(p, _MM_HINT_T0);
-                _mm_prefetch(v, _MM_HINT_T0);
-            }
+        slots: [(usize, usize); 16],
+        dt: f32,
+    ) -> bool {
+        let lo = [
+            slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7],
+        ];
+        let hi = [
+            slots[8], slots[9], slots[10], slots[11], slots[12], slots[13], slots[14], slots[15],
+        ];
+        if !Self::simd_update_vec3_x8(pos_set, vel_set, lo, dt) {
+            return false;
         }
+        Self::simd_update_vec3_x8(pos_set, vel_set, hi, dt)
     }
 
     #[inline]
@@ -1400,14 +1426,12 @@ impl EcsWorld {
             if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
                 return false;
             }
-            #[repr(align(32))]
-            struct Aligned([f32; 8]);
-            let mut px = Aligned([0f32; 8]);
-            let mut py = Aligned([0f32; 8]);
-            let mut pz = Aligned([0f32; 8]);
-            let mut vx = Aligned([0f32; 8]);
-            let mut vy = Aligned([0f32; 8]);
-            let mut vz = Aligned([0f32; 8]);
+            let mut px = [0f32; 8];
+            let mut py = [0f32; 8];
+            let mut pz = [0f32; 8];
+            let mut vx = [0f32; 8];
+            let mut vy = [0f32; 8];
+            let mut vz = [0f32; 8];
 
             let pos_ptr = pos_set.dense_vals.as_mut_ptr();
             let vel_ptr = vel_set.dense_vals.as_ptr();
@@ -1415,36 +1439,36 @@ impl EcsWorld {
                 let p = &mut *pos_ptr.add(*pi);
                 let v = &*vel_ptr.add(*vi);
                 if let (Value::Vec3(p3), Value::Vec3(v3)) = (p, v) {
-                    px.0[lane] = p3[0];
-                    py.0[lane] = p3[1];
-                    pz.0[lane] = p3[2];
-                    vx.0[lane] = v3[0];
-                    vy.0[lane] = v3[1];
-                    vz.0[lane] = v3[2];
+                    px[lane] = p3[0];
+                    py[lane] = p3[1];
+                    pz[lane] = p3[2];
+                    vx[lane] = v3[0];
+                    vy[lane] = v3[1];
+                    vz[lane] = v3[2];
                 } else {
                     return false;
                 }
             }
 
             let dtv = _mm256_set1_ps(dt);
-            let pxv = _mm256_load_ps(px.0.as_ptr());
-            let pyv = _mm256_load_ps(py.0.as_ptr());
-            let pzv = _mm256_load_ps(pz.0.as_ptr());
-            let vxv = _mm256_load_ps(vx.0.as_ptr());
-            let vyv = _mm256_load_ps(vy.0.as_ptr());
-            let vzv = _mm256_load_ps(vz.0.as_ptr());
+            let pxv = _mm256_loadu_ps(px.as_ptr());
+            let pyv = _mm256_loadu_ps(py.as_ptr());
+            let pzv = _mm256_loadu_ps(pz.as_ptr());
+            let vxv = _mm256_loadu_ps(vx.as_ptr());
+            let vyv = _mm256_loadu_ps(vy.as_ptr());
+            let vzv = _mm256_loadu_ps(vz.as_ptr());
             let out_x = _mm256_fmadd_ps(vxv, dtv, pxv);
             let out_y = _mm256_fmadd_ps(vyv, dtv, pyv);
             let out_z = _mm256_fmadd_ps(vzv, dtv, pzv);
-            _mm256_store_ps(px.0.as_mut_ptr(), out_x);
-            _mm256_store_ps(py.0.as_mut_ptr(), out_y);
-            _mm256_store_ps(pz.0.as_mut_ptr(), out_z);
+            _mm256_storeu_ps(px.as_mut_ptr(), out_x);
+            _mm256_storeu_ps(py.as_mut_ptr(), out_y);
+            _mm256_storeu_ps(pz.as_mut_ptr(), out_z);
 
             for (lane, (pi, _)) in slots.iter().enumerate() {
                 if let Value::Vec3(p3) = &mut *pos_ptr.add(*pi) {
-                    p3[0] = px.0[lane];
-                    p3[1] = py.0[lane];
-                    p3[2] = pz.0[lane];
+                    p3[0] = px[lane];
+                    p3[1] = py[lane];
+                    p3[2] = pz[lane];
                 } else {
                     return false;
                 }

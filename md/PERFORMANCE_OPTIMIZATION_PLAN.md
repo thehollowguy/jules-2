@@ -13,14 +13,14 @@ Benchmark snapshot (recorded on 2026-04-08, `bench-ecs`):
 - steps: 50
 - dt: 0.016
 - command: `cargo run --release --bin bench-ecs -- 5000 50 0.016 both`
-- baseline: 701.6 steps/s
-- soa-linear: 6167.9 steps/s
-- fused-linear: 8359.8 steps/s
-- chunked-fused: 11981.7 steps/s
-- superoptimizer: 37470.7 steps/s
-- aot-hash: 47740.4 steps/s (kernel selected by CPU feature detection: `Avx2Fma`, x8 + prefetch software-pipelined dispatch)
-- rust: 87444.7 steps/s
-- aot-hash prep/iterate split: prepare=0.000000s, iterate=0.001047s
+- baseline: 716.6 steps/s
+- soa-linear: 6754.8 steps/s
+- fused-linear: 9238.8 steps/s
+- chunked-fused: 12413.6 steps/s
+- superoptimizer: 40377.0 steps/s
+- aot-hash: 43218.8 steps/s (kernel selected by CPU feature detection: `Avx2Fma`, x16-unrolled dispatch enabled)
+- rust: 93035.0 steps/s
+- aot-hash prep/iterate split: prepare=0.000000s, iterate=0.001157s
 - hotspot weights (aot-hash): query=0.0%, fetch=0.0%, math=100.0%, write=0.0%
 - recommendation: for throughput runs use `aot-hash` (feature-selected kernel) or `superoptimizer`; keep query matching/cache validation outside the simulation loop.
 
