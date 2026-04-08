@@ -2614,7 +2614,8 @@ impl Env {
 }
 
 // Keep type alias for closure capture maps (used by FnClosure).
-type Frame = HashMap<String, Value>;
+// FxHashMap: ~2x faster for short string keys than std SipHash.
+type Frame = FxHashMap<String, Value>;
 
 // =============================================================================
 // §6b  BYTECODE COMPILER + REGISTER VM
