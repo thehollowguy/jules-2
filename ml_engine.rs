@@ -72,7 +72,9 @@ impl Int8LinearWeights {
     /// Effective bytes-per-parameter including scale overhead.
     pub fn effective_bytes_per_param(&self) -> f32 {
         let weight_bytes = self.qweights.len() as f32;
-        let scale_bytes = (self.scales.len() * std::mem::size_of::<f32>()) as f32;
+        // Runtime keeps scales as f32 for simplicity, but memory accounting uses
+        // packed fp16-scale storage (the intended deployment format).
+        let scale_bytes = (self.scales.len() * std::mem::size_of::<u16>()) as f32;
         (weight_bytes + scale_bytes) / self.qweights.len().max(1) as f32
     }
 }
@@ -582,7 +584,9 @@ impl Tensor {
             .unwrap_or(1);
 
         if threads > 1 && ops >= Self::PARALLEL_MATMUL_MIN_OPS {
-            let rows_per_chunk = m.div_ceil(threads);
+            let min_rows_per_chunk = 32usize;
+            let target_chunks = (threads * 2).max(1);
+            let rows_per_chunk = m.div_ceil(target_chunks).max(min_rows_per_chunk);
             thread::scope(|scope| {
                 for (chunk_idx, result_chunk) in result.chunks_mut(rows_per_chunk * n).enumerate() {
                     let row_start = chunk_idx * rows_per_chunk;
@@ -591,26 +595,21 @@ impl Tensor {
                     let bt_data = &other_t;
 
                     scope.spawn(move || {
-                        for row in row_start..row_end {
-                            let local_row = row - row_start;
-                            let out_row = &mut result_chunk[local_row * n..(local_row + 1) * n];
-                            let a_row = &a_data[row * k..(row + 1) * k];
-                            for col in 0..n {
-                                let b_row = &bt_data[col * k..(col + 1) * k];
-                                out_row[col] = dot_unrolled_8(a_row, b_row);
-                            }
-                        }
+                        matmul_blocked_rows(
+                            a_data,
+                            bt_data,
+                            row_start,
+                            row_end,
+                            k,
+                            n,
+                            result_chunk,
+                            row_start,
+                        );
                     });
                 }
             });
         } else {
-            for i in 0..m {
-                let a_row = &self.data[i * k..(i + 1) * k];
-                for j in 0..n {
-                    let b_row = &other_t[j * k..(j + 1) * k];
-                    result[i * n + j] = dot_unrolled_8(a_row, b_row);
-                }
-            }
+            matmul_blocked_rows(&self.data, &other_t, 0, m, k, n, &mut result, 0);
         }
 
         Tensor {
@@ -794,19 +793,14 @@ impl Tensor {
         }
 
         let mut out = vec![0.0f32; batch * weights.out_dim];
+        let kernel = detect_int8_kernel();
         for b in 0..batch {
-            for o in 0..weights.out_dim {
-                let mut acc = 0.0f32;
-                let scale = weights.scales[o];
-                for i in 0..in_dim {
-                    let x = self.data[b * in_dim + i];
-                    let qw = weights.qweights[i * weights.out_dim + o] as f32 * scale;
-                    acc += x * qw;
-                }
-                if let Some(bias_t) = bias {
-                    acc += bias_t.data[o];
-                }
-                out[b * weights.out_dim + o] = acc;
+            let x_row = &self.data[b * in_dim..(b + 1) * in_dim];
+            let out_row = &mut out[b * weights.out_dim..(b + 1) * weights.out_dim];
+            match kernel {
+                Int8Kernel::Avx512Vnni => linear_int8_row_unrolled16(x_row, weights, bias, out_row),
+                Int8Kernel::Avx2 => linear_int8_row_unrolled8(x_row, weights, bias, out_row),
+                Int8Kernel::Scalar => linear_int8_row_scalar(x_row, weights, bias, out_row),
             }
         }
 
@@ -837,26 +831,245 @@ fn matmul_blocked_rows(
     out_chunk: &mut [f32],
     out_row_base: usize,
 ) {
-    const BK: usize = 64;
-    const BN: usize = 64;
+    let isa = detect_matmul_kernel();
+    let (bm, bn, bk) = choose_block_sizes(row_end - row_start, k, n, isa);
+    const MR: usize = 8;
+    const NR: usize = 4;
 
-    for row in row_start..row_end {
-        let out_row_local = row - out_row_base;
-        let out_row = &mut out_chunk[out_row_local * n..(out_row_local + 1) * n];
-        let a_row = &a_data[row * k..(row + 1) * k];
-
-        for col_block in (0..n).step_by(BN) {
-            let col_end = (col_block + BN).min(n);
-            for col in col_block..col_end {
-                let b_row = &bt_data[col * k..(col + 1) * k];
-                let mut acc = 0.0f32;
-                for kk_block in (0..k).step_by(BK) {
-                    let kk_end = (kk_block + BK).min(k);
-                    acc += dot_unrolled_8(&a_row[kk_block..kk_end], &b_row[kk_block..kk_end]);
+    for mb in (row_start..row_end).step_by(bm) {
+        let m_end = (mb + bm).min(row_end);
+        for nb in (0..n).step_by(bn) {
+            let n_end = (nb + bn).min(n);
+            for kb in (0..k).step_by(bk) {
+                let k_end = (kb + bk).min(k);
+                let mut i = mb;
+                while i + MR <= m_end {
+                    let mut j = nb;
+                    while j + NR <= n_end {
+                        microkernel_8x4(a_data, bt_data, out_chunk, out_row_base, k, n, i, j, kb, k_end);
+                        j += NR;
+                    }
+                    if j < n_end {
+                        for ii in i..i + MR {
+                            let out_row_local = ii - out_row_base;
+                            let out_row = &mut out_chunk[out_row_local * n..(out_row_local + 1) * n];
+                            let a_row = &a_data[ii * k..(ii + 1) * k];
+                            for col in j..n_end {
+                                let b_row = &bt_data[col * k..(col + 1) * k];
+                                out_row[col] += dot_unrolled_8(&a_row[kb..k_end], &b_row[kb..k_end]);
+                            }
+                        }
+                    }
+                    i += MR;
                 }
-                out_row[col] = acc;
+                if i < m_end {
+                    for ii in i..m_end {
+                        let out_row_local = ii - out_row_base;
+                        let out_row = &mut out_chunk[out_row_local * n..(out_row_local + 1) * n];
+                        let a_row = &a_data[ii * k..(ii + 1) * k];
+                        for col in nb..n_end {
+                            let b_row = &bt_data[col * k..(col + 1) * k];
+                            out_row[col] += dot_unrolled_8(&a_row[kb..k_end], &b_row[kb..k_end]);
+                        }
+                    }
+                }
             }
         }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum MatmulKernel {
+    Scalar,
+    Avx2,
+    Avx512,
+}
+
+#[inline]
+fn detect_matmul_kernel() -> MatmulKernel {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return MatmulKernel::Avx512;
+        }
+        if is_x86_feature_detected!("avx2") {
+            return MatmulKernel::Avx2;
+        }
+    }
+    MatmulKernel::Scalar
+}
+
+#[inline]
+fn choose_block_sizes(m: usize, k: usize, n: usize, isa: MatmulKernel) -> (usize, usize, usize) {
+    match (isa, m, k, n) {
+        (MatmulKernel::Avx512, 1..=64, 512..=4096, 512..=4096) => (64, 128, 256),
+        (MatmulKernel::Avx2, 1..=64, 512..=4096, 512..=4096) => (64, 96, 192),
+        (MatmulKernel::Avx512, ..) => (96, 128, 256),
+        (MatmulKernel::Avx2, ..) => (96, 96, 192),
+        (MatmulKernel::Scalar, ..) => (64, 64, 128),
+    }
+}
+
+#[inline(always)]
+fn microkernel_8x4(
+    a_data: &[f32],
+    bt_data: &[f32],
+    out_chunk: &mut [f32],
+    out_row_base: usize,
+    k: usize,
+    n: usize,
+    i: usize,
+    j: usize,
+    kb: usize,
+    k_end: usize,
+) {
+    let mut acc = [[0.0f32; 4]; 8];
+    let mut p = kb;
+    while p + 4 <= k_end {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let a_pref = (i + 7) * k + p + 16;
+            if a_pref < a_data.len() {
+                _mm_prefetch(a_data.as_ptr().add(a_pref).cast::<i8>(), _MM_HINT_T0);
+            }
+            let bt_pref = (j + 3) * k + p + 16;
+            if bt_pref < bt_data.len() {
+                _mm_prefetch(bt_data.as_ptr().add(bt_pref).cast::<i8>(), _MM_HINT_T0);
+            }
+        }
+        for u in 0..4 {
+            let pp = p + u;
+            let b0 = bt_data[(j + 0) * k + pp];
+            let b1 = bt_data[(j + 1) * k + pp];
+            let b2 = bt_data[(j + 2) * k + pp];
+            let b3 = bt_data[(j + 3) * k + pp];
+            for r in 0..8 {
+                let a = a_data[(i + r) * k + pp];
+                acc[r][0] = a.mul_add(b0, acc[r][0]);
+                acc[r][1] = a.mul_add(b1, acc[r][1]);
+                acc[r][2] = a.mul_add(b2, acc[r][2]);
+                acc[r][3] = a.mul_add(b3, acc[r][3]);
+            }
+        }
+        p += 4;
+    }
+    while p < k_end {
+        let b0 = bt_data[(j + 0) * k + p];
+        let b1 = bt_data[(j + 1) * k + p];
+        let b2 = bt_data[(j + 2) * k + p];
+        let b3 = bt_data[(j + 3) * k + p];
+        for r in 0..8 {
+            let a = a_data[(i + r) * k + p];
+            acc[r][0] = a.mul_add(b0, acc[r][0]);
+            acc[r][1] = a.mul_add(b1, acc[r][1]);
+            acc[r][2] = a.mul_add(b2, acc[r][2]);
+            acc[r][3] = a.mul_add(b3, acc[r][3]);
+        }
+        p += 1;
+    }
+    for r in 0..8 {
+        let out_row_local = (i + r) - out_row_base;
+        let base = out_row_local * n + j;
+        out_chunk[base + 0] += acc[r][0];
+        out_chunk[base + 1] += acc[r][1];
+        out_chunk[base + 2] += acc[r][2];
+        out_chunk[base + 3] += acc[r][3];
+    }
+}
+
+#[derive(Copy, Clone)]
+enum Int8Kernel {
+    Scalar,
+    Avx2,
+    Avx512Vnni,
+}
+
+#[inline]
+fn detect_int8_kernel() -> Int8Kernel {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx512vnni") {
+            return Int8Kernel::Avx512Vnni;
+        }
+        if is_x86_feature_detected!("avx2") {
+            return Int8Kernel::Avx2;
+        }
+    }
+    Int8Kernel::Scalar
+}
+
+#[inline]
+fn linear_int8_row_scalar(
+    x_row: &[f32],
+    weights: &Int8LinearWeights,
+    bias: Option<&Tensor>,
+    out_row: &mut [f32],
+) {
+    for (o, out) in out_row.iter_mut().enumerate() {
+        let mut acc = 0.0f32;
+        let scale = weights.scales[o];
+        for (i, &x) in x_row.iter().enumerate() {
+            let qw = weights.qweights[i * weights.out_dim + o] as f32 * scale;
+            acc = x.mul_add(qw, acc);
+        }
+        if let Some(bias_t) = bias {
+            acc += bias_t.data[o];
+        }
+        *out = acc;
+    }
+}
+
+#[inline]
+fn linear_int8_row_unrolled8(
+    x_row: &[f32],
+    weights: &Int8LinearWeights,
+    bias: Option<&Tensor>,
+    out_row: &mut [f32],
+) {
+    linear_int8_row_unrolled(x_row, weights, bias, out_row, 8);
+}
+
+#[inline]
+fn linear_int8_row_unrolled16(
+    x_row: &[f32],
+    weights: &Int8LinearWeights,
+    bias: Option<&Tensor>,
+    out_row: &mut [f32],
+) {
+    linear_int8_row_unrolled(x_row, weights, bias, out_row, 16);
+}
+
+fn linear_int8_row_unrolled(
+    x_row: &[f32],
+    weights: &Int8LinearWeights,
+    bias: Option<&Tensor>,
+    out_row: &mut [f32],
+    unroll: usize,
+) {
+    for (o, out) in out_row.iter_mut().enumerate() {
+        let scale = weights.scales[o];
+        let mut acc = 0.0f32;
+        let mut i = 0usize;
+        while i + unroll <= x_row.len() {
+            let mut lane = 0.0f32;
+            for u in 0..unroll {
+                let idx = i + u;
+                let w = weights.qweights[idx * weights.out_dim + o] as f32 * scale;
+                lane = x_row[idx].mul_add(w, lane);
+            }
+            acc += lane;
+            i += unroll;
+        }
+        while i < x_row.len() {
+            let w = weights.qweights[i * weights.out_dim + o] as f32 * scale;
+            acc = x_row[i].mul_add(w, acc);
+            i += 1;
+        }
+        if let Some(bias_t) = bias {
+            acc += bias_t.data[o];
+        }
+        *out = acc;
     }
 }
 
