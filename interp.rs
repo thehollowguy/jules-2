@@ -148,9 +148,6 @@
     clippy::large_enum_variant,
     clippy::too_many_arguments
 )]
-#![feature(core_intrinsics)]
-#![feature(maybe_uninit_uninit_array)]
-#![feature(maybe_uninit_slice)]
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -165,12 +162,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 // ── Branch prediction hints using compiler intrinsics ─────────────────────────
 #[inline(always)]
 fn likely(b: bool) -> bool {
-    unsafe { std::intrinsics::likely(b) }
+    b
 }
 
 #[inline(always)]
 fn unlikely(b: bool) -> bool {
-    unsafe { std::intrinsics::unlikely(b) }
+    b
 }
 
 // ── Cache-line padding to prevent false sharing ───────────────────────────────
@@ -2660,10 +2657,12 @@ impl EcsWorld {
                 let dmg_ptr = damage_set.dense_vals.as_ptr();
 
                 // Prefetch data for next iteration
-                _mm_prefetch(pos_ptr as *const i8, _MM_HINT_T0);
-                _mm_prefetch(vel_ptr as *const i8, _MM_HINT_T0);
-                _mm_prefetch(hp_ptr as *const i8, _MM_HINT_T0);
-                _mm_prefetch(dmg_ptr as *const i8, _MM_HINT_T0);
+                unsafe {
+                    _mm_prefetch(pos_ptr as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(vel_ptr as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(hp_ptr as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(dmg_ptr as *const i8, _MM_HINT_T0);
+                }
 
                 let mut i = 0usize;
                 while unlikely(i + 7 < chunk.len()) {
@@ -3619,15 +3618,39 @@ impl Compiler {
     /// Compile a block, returning the register holding the tail value.
     fn compile_block(&mut self, block: &Block, dst: u16) {
         self.push_scope();
-        for stmt in &block.stmts {
-            self.compile_stmt(stmt);
-            // If stmt itself ends in Return/Break/Continue we can stop.
-        }
+
+        // Prefer explicit AST tail when present.
         if let Some(tail) = &block.tail {
+            for stmt in &block.stmts {
+                self.compile_stmt(stmt);
+            }
             self.compile_expr_into(tail, dst);
-        } else {
-            self.emit(Instr::LoadUnit(dst));
+            self.pop_scope();
+            return;
         }
+
+        // Some parser/lowering paths keep the final value-producing expression
+        // as `Stmt::Expr { has_semi: false }` instead of filling `block.tail`.
+        // Preserve implicit return semantics for VM/JIT by compiling that final
+        // expression into `dst` rather than discarding it.
+        if let Some((last, rest)) = block.stmts.split_last() {
+            for stmt in rest {
+                self.compile_stmt(stmt);
+            }
+            if let Stmt::Expr {
+                expr,
+                has_semi: false,
+                ..
+            } = last
+            {
+                self.compile_expr_into(expr, dst);
+                self.pop_scope();
+                return;
+            }
+            self.compile_stmt(last);
+        }
+
+        self.emit(Instr::LoadUnit(dst));
         self.pop_scope();
     }
 
@@ -4158,17 +4181,17 @@ impl Drop for VmRegsGuard {
 pub fn vm_exec(
     interp: &mut Interpreter,
     func: &CompiledFn,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> Result<Value, RuntimeError> {
     let reg_len = func.slot_count as usize + 32;
     let mut regs_guard = VmRegsGuard::new(reg_len);
     let regs = regs_guard.regs_mut();
 
     // Load arguments.
-    for (i, arg) in args.into_iter().enumerate() {
+    for (i, arg) in args.iter().enumerate() {
         if i < reg_len {
             // SAFETY: `i < reg_len == regs.len()` guarded above.
-            unsafe { *regs.get_unchecked_mut(i) = arg };
+            unsafe { *regs.get_unchecked_mut(i) = arg.clone() };
         }
     }
 
@@ -7476,6 +7499,10 @@ pub struct Interpreter {
     jit_enabled: bool,
     /// If enabled, compile all top-level functions at load time to remove first-call latency.
     advance_jit_enabled: bool,
+    /// Lightweight JIT dispatch counters for benchmark/debug visibility.
+    jit_native_calls: u64,
+    jit_vm_calls: u64,
+    jit_fallback_calls: u64,
     // ── Inline caches for hot path optimization ───────────────────────────────
     /// Polymorphic inline cache for field lookups (struct/entity component access)
     field_cache: CachePadded<PolymorphicInlineCache>,
@@ -7518,6 +7545,9 @@ impl Interpreter {
             runtime_profile: FxHashMap::default(),
             jit_enabled: true,
             advance_jit_enabled: true,
+            jit_native_calls: 0,
+            jit_vm_calls: 0,
+            jit_fallback_calls: 0,
             // Initialize inline caches with cache-line padding to prevent false sharing
             field_cache: CachePadded::new(PolymorphicInlineCache::new()),
             method_cache: CachePadded::new(PolymorphicInlineCache::new()),
@@ -7555,6 +7585,16 @@ impl Interpreter {
     /// Enable/disable advance JIT (eager pre-compilation on program load).
     pub fn set_advance_jit_enabled(&mut self, enabled: bool) {
         self.advance_jit_enabled = enabled;
+    }
+
+    pub fn reset_jit_counters(&mut self) {
+        self.jit_native_calls = 0;
+        self.jit_vm_calls = 0;
+        self.jit_fallback_calls = 0;
+    }
+
+    pub fn jit_counters(&self) -> (u64, u64, u64) {
+        (self.jit_native_calls, self.jit_vm_calls, self.jit_fallback_calls)
     }
 
     fn precompile_loaded_functions(&mut self) {
@@ -7649,6 +7689,7 @@ impl Interpreter {
             .get(name)
             .cloned()
             .ok_or_else(|| RuntimeError::new(format!("undefined function `{name}`")))?;
+        let expects_non_unit = closure.decl.ret_ty.is_some();
 
         // ── Bytecode fast path ────────────────────────────────────────────────
         if self.jit_enabled {
@@ -7673,31 +7714,53 @@ impl Interpreter {
             {
                 if let Some(native) = self.native_fns.get(name).cloned() {
                     if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
-                        return Ok(v);
+                        if !matches!(v, Value::Unit) || !expects_non_unit {
+                            self.jit_native_calls = self.jit_native_calls.saturating_add(1);
+                            return Ok(v);
+                        }
+                        if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+                            eprintln!("[jit-debug] native path returned Unit for `{name}`, falling back");
+                        }
                     }
                 } else if let Some(native) = crate::phase3_jit::translate(&compiled) {
                     let native = Arc::new(native);
                     self.native_fns.insert(name.to_owned(), native.clone());
                     if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
-                        return Ok(v);
+                        if !matches!(v, Value::Unit) || !expects_non_unit {
+                            self.jit_native_calls = self.jit_native_calls.saturating_add(1);
+                            return Ok(v);
+                        }
+                        if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+                            eprintln!("[jit-debug] native path returned Unit for `{name}`, falling back");
+                        }
                     }
                 }
             }
 
             // If lowering is lossless and arg count matches expectation, run the VM.
+            if !compiled.vm_supported && std::env::var_os("JULES_JIT_DEBUG").is_some() {
+                eprintln!("[jit-debug] `{name}` is not VM-lowerable; using tree-walker fallback");
+            }
             if compiled.vm_supported
                 && closure.capture.is_empty()
                 && args.len() == closure.decl.params.len()
             {
-                let result = vm_exec(self, &compiled, args).map(|r| match r {
+                let result = vm_exec(self, &compiled, &args).map(|r| match r {
                     Value::Return(v) => *v,
                     other => other,
-                });
-                return result;
+                })?;
+                if !matches!(result, Value::Unit) || !expects_non_unit {
+                    self.jit_vm_calls = self.jit_vm_calls.saturating_add(1);
+                    return Ok(result);
+                }
+                if std::env::var_os("JULES_JIT_DEBUG").is_some() {
+                    eprintln!("[jit-debug] VM path returned Unit for `{name}`, falling back to tree-walker");
+                }
             }
         }
 
         // ── Fallback: tree-walker (captures, mismatched args, etc.) ──────────
+        self.jit_fallback_calls = self.jit_fallback_calls.saturating_add(1);
         let mut env = Env::new();
         env.push();
         // Inject captured environment for closures.
@@ -9564,7 +9627,7 @@ impl Interpreter {
                 Ok(Value::Bool(enabled))
             }
             "debug::jit_state" => {
-                let mut state = HashMap::default();
+                let mut state = FxHashMap::default();
                 state.insert("jit_enabled".to_string(), Value::Bool(self.jit_enabled));
                 state.insert(
                     "advance_jit_enabled".to_string(),
@@ -9587,7 +9650,7 @@ impl Interpreter {
             }
             "debug::runtime_hotspots" => {
                 let limit = args.first().and_then(|v| v.as_i64()).unwrap_or(8).max(1) as usize;
-                let total_nanos: u128 = self.runtime_profile.values().map(|(_, n)| *n).sum();
+                let total_nanos: u128 = self.runtime_profile.values().map(|(_, n)| *n as u128).sum();
                 let mut rows = self
                     .runtime_profile
                     .iter()
@@ -9596,7 +9659,7 @@ impl Interpreter {
                 rows.sort_by(|a, b| b.2.cmp(&a.2));
                 let mut out = Vec::new();
                 for (name, calls, nanos) in rows.into_iter().take(limit) {
-                    let mut row = HashMap::default();
+                    let mut row = FxHashMap::default();
                     let total_ms = nanos as f64 / 1_000_000.0;
                     let avg_us = if calls == 0 {
                         0.0
