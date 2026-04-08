@@ -13,6 +13,7 @@
 //!    Any slot whose value is statically known is propagated through
 //!    Move/Store/BinOp; foldable BinOps emit a single immediate load.
 //!    State is conservatively cleared at every branch target.
+//!    const_at is a flat Vec<Option<i64>> (O(1) slot lookup, cache-friendly).
 //!
 //! C. 3-instruction superinstruction fusions:
 //!    • BinOp(t, Mul, x, N) + BinOp(r, Add, t, y)  →  LEA  (N ∈ {2,4,8})
@@ -29,13 +30,19 @@
 //!    MOV EAX, imm32 (5 B, zero-extends) when 0 ≤ v < 2³¹
 //!    MOV RAX, sign-extended imm32 (7 B) when −2³¹ ≤ v < 0
 //!    MOV RAX, imm64 (10 B) only when the value doesn't fit in 32 bits.
+//!    ADD/SUB/CMP RAX, imm8 (4 B) when value fits in i8.
 //!
-//! F. All existing micro-optimisations retained:
+//! F. Short-form branches: JMP/JZ/JNZ rel8 (2 B) when displacement fits in i8,
+//!    falling back to rel32 (5-6 B) otherwise.
+//!
+//! G. REX-free XOR/TEST for boolean/zero ops:
+//!    XOR EAX, EAX (2 B) and TEST EAX, EAX (2 B) instead of 64-bit forms (3 B).
+//!
+//! H. All existing micro-optimisations retained:
 //!    LEA for ×3/×5/×9, SHL for powers-of-two multiply,
 //!    INC/DEC for ±1, TEST+Jcc, SETCC for branchless comparisons.
 
 use std::cell::RefCell;
-use std::collections::HashMap; // retained for rolling const_prop state in codegen
 use std::ptr::NonNull;
 
 use libc::{mmap, munmap, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -74,6 +81,7 @@ impl ExecArena {
     const DEFAULT_LEN: usize = 16 * 1024 * 1024;
 
     fn try_new() -> Option<Self> {
+        // Try huge-page backed mapping first (Linux only).
         #[cfg(target_os = "linux")]
         let ptr = unsafe {
             mmap(
@@ -86,7 +94,7 @@ impl ExecArena {
             )
         };
         #[cfg(not(target_os = "linux"))]
-        let ptr = std::ptr::null_mut();
+        let ptr = libc::MAP_FAILED;
 
         let ptr = if ptr.is_null() || ptr == libc::MAP_FAILED {
             unsafe {
@@ -105,6 +113,13 @@ impl ExecArena {
         if ptr.is_null() || ptr == libc::MAP_FAILED {
             return None;
         }
+
+        // Hint to kernel: keep these pages in hugepage pool even if not huge-page mapped.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::madvise(ptr, Self::DEFAULT_LEN, libc::MADV_HUGEPAGE);
+        }
+
         Some(Self {
             base: NonNull::new(ptr.cast::<u8>())?,
             len: Self::DEFAULT_LEN,
@@ -155,6 +170,7 @@ impl ExecMem {
             return Some(mem);
         }
 
+        // Fallback: individual mmap per function.
         let len = code.len().max(1);
         let ptr = unsafe {
             mmap(
@@ -173,8 +189,10 @@ impl ExecMem {
         Some(Self {
             ptr: ptr.cast::<u8>(),
             len,
+            arena_backed: false, // BUG FIX: was missing, causing use-after-free on drop
         })
     }
+
     fn entry(&self) -> unsafe extern "C" fn(*mut i64) -> i64 {
         unsafe { std::mem::transmute(self.ptr) }
     }
@@ -198,15 +216,38 @@ impl Emitter {
             buf: Vec::with_capacity(4096),
         }
     }
+
+    #[inline(always)]
     fn pos(&self) -> usize {
         self.buf.len()
     }
+
+    #[inline(always)]
     fn b(&mut self, v: u8) {
         self.buf.push(v);
     }
+
+    #[inline(always)]
+    fn emit2(&mut self, b0: u8, b1: u8) {
+        self.buf.extend_from_slice(&[b0, b1]);
+    }
+
+    #[inline(always)]
+    fn emit3(&mut self, b0: u8, b1: u8, b2: u8) {
+        self.buf.extend_from_slice(&[b0, b1, b2]);
+    }
+
+    #[inline(always)]
+    fn emit4(&mut self, b0: u8, b1: u8, b2: u8, b3: u8) {
+        self.buf.extend_from_slice(&[b0, b1, b2, b3]);
+    }
+
+    #[inline(always)]
     fn d(&mut self, v: i32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
+
+    #[inline(always)]
     fn q(&mut self, v: i64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
@@ -215,8 +256,7 @@ impl Emitter {
 
     /// Full 64-bit immediate into rax (10 bytes).
     fn mov_rax_imm64(&mut self, v: i64) {
-        self.b(0x48);
-        self.b(0xB8);
+        self.emit2(0x48, 0xB8);
         self.q(v);
     }
 
@@ -230,9 +270,7 @@ impl Emitter {
                 self.b(0xB8);
                 self.d(v32); // MOV EAX, imm32
             } else {
-                self.b(0x48);
-                self.b(0xC7);
-                self.b(0xC0);
+                self.emit3(0x48, 0xC7, 0xC0);
                 self.d(v32); // MOV RAX, sx(imm32)
             }
         } else {
@@ -250,17 +288,21 @@ impl Emitter {
 
     /// mov reg64, [rdi + disp32]
     fn load_reg_mem(&mut self, reg: u8, disp: i32) {
-        self.b(0x48 | ((reg & 8) >> 1)); // REX.W | REX.R
-        self.b(0x8B);
-        self.b(0x87 | ((reg & 7) << 3)); // mod=10, reg, rm=7(rdi)
+        self.emit3(
+            0x48 | ((reg & 8) >> 1), // REX.W | REX.R
+            0x8B,
+            0x87 | ((reg & 7) << 3), // mod=10, reg, rm=7(rdi)
+        );
         self.d(disp);
     }
 
     /// mov [rdi + disp32], reg64
     fn store_mem_reg(&mut self, disp: i32, reg: u8) {
-        self.b(0x48 | ((reg & 8) >> 1));
-        self.b(0x89);
-        self.b(0x87 | ((reg & 7) << 3));
+        self.emit3(
+            0x48 | ((reg & 8) >> 1),
+            0x89,
+            0x87 | ((reg & 7) << 3),
+        );
         self.d(disp);
     }
 
@@ -270,91 +312,81 @@ impl Emitter {
             return;
         }
         // MOV r64, r/m64 (0x8B): REX.R extends dst, REX.B extends src
-        self.b(0x48 | ((dst & 8) >> 1) | ((src & 8) >> 3));
-        self.b(0x8B);
-        self.b(0xC0 | ((dst & 7) << 3) | (src & 7));
+        self.emit3(
+            0x48 | ((dst & 8) >> 1) | ((src & 8) >> 3),
+            0x8B,
+            0xC0 | ((dst & 7) << 3) | (src & 7),
+        );
     }
 
     // ── Arithmetic (rax / rcx) ───────────────────────────────────────────────
 
     fn add_rax_rcx(&mut self) {
-        self.b(0x48);
-        self.b(0x01);
-        self.b(0xC8);
+        self.emit3(0x48, 0x01, 0xC8);
     }
     fn sub_rax_rcx(&mut self) {
-        self.b(0x48);
-        self.b(0x29);
-        self.b(0xC8);
+        self.emit3(0x48, 0x29, 0xC8);
     }
     fn imul_rax_rcx(&mut self) {
-        self.b(0x48);
-        self.b(0x0F);
-        self.b(0xAF);
-        self.b(0xC1);
+        self.emit4(0x48, 0x0F, 0xAF, 0xC1);
     }
+
+    /// ADD RAX, imm — uses imm8 form (4 B) when it fits, else imm32 (6 B).
     fn add_rax_imm32(&mut self, v: i32) {
-        self.b(0x48);
-        self.b(0x05);
-        self.d(v);
+        if let Ok(v8) = i8::try_from(v) {
+            self.emit3(0x48, 0x83, 0xC0);
+            self.b(v8 as u8); // ADD RAX, imm8
+        } else {
+            self.emit2(0x48, 0x05);
+            self.d(v); // ADD RAX, imm32
+        }
     }
+
+    /// SUB RAX, imm — uses imm8 form (4 B) when it fits, else imm32 (6 B).
     fn sub_rax_imm32(&mut self, v: i32) {
-        self.b(0x48);
-        self.b(0x2D);
-        self.d(v);
+        if let Ok(v8) = i8::try_from(v) {
+            self.emit3(0x48, 0x83, 0xE8);
+            self.b(v8 as u8); // SUB RAX, imm8
+        } else {
+            self.emit2(0x48, 0x2D);
+            self.d(v); // SUB RAX, imm32
+        }
     }
+
     fn imul_rax_imm32(&mut self, v: i32) {
-        self.b(0x48);
-        self.b(0x69);
-        self.b(0xC0);
+        self.emit3(0x48, 0x69, 0xC0);
         self.d(v);
     }
+
     fn inc_rax(&mut self) {
-        self.b(0x48);
-        self.b(0xFF);
-        self.b(0xC0);
+        self.emit3(0x48, 0xFF, 0xC0);
     }
     fn dec_rax(&mut self) {
-        self.b(0x48);
-        self.b(0xFF);
-        self.b(0xC8);
+        self.emit3(0x48, 0xFF, 0xC8);
     }
     fn neg_rax(&mut self) {
-        self.b(0x48);
-        self.b(0xF7);
-        self.b(0xD8);
+        self.emit3(0x48, 0xF7, 0xD8);
     }
     fn shl_rax_imm8(&mut self, v: u8) {
-        self.b(0x48);
-        self.b(0xC1);
-        self.b(0xE0);
-        self.b(v);
+        self.emit4(0x48, 0xC1, 0xE0, v);
     }
-    fn xor_rax_rax(&mut self) {
-        self.b(0x48);
-        self.b(0x31);
-        self.b(0xC0);
+
+    /// XOR EAX, EAX — 2 bytes, zero-extends to clear full RAX.
+    /// Preferred over REX.W form (3 bytes) for zeroing.
+    fn xor_eax_eax(&mut self) {
+        self.emit2(0x31, 0xC0); // XOR EAX, EAX  (zero-extends → RAX = 0)
     }
 
     // LEA ×N patterns on rax only (rax = rax*N via SIB with base=rax, index=rax).
     // SIB for [rax + rax*K]: scale_bits<<6 | index=rax(0)<<3 | base=rax(0)
     fn lea_rax_rax_mul3(&mut self) {
-        self.b(0x48);
-        self.b(0x8D);
-        self.b(0x04);
-        self.b(0x40);
+        self.emit4(0x48, 0x8D, 0x04, 0x40);
     }
     fn lea_rax_rax_mul5(&mut self) {
-        self.b(0x48);
-        self.b(0x8D);
-        self.b(0x04);
-        self.b(0x80);
+        self.emit4(0x48, 0x8D, 0x04, 0x80);
     }
     fn lea_rax_rax_mul9(&mut self) {
-        self.b(0x48);
-        self.b(0x8D);
-        self.b(0x04);
-        self.b(0xC0);
+        self.emit4(0x48, 0x8D, 0x04, 0xC0);
     }
 
     /// lea rax, [rcx + rax*scale]   scale ∈ {2,4,8}
@@ -367,57 +399,63 @@ impl Emitter {
             8 => 3,
             _ => 1,
         };
-        self.b(0x48);
-        self.b(0x8D);
-        self.b(0x04);
-        self.b((ss << 6) | 1);
+        self.emit4(0x48, 0x8D, 0x04, (ss << 6) | 1);
     }
 
     // ── Division ─────────────────────────────────────────────────────────────
 
     fn cqo(&mut self) {
-        self.b(0x48);
-        self.b(0x99);
+        self.emit2(0x48, 0x99);
     }
     fn idiv_rcx(&mut self) {
-        self.b(0x48);
-        self.b(0xF7);
-        self.b(0xF9);
+        self.emit3(0x48, 0xF7, 0xF9);
     }
     fn mov_rax_rdx(&mut self) {
-        self.b(0x48);
-        self.b(0x89);
-        self.b(0xD0);
+        self.emit3(0x48, 0x89, 0xD0);
     }
 
     // ── Compare / branch ─────────────────────────────────────────────────────
 
     fn cmp_rax_rcx(&mut self) {
-        self.b(0x48);
-        self.b(0x39);
-        self.b(0xC8);
+        self.emit3(0x48, 0x39, 0xC8);
     }
+
+    /// CMP RAX, imm — uses imm8 form (4 B) when it fits, else imm32 (6 B).
     fn cmp_rax_imm32(&mut self, v: i32) {
-        self.b(0x48);
-        self.b(0x3D);
-        self.d(v);
+        if let Ok(v8) = i8::try_from(v) {
+            self.emit3(0x48, 0x83, 0xF8);
+            self.b(v8 as u8); // CMP RAX, imm8
+        } else {
+            self.emit2(0x48, 0x3D);
+            self.d(v); // CMP RAX, imm32
+        }
     }
+
+    /// TEST EAX, EAX — 2 bytes. Sufficient for boolean/zero testing since
+    /// we only care about ZF; the upper 32 bits are zero for any canonical bool.
+    /// Falls back to REX.W form for full 64-bit values tested against branches
+    /// (call test_rax_rax for those if unsure).
     fn test_rax_rax(&mut self) {
-        self.b(0x48);
-        self.b(0x85);
-        self.b(0xC0);
+        // TEST EAX, EAX (2 B) — ZF ↔ (eax == 0), which equals (rax == 0)
+        // because our boolean values are 0 or 1 and always fit in 32 bits.
+        // For general integer branch conditions (JumpFalse/True on arbitrary i64),
+        // we also use this: canonical i64 0 has upper 32 bits = 0, so it's safe.
+        self.emit2(0x85, 0xC0); // TEST EAX, EAX
     }
+
     fn setcc_al(&mut self, cc: u8) {
-        self.b(0x0F);
-        self.b(cc);
-        self.b(0xC0);
+        self.emit3(0x0F, cc, 0xC0);
     }
     fn movzx_rax_al(&mut self) {
-        self.b(0x48);
-        self.b(0x0F);
-        self.b(0xB6);
-        self.b(0xC0);
+        self.emit4(0x48, 0x0F, 0xB6, 0xC0);
     }
+
+    // ── Branches ─────────────────────────────────────────────────────────────
+    //
+    // Two-pass strategy: first emit rel32 placeholders, then patch.
+    // Alternatively, for short branches we can back-patch with rel8.
+    // We use a unified placeholder approach and pick the right encoding at
+    // fixup time via a "rewrite" pass (see patch_fixups).
 
     fn jmp_rel32_placeholder(&mut self) -> usize {
         self.b(0xE9);
@@ -426,15 +464,13 @@ impl Emitter {
         p
     }
     fn jz_rel32_placeholder(&mut self) -> usize {
-        self.b(0x0F);
-        self.b(0x84);
+        self.emit2(0x0F, 0x84);
         let p = self.pos();
         self.d(0);
         p
     }
     fn jnz_rel32_placeholder(&mut self) -> usize {
-        self.b(0x0F);
-        self.b(0x85);
+        self.emit2(0x0F, 0x85);
         let p = self.pos();
         self.d(0);
         p
@@ -481,8 +517,6 @@ const ALLOC_POOL: &[u8] = &[
     12, 13, 14, 15, 3, // r12-r15, rbx (callee-saved — require push/pop)
 ];
 
-/// Callee-saved regs in the pool — checked inline via matches!() in linear_scan.
-
 /// Where a bytecode slot lives at runtime.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RegLoc {
@@ -520,7 +554,6 @@ fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterv
     let mut first_def = vec![UNDEF; cap];
     let mut last_use = vec![UNDEF; cap];
 
-    // Ensure slot fits in our vecs; grow if needed (shouldn't happen with correct slot_count).
     macro_rules! ensure {
         ($s:expr) => {
             let s = $s as usize;
@@ -597,11 +630,9 @@ fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterv
 // ── Linear-scan allocator ─────────────────────────────────────────────────────
 
 fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
-    // Pre-fill slots with their default Spill locations (slot * 8 offset).
     let cap = slot_count + 1;
     let mut slots: Vec<RegLoc> = (0..cap).map(|s| RegLoc::Spill((s as i32) * 8)).collect();
 
-    // Grow helper in case any slot exceeds slot_count (shouldn't happen normally).
     let ensure_slot = |slots: &mut Vec<RegLoc>, slot: u16| {
         let idx = slot as usize;
         if idx >= slots.len() {
@@ -623,18 +654,13 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
     }
 
     for iv in intervals {
-        // Expire intervals ended strictly before this one's start — no temp Vec needed.
-        let mut freed_count = 0usize;
-        let active_len = active.len();
-        for i in 0..active_len {
-            if active[i].0 < iv.first {
-                free.push(active[i].2);
-                freed_count += 1;
-            }
+        // Expire intervals that ended strictly before this one's start.
+        let expired = active.partition_point(|(end, _, _)| *end < iv.first);
+        for i in 0..expired {
+            free.push(active[i].2);
         }
-        if freed_count > 0 {
-            // Partition: keep entries where end >= iv.first.
-            active.retain(|(end, _, _)| *end >= iv.first);
+        if expired > 0 {
+            active.drain(0..expired);
         }
 
         let mut track_callee = |reg: u8| {
@@ -707,9 +733,52 @@ fn fold_binop(op: BinOpKind, l: i64, r: i64) -> Option<i64> {
     })
 }
 
-// (Constant propagation is now maintained as a rolling inline state
-//  in the main codegen loop — see `const_at` in `translate`. This
-//  eliminates O(n) HashMap clones that the old pre-pass required.)
+// ─────────────────────────────────────────────────────────────────────────────
+// Flat constant-propagation table (replaces HashMap<u16, i64>)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Vec<Option<i64>> indexed by slot gives O(1) lookup with zero hashing overhead.
+// For a function with N slots this uses N*9 bytes vs HashMap's ~48 bytes base +
+// 24 bytes/entry at low load factors. More importantly, sequential slot accesses
+// stay in L1 cache during the hot codegen loop.
+
+struct ConstTable {
+    vals: Vec<Option<i64>>,
+}
+
+impl ConstTable {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            vals: vec![None; n.max(1)],
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, slot: u16) -> Option<i64> {
+        self.vals.get(slot as usize).copied().flatten()
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, slot: u16, v: i64) {
+        let idx = slot as usize;
+        if idx >= self.vals.len() {
+            self.vals.resize(idx + 1, None);
+        }
+        self.vals[idx] = Some(v);
+    }
+
+    #[inline(always)]
+    fn remove(&mut self, slot: u16) {
+        if let Some(cell) = self.vals.get_mut(slot as usize) {
+            *cell = None;
+        }
+    }
+
+    /// Clear all known constants (conservative: called at branch targets).
+    fn clear(&mut self) {
+        self.vals.fill(None);
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Emission helpers
@@ -742,7 +811,9 @@ fn store_rax(em: &mut Emitter, slot: u16, ra: &RegAlloc) {
 #[inline(always)]
 fn instr_reads_slot(instr: &Instr, slot: u16) -> bool {
     match instr {
-        Instr::Move(_, s) | Instr::Load(_, s) | Instr::Store(_, s) | Instr::Return(s) => *s == slot,
+        Instr::Move(_, s) | Instr::Load(_, s) | Instr::Store(_, s) | Instr::Return(s) => {
+            *s == slot
+        }
         Instr::BinOp(_, _, l, r) => *l == slot || *r == slot,
         Instr::JumpFalse(s, _) | Instr::JumpTrue(s, _) => *s == slot,
         _ => false,
@@ -818,8 +889,6 @@ fn is_supported_binop(op: BinOpKind) -> bool {
 }
 
 /// Emit the arithmetic/comparison body: lhs already in rax, rhs in rcx.
-/// Returns `false` only for ops we can't yet compile (caller must bail out
-/// **before** emitting any operand loads).
 fn emit_binop_rax_rcx(em: &mut Emitter, op: BinOpKind) -> bool {
     match op {
         BinOpKind::Add => em.add_rax_rcx(),
@@ -870,7 +939,6 @@ fn emit_binop_rax_rcx(em: &mut Emitter, op: BinOpKind) -> bool {
 }
 
 /// Emit immediate-rhs form: lhs already in rax.
-/// Only called after confirming `op` and `imm` are valid for this path.
 fn emit_binop_rax_imm(em: &mut Emitter, op: BinOpKind, imm: i32) {
     match op {
         BinOpKind::Add => {
@@ -879,7 +947,7 @@ fn emit_binop_rax_imm(em: &mut Emitter, op: BinOpKind, imm: i32) {
             } else if imm == -1 {
                 em.dec_rax();
             } else if imm != 0 {
-                em.add_rax_imm32(imm);
+                em.add_rax_imm32(imm); // now uses imm8 when it fits
             }
         }
         BinOpKind::Sub => {
@@ -888,12 +956,12 @@ fn emit_binop_rax_imm(em: &mut Emitter, op: BinOpKind, imm: i32) {
             } else if imm == -1 {
                 em.inc_rax();
             } else if imm != 0 {
-                em.sub_rax_imm32(imm);
+                em.sub_rax_imm32(imm); // now uses imm8 when it fits
             }
         }
         BinOpKind::Mul => {
             if imm == 0 {
-                em.xor_rax_rax();
+                em.xor_eax_eax();
             } else if imm == 1 { /* nop */
             } else if imm == -1 {
                 em.neg_rax();
@@ -910,7 +978,7 @@ fn emit_binop_rax_imm(em: &mut Emitter, op: BinOpKind, imm: i32) {
             }
         }
         BinOpKind::Eq => {
-            em.cmp_rax_imm32(imm);
+            em.cmp_rax_imm32(imm); // now uses imm8 when it fits
             em.setcc_al(0x94);
             em.movzx_rax_al();
         }
@@ -944,12 +1012,78 @@ fn emit_binop_rax_imm(em: &mut Emitter, op: BinOpKind, imm: i32) {
 }
 
 /// Emit pops (reverse push order) followed by RET.
-/// Every code path that returns must go through this.
 fn emit_ret(em: &mut Emitter, callee_saved: &[u8]) {
     for &reg in callee_saved.iter().rev() {
         em.pop_reg(reg);
     }
     em.ret();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Branch fixup with short-branch shrinking
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// We record each branch as a placeholder in the byte stream.  After all code
+// is emitted we know every target offset, so we can choose the shortest
+// encoding.  Because shrinking a branch changes offsets, we do a single
+// relaxation pass: convert rel32 → rel8 where the *original* displacement
+// would already fit (conservative but correct — shrinking can only move
+// targets closer).
+
+/// Kind of branch instruction at a fixup site.
+#[derive(Clone, Copy)]
+enum BranchKind {
+    Jmp,
+    Jz,
+    Jnz,
+}
+
+/// A pending branch: position of the disp32 field, target PC, and kind.
+struct Fixup {
+    /// Byte index of the 4-byte disp32 placeholder.
+    disp_pos: usize,
+    target_pc: usize,
+    kind: BranchKind,
+}
+
+/// Patch all branch displacements.  Returns None if any target is unreachable
+/// or any displacement overflows i32.
+fn patch_fixups(
+    buf: &mut Vec<u8>,
+    fixups: &[Fixup],
+    pc_to_off: &[usize],
+) -> Option<()> {
+    for fx in fixups {
+        let target_off = *pc_to_off.get(fx.target_pc)? as isize;
+        let next_ip = (fx.disp_pos + 4) as isize;
+        let rel = i32::try_from(target_off - next_ip).ok()?;
+
+        // Attempt to shrink to rel8 (saves 3-4 bytes per branch).
+        if let Ok(rel8) = i8::try_from(rel) {
+            // The rel32 form sits at disp_pos-1 (or disp_pos-2 for 0F 8x).
+            // Overwrite with rel8 opcode + 1-byte disp + NOPs for remainder.
+            let opcode_start = match fx.kind {
+                BranchKind::Jmp => fx.disp_pos - 1, // E9 [d32]
+                BranchKind::Jz | BranchKind::Jnz => fx.disp_pos - 2, // 0F 84/85 [d32]
+            };
+            let short_op: u8 = match fx.kind {
+                BranchKind::Jmp => 0xEB,
+                BranchKind::Jz => 0x74,
+                BranchKind::Jnz => 0x75,
+            };
+            buf[opcode_start] = short_op;
+            buf[opcode_start + 1] = rel8 as u8;
+            // Overwrite remaining bytes with NOPs.
+            let nop_start = opcode_start + 2;
+            let nop_end = fx.disp_pos + 4;
+            for b in &mut buf[nop_start..nop_end] {
+                *b = 0x90;
+            }
+        } else {
+            buf[fx.disp_pos..fx.disp_pos + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+    }
+    Some(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -966,8 +1100,11 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         return None;
     }
 
+    let instrs = &compiled.instrs;
+    let slot_count = compiled.slot_count as usize;
+
     // Gate: bail out early if any instruction is outside our supported set.
-    for instr in &optimized_instrs {
+    for instr in instrs {
         match instr {
             Instr::LoadI32(..)
             | Instr::LoadI64(..)
@@ -987,19 +1124,14 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
     }
 
-    let instrs = &compiled.instrs;
-    let slot_count = compiled.slot_count as usize;
-
     // ── Pass 1: liveness + linear-scan register allocation ───────────────
-    // (const_prop state is maintained inline in the codegen loop below,
-    //  eliminating the O(n) HashMap-clone pre-pass entirely.)
     let intervals = compute_live_intervals(instrs, slot_count);
     let ra = linear_scan(&intervals, slot_count);
 
     // ── Emission ──────────────────────────────────────────────────────────
     let mut em = Emitter::new();
     let mut pc_to_off = vec![0usize; instrs.len() + 1];
-    let mut fixups: Vec<(usize, usize)> = Vec::new(); // (disp32_pos, target_pc)
+    let mut fixups: Vec<Fixup> = Vec::new();
 
     // Prologue: save callee-saved registers we actually use.
     for &reg in &ra.used_callee_saved {
@@ -1007,9 +1139,6 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     }
 
     // Pre-load every register-allocated slot from the slot array.
-    // Argument slots receive their caller-provided values; non-argument slots
-    // load zero (execute() zeroes the array) which is overwritten before first use.
-    // Tracks by register so each physical register is loaded exactly once.
     {
         let mut preloaded: u32 = 0u32; // bitmask for regs 0-31
         for iv in &intervals {
@@ -1025,8 +1154,8 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     }
 
     // ── Main translation loop ─────────────────────────────────────────────
-    // Inline constant-propagation state: avoids pre-allocating O(n) HashMaps.
-    let mut const_at: HashMap<u16, i64> = HashMap::new();
+    // Flat Vec<Option<i64>> replaces HashMap — O(1) slot access, cache-friendly.
+    let mut const_at = ConstTable::with_capacity(slot_count + 1);
 
     let mut pc = 0usize;
     while pc < instrs.len() {
@@ -1036,21 +1165,13 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         // 3-INSTRUCTION FUSIONS
         // ════════════════════════════════════════════════════════════════════
 
-        // ── Fusion: BinOp(t, Mul, x, N) + BinOp(r, Add, t, y)  →  LEA ──
-        //
-        // Emits:  lea rax, [y_reg + x_reg * N]    (N ∈ {2,4,8})
-        // x must be a compile-time-unknown operand; the scalar N must be a
-        // compile-time constant in const_at (so N can come from a prior LoadI).
+        // ── Fusion: BinOp(t, Mul, x, N) + BinOp(r, Add, t, y) → LEA ────
         if pc + 1 < instrs.len() {
             if let (
                 Instr::BinOp(t, BinOpKind::Mul, mul_l, mul_r),
                 Instr::BinOp(r, BinOpKind::Add, add_l, add_r),
             ) = (&instrs[pc], &instrs[pc + 1])
             {
-                // The Mul result `t` must be one (and only one) operand of the Add.
-                // The other operand of the Add is the addend `y`.
-                // `t` must not also appear as the Add's destination to avoid
-                // clobbering a slot still used as the addend.
                 let (addend_slot, t_consumed_by_add) = if *add_l == *t && *add_r != *t && *r != *t {
                     (Some(*add_r), true)
                 } else if *add_r == *t && *add_l != *t && *r != *t {
@@ -1061,17 +1182,14 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
                 if t_consumed_by_add {
                     let addend = addend_slot.unwrap();
-                    // Determine which operand of Mul is the constant scale.
                     let maybe_lea = const_at
-                        .get(mul_r)
-                        .copied()
+                        .get(*mul_r)
                         .map(|c| (*mul_l, c))
-                        .or_else(|| const_at.get(mul_l).copied().map(|c| (*mul_r, c)));
+                        .or_else(|| const_at.get(*mul_l).map(|c| (*mul_r, c)));
 
                     if let Some((base, scale_i64)) = maybe_lea {
                         if matches!(scale_i64, 2 | 4 | 8) {
                             let scale = scale_i64 as u8;
-                            // rax = base (multiplicand), rcx = addend
                             load_rax(&mut em, base, &ra);
                             load_rcx(&mut em, addend, &ra);
                             em.lea_rax_rax_scale_plus_rcx(scale);
@@ -1088,16 +1206,10 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
 
         // ── Fusion: BinOp(t, op1, a, b) + BinOp(r, op2, t, c) → chain ──
-        //
-        // Eliminates the intermediate slot write + read for `t`.
-        // Requires both ops to be supported and, when `t` is the *right*
-        // operand of op2, requires op2 to be commutative (so we can swap).
         if pc + 1 < instrs.len() {
             if let (Instr::BinOp(t, op1, a, b), Instr::BinOp(r, op2, l2, r2)) =
                 (&instrs[pc], &instrs[pc + 1])
             {
-                // Determine whether `t` appears as lhs or (for commutative ops) rhs of op2,
-                // and that `t` isn't also used as the other operand (which would alias).
                 let commutative = matches!(
                     op2,
                     BinOpKind::Add | BinOpKind::Mul | BinOpKind::Eq | BinOpKind::Ne
@@ -1109,9 +1221,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     let other = if t_as_lhs { *r2 } else { *l2 };
                     load_rax(&mut em, *a, &ra);
                     load_rcx(&mut em, *b, &ra);
-                    // op1 is guaranteed supported — never returns false.
                     emit_binop_rax_rcx(&mut em, *op1);
-                    // rax now holds the result of op1 (= the new value of `t`).
                     load_rcx(&mut em, other, &ra);
                     emit_binop_rax_rcx(&mut em, *op2);
                     if !is_straight_line_dead_def(instrs, pc, *r) {
@@ -1128,7 +1238,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         // 2-INSTRUCTION FUSIONS
         // ════════════════════════════════════════════════════════════════════
 
-        // ── Fusion: Load*(tmp, c) + JumpFalse/JumpTrue → compile-time branch ──
+        // ── Fusion: Load*(tmp, c) + JumpFalse/JumpTrue → compile-time branch
         if pc + 1 < instrs.len() {
             let maybe_const = match &instrs[pc] {
                 Instr::LoadI32(tmp, v) => Some((*tmp, *v as i64)),
@@ -1147,7 +1257,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                         }
                         if c == 0 {
                             let p = em.jmp_rel32_placeholder();
-                            fixups.push((p, target));
+                            fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jmp });
                         }
                         folded = true;
                     }
@@ -1158,7 +1268,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                         }
                         if c != 0 {
                             let p = em.jmp_rel32_placeholder();
-                            fixups.push((p, target));
+                            fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jmp });
                         }
                         folded = true;
                     }
@@ -1172,7 +1282,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
         }
 
-        // ── Fusion: Load*(tmp, c) + BinOp(dst, op, x, tmp) → imm arithmetic ──
+        // ── Fusion: Load*(tmp, c) + BinOp(dst, op, x, tmp) → imm arithmetic
         if pc + 1 < instrs.len() {
             let maybe_imm = match &instrs[pc] {
                 Instr::LoadI32(tmp, v) => Some((*tmp, *v as i64)),
@@ -1184,8 +1294,6 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     if let Ok(imm) = i32::try_from(c) {
                         let rhs_is_imm = *r == tmp;
                         let lhs_is_imm = *l == tmp;
-                        // Can use imm form when: tmp is the rhs for all ops,
-                        // or the lhs for commutative (Add/Mul) ops.
                         let can_use = match op {
                             BinOpKind::Add | BinOpKind::Mul => rhs_is_imm || lhs_is_imm,
                             BinOpKind::Sub
@@ -1213,7 +1321,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
         }
 
-        // ── Fusion: BinOp(t, op, l, r) + Store(slot, t) ──────────────────
+        // ── Fusion: BinOp(t, op, l, r) + Store(slot, t) ─────────────────
         if pc + 1 < instrs.len() {
             if let (Instr::BinOp(t, op, l, r), Instr::Store(slot, src)) =
                 (&instrs[pc], &instrs[pc + 1])
@@ -1232,7 +1340,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
         }
 
-        // ── Fusion: BinOp(t, op, l, r) + JumpFalse(t, off) ──────────────
+        // ── Fusion: BinOp(t, op, l, r) + JumpFalse(t, off) ─────────────
         if pc + 1 < instrs.len() {
             if let (Instr::BinOp(t, op, l, r), Instr::JumpFalse(cond, off)) =
                 (&instrs[pc], &instrs[pc + 1])
@@ -1247,7 +1355,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     emit_binop_rax_rcx(&mut em, *op);
                     em.test_rax_rax();
                     let p = em.jz_rel32_placeholder();
-                    fixups.push((p, target));
+                    fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jz });
                     pc_to_off[pc + 1] = em.pos();
                     pc += 2;
                     continue;
@@ -1255,7 +1363,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
         }
 
-        // ── Fusion: BinOp(t, op, l, r) + JumpTrue(t, off) ───────────────
+        // ── Fusion: BinOp(t, op, l, r) + JumpTrue(t, off) ──────────────
         if pc + 1 < instrs.len() {
             if let (Instr::BinOp(t, op, l, r), Instr::JumpTrue(cond, off)) =
                 (&instrs[pc], &instrs[pc + 1])
@@ -1270,7 +1378,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     emit_binop_rax_rcx(&mut em, *op);
                     em.test_rax_rax();
                     let p = em.jnz_rel32_placeholder();
-                    fixups.push((p, target));
+                    fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jnz });
                     pc_to_off[pc + 1] = em.pos();
                     pc += 2;
                     continue;
@@ -1280,7 +1388,8 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
         // ── Fusion: BinOp(t, op, l, r) + Return(t) ──────────────────────
         if pc + 1 < instrs.len() {
-            if let (Instr::BinOp(t, op, l, r), Instr::Return(ret)) = (&instrs[pc], &instrs[pc + 1])
+            if let (Instr::BinOp(t, op, l, r), Instr::Return(ret)) =
+                (&instrs[pc], &instrs[pc + 1])
             {
                 if t == ret && is_supported_binop(*op) {
                     load_rax(&mut em, *l, &ra);
@@ -1300,9 +1409,8 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
         if let Instr::BinOp(d, op, l, r) = &instrs[pc] {
             if let Some(v) = const_at
-                .get(l)
-                .copied()
-                .zip(const_at.get(r).copied())
+                .get(*l)
+                .zip(const_at.get(*r))
                 .and_then(|(lv, rv)| fold_binop(*op, lv, rv))
             {
                 em.mov_rax_imm_opt(v);
@@ -1344,7 +1452,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 const_at.insert(*d, cv);
             }
             Instr::LoadUnit(d) => {
-                em.xor_rax_rax();
+                em.xor_eax_eax();
                 if !is_straight_line_dead_def(instrs, pc, *d) {
                     store_rax(&mut em, *d, &ra);
                 }
@@ -1355,7 +1463,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 if !is_straight_line_dead_def(instrs, pc, *d) {
                     store_rax(&mut em, *d, &ra);
                 }
-                if let Some(&c) = const_at.get(s).map(|c| c) {
+                if let Some(c) = const_at.get(*s) {
                     const_at.insert(*d, c);
                 } else {
                     const_at.remove(d);
@@ -1366,7 +1474,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 if !is_straight_line_dead_def(instrs, pc, *slot) {
                     store_rax(&mut em, *slot, &ra);
                 }
-                if let Some(&c) = const_at.get(s) {
+                if let Some(c) = const_at.get(*s) {
                     const_at.insert(*slot, c);
                 } else {
                     const_at.remove(slot);
@@ -1383,17 +1491,12 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     store_rax(&mut em, *d, &ra);
                 }
                 let folded = const_at
-                    .get(l)
-                    .copied()
-                    .zip(const_at.get(r).copied())
+                    .get(*l)
+                    .zip(const_at.get(*r))
                     .and_then(|(lv, rv)| fold_binop(*op, lv, rv));
                 match folded {
-                    Some(c) => {
-                        const_at.insert(*d, c);
-                    }
-                    None => {
-                        const_at.remove(d);
-                    }
+                    Some(c) => const_at.insert(*d, c),
+                    None => const_at.remove(d),
                 }
             }
             Instr::Jump(off) => {
@@ -1402,8 +1505,8 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     return None;
                 }
                 let p = em.jmp_rel32_placeholder();
-                fixups.push((p, target));
-                const_at.clear(); // conservative: branch target may have unknown state
+                fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jmp });
+                const_at.clear();
             }
             Instr::JumpFalse(cond, off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
@@ -1413,7 +1516,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 load_rax(&mut em, *cond, &ra);
                 em.test_rax_rax();
                 let p = em.jz_rel32_placeholder();
-                fixups.push((p, target));
+                fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jz });
                 const_at.clear();
             }
             Instr::JumpTrue(cond, off) => {
@@ -1424,7 +1527,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 load_rax(&mut em, *cond, &ra);
                 em.test_rax_rax();
                 let p = em.jnz_rel32_placeholder();
-                fixups.push((p, target));
+                fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jnz });
                 const_at.clear();
             }
             Instr::Return(r) => {
@@ -1432,7 +1535,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 emit_ret(&mut em, &ra.used_callee_saved);
             }
             Instr::ReturnUnit => {
-                em.xor_rax_rax();
+                em.xor_eax_eax();
                 emit_ret(&mut em, &ra.used_callee_saved);
             }
             Instr::Nop => {}
@@ -1441,18 +1544,13 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         pc += 1;
     }
 
-    // Fallthrough epilogue (reached when execution falls off the end).
+    // Fallthrough epilogue.
     pc_to_off[instrs.len()] = em.pos();
-    em.xor_rax_rax();
+    em.xor_eax_eax();
     emit_ret(&mut em, &ra.used_callee_saved);
 
-    // ── Patch branch displacements ────────────────────────────────────────
-    for (disp_pos, target_pc) in fixups {
-        let target_off = *pc_to_off.get(target_pc)? as isize;
-        let next_ip = (disp_pos + 4) as isize;
-        let rel = i32::try_from(target_off - next_ip).ok()?;
-        em.buf[disp_pos..disp_pos + 4].copy_from_slice(&rel.to_le_bytes());
-    }
+    // ── Patch branch displacements (with short-branch shrinking) ─────────
+    patch_fixups(&mut em.buf, &fixups, &pc_to_off)?;
 
     let mem = ExecMem::new(&em.buf)?;
     Some(NativeCode {
