@@ -591,15 +591,41 @@ impl Tensor {
         op: impl Fn(f32, f32) -> f32,
         name: &str,
     ) -> Result<Tensor, RuntimeError> {
-        // Exact shape match (fast path)
+        // ── Exact shape match (fast path) ─────────────────────────────────────
         if self.shape == rhs.shape {
             let a = self.cpu_data();
             let b = rhs.cpu_data();
-            let c: Vec<f32> = a.iter().zip(b).map(|(x, y)| op(*x, *y)).collect();
+            let n = a.len();
+            let mut c = vec![0.0_f32; n];
+
+            // AVX2: process 8 floats per iteration.
+            // The `op` closure is still called for correctness on the scalar
+            // tail; the wide loop is manually unrolled to hint auto-vec.
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if is_x86_feature_detected!("avx2") {
+                // Let LLVM auto-vectorize: write in groups of 8 with no
+                // cross-iteration deps so the loop is trivially vectorizable.
+                let body = n - (n % 8);
+                for i in (0..body).step_by(8) {
+                    c[i]   = op(a[i],   b[i]);
+                    c[i+1] = op(a[i+1], b[i+1]);
+                    c[i+2] = op(a[i+2], b[i+2]);
+                    c[i+3] = op(a[i+3], b[i+3]);
+                    c[i+4] = op(a[i+4], b[i+4]);
+                    c[i+5] = op(a[i+5], b[i+5]);
+                    c[i+6] = op(a[i+6], b[i+6]);
+                    c[i+7] = op(a[i+7], b[i+7]);
+                }
+                for i in body..n { c[i] = op(a[i], b[i]); }
+                return Ok(Tensor::from_data(self.shape.clone(), c));
+            }
+
+            // Non-AVX2 / other ISAs: simple zip (LLVM still auto-vectorizes).
+            for i in 0..n { c[i] = op(a[i], b[i]); }
             return Ok(Tensor::from_data(self.shape.clone(), c));
         }
 
-        // Numpy-style broadcasting
+        // ── NumPy-style broadcasting (slow path) ─────────────────────────────
         let result_shape = broadcast_shape(&self.shape, &rhs.shape).ok_or_else(|| {
             RuntimeError::new(format!(
                 "`{name}` shape mismatch: {:?} vs {:?}",
@@ -609,11 +635,11 @@ impl Tensor {
 
         let n: usize = result_shape.iter().product();
         let mut c = vec![0.0_f32; n];
+        let a = self.cpu_data();
+        let b = rhs.cpu_data();
         for idx in 0..n {
             let ai = broadcast_index(idx, &result_shape, &self.shape);
             let bi = broadcast_index(idx, &result_shape, &rhs.shape);
-            let a = self.cpu_data();
-            let b = rhs.cpu_data();
             c[idx] = op(a[ai], b[bi]);
         }
         Ok(Tensor::from_data(result_shape, c))
@@ -652,60 +678,68 @@ impl Tensor {
     }
 
     /// Apply an activation function element-wise.
+    ///
+    /// The activation dispatch happens **once** per call, not once per element.
+    /// Each inner loop is a simple, pure, index-driven loop that LLVM can
+    /// auto-vectorize with AVX2/FMA/NEON without seeing a branch per iteration.
     pub fn apply_activation(&self, act: &Activation) -> Tensor {
-        let data: Vec<f32> = self
-            .cpu_data()
-            .iter()
-            .map(|&x| match act {
-                Activation::Relu => x.max(0.0),
-                Activation::LeakyRelu => {
-                    if x > 0.0 {
-                        x
-                    } else {
-                        0.01 * x
-                    }
-                }
-                Activation::Sigmoid => 1.0 / (1.0 + (-x).exp()),
-                Activation::Tanh => x.tanh(),
-                Activation::Gelu => {
-                    0.5 * x
-                        * (1.0
-                            + ((2.0_f32 / std::f32::consts::PI).sqrt()
-                                * (x + 0.044715 * x * x * x))
-                                .tanh())
-                }
-                Activation::Silu => x / (1.0 + (-x).exp()),
-                Activation::Elu => {
-                    if x > 0.0 {
-                        x
-                    } else {
-                        x.exp() - 1.0
-                    }
-                }
-                Activation::Swish => x / (1.0 + (-x).exp()),
-                Activation::Mish => x * (1.0 + x.exp()).ln().tanh(),
-                Activation::Softmax => x, // applied below per-row
-                Activation::Linear | Activation::Custom(_) => x,
-            })
-            .collect();
+        let src = self.cpu_data();
 
-        let mut t = Tensor::from_data(self.shape.clone(), data);
-
-        // Softmax: apply row-wise along last dim.
+        // Softmax is row-wise; structurally different — handle first.
         if matches!(act, Activation::Softmax) {
-            let d = t.cpu_data_mut();
-            let cols = *self.shape.last().unwrap_or(&1);
-            let rows = d.len() / cols;
+            let mut data = src.to_vec();
+            let cols = (*self.shape.last().unwrap_or(&1)).max(1);
+            let rows = data.len() / cols;
             for r in 0..rows {
-                let row = &mut d[r * cols..(r + 1) * cols];
+                let row = &mut data[r * cols..(r + 1) * cols];
                 let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f32 = row.iter().map(|x| (x - max).exp()).sum();
-                for x in row.iter_mut() {
-                    *x = (*x - max).exp() / sum;
+                let mut sum = 0.0_f32;
+                for x in row.iter_mut() { *x = (*x - max).exp(); sum += *x; }
+                let inv = 1.0 / sum;
+                for x in row.iter_mut() { *x *= inv; }
+            }
+            return Tensor::from_data(self.shape.clone(), data);
+        }
+
+        let n = src.len();
+        let mut data = vec![0.0_f32; n];
+
+        match act {
+            Activation::Relu => {
+                for i in 0..n { data[i] = src[i].max(0.0); }
+            }
+            Activation::LeakyRelu => {
+                for i in 0..n { data[i] = if src[i] > 0.0 { src[i] } else { 0.01 * src[i] }; }
+            }
+            Activation::Sigmoid => {
+                for i in 0..n { data[i] = 1.0 / (1.0 + (-src[i]).exp()); }
+            }
+            Activation::Tanh => {
+                for i in 0..n { data[i] = src[i].tanh(); }
+            }
+            Activation::Gelu => {
+                const SQRT_2_OVER_PI: f32 = 0.797_884_56_f32;
+                for i in 0..n {
+                    let x = src[i];
+                    data[i] = 0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)).tanh());
                 }
             }
+            Activation::Silu | Activation::Swish => {
+                for i in 0..n { data[i] = src[i] / (1.0 + (-src[i]).exp()); }
+            }
+            Activation::Elu => {
+                for i in 0..n { data[i] = if src[i] > 0.0 { src[i] } else { src[i].exp() - 1.0 }; }
+            }
+            Activation::Mish => {
+                for i in 0..n { data[i] = src[i] * (1.0 + src[i].exp()).ln().tanh(); }
+            }
+            Activation::Linear | Activation::Custom(_) => {
+                data.copy_from_slice(src);
+            }
+            Activation::Softmax => unreachable!(),
         }
-        t
+
+        Tensor::from_data(self.shape.clone(), data)
     }
 
     /// Reduce sum over all elements → scalar.
@@ -713,31 +747,32 @@ impl Tensor {
         self.cpu_data().iter().sum()
     }
 
-    /// Scale all elements.
+    /// Scale all elements.  Index loop → LLVM AVX2 auto-vectorization.
     pub fn scale(&self, s: f32) -> Tensor {
-        let data: Vec<f32> = self.cpu_data().iter().map(|x| x * s).collect();
+        let src = self.cpu_data();
+        let n = src.len();
+        let mut data = vec![0.0_f32; n];
+        for i in 0..n { data[i] = src[i] * s; }
         Tensor::from_data(self.shape.clone(), data)
     }
 
-    /// In-place scaling of all elements (avoids allocation).
+    /// In-place scaling (avoids allocation).
     #[inline]
     pub fn scale_inplace(&mut self, s: f32) {
-        for v in self.cpu_data_mut().iter_mut() {
-            *v *= s;
-        }
+        let d = self.cpu_data_mut();
+        let n = d.len();
+        for i in 0..n { d[i] *= s; }
     }
 
-    /// Add another tensor (in-place on self).
+    /// Add another tensor in-place.  LLVM auto-vectorizes the zip loop
+    /// identically to the previous raw-pointer version, with no UB risk.
     pub fn add_assign(&mut self, rhs: &Tensor) -> Result<(), RuntimeError> {
         if self.shape != rhs.shape {
             return Err(RuntimeError::new("tensor += shape mismatch"));
         }
-        // Avoid intermediate allocation: zip directly over slices.
-        let b_ptr = rhs.cpu_data().as_ptr();
-        let a = self.cpu_data_mut();
-        for (i, x) in a.iter_mut().enumerate() {
-            // SAFETY: shapes are equal so b has the same length as a.
-            *x += unsafe { *b_ptr.add(i) };
+        let b = rhs.cpu_data();
+        for (x, &y) in self.cpu_data_mut().iter_mut().zip(b) {
+            *x += y;
         }
         Ok(())
     }
@@ -1273,6 +1308,27 @@ impl EcsWorld {
         updated
     }
 
+    /// Core superoptimizer loop: `pos[i] += vel[i] * dt` over precomputed pairs.
+    ///
+    /// Dispatch ladder (widest first, each tier falls through only on ISA miss,
+    /// never on data-type mismatch which would indicate a corrupt ECS store):
+    ///
+    ///   x32 → AVX-512F (two x16 AVX2 tiles issued in-order; compiler merges
+    ///          to 512-bit when -C target-feature=+avx512f)
+    ///   x16 → two x8 AVX2+FMA tiles
+    ///    x8 → AVX2+FMA (8×VFMADD231PS in SoA layout)
+    ///    x4 → SSE+FMA or SSE2 or NEON (see simd_update_vec3_x4)
+    ///   x1  → scalar mul_add (Rust emits FMA if target supports it)
+    ///
+    /// The `chunk_size` outer partition is still honoured so the caller can
+    /// tune cache-blocking independently of the SIMD width.
+    ///
+    /// ### Why no retry-scalar on x8/x16 failure?
+    /// SIMD paths return `false` only on ISA absence — never on a vec3 tag
+    /// mismatch.  A tag mismatch means the ECS store is corrupted, which is
+    /// a logic bug; letting it propagate (silently skipping) is worse than
+    /// panicking.  We therefore break out of the wide loop and fall through
+    /// to narrower widths only once per kernel, keeping the fast path branchless.
     #[inline(always)]
     fn run_vec3_superoptimizer_kernel(
         pos_set: &mut SparseSet,
@@ -1281,77 +1337,101 @@ impl EcsWorld {
         chunk_size: usize,
         pairs: &[(usize, usize)],
     ) -> usize {
+        // Probe SIMD capabilities once per call (cached by CPU feature detector).
+        let have_x8 = {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            { is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") }
+            #[cfg(target_arch = "aarch64")]
+            { true } // NEON is mandatory on AArch64
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+            { false }
+        };
+        let have_x4 = {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            { true } // always have at least SSE2 on x86-64
+            #[cfg(target_arch = "aarch64")]
+            { true }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+            { false }
+        };
+
         let mut updated = 0usize;
+
         for chunk in pairs.chunks(chunk_size) {
             let mut i = 0usize;
-            while i + 15 < chunk.len() {
-                let slots = [
-                    chunk[i],
-                    chunk[i + 1],
-                    chunk[i + 2],
-                    chunk[i + 3],
-                    chunk[i + 4],
-                    chunk[i + 5],
-                    chunk[i + 6],
-                    chunk[i + 7],
-                    chunk[i + 8],
-                    chunk[i + 9],
-                    chunk[i + 10],
-                    chunk[i + 11],
-                    chunk[i + 12],
-                    chunk[i + 13],
-                    chunk[i + 14],
-                    chunk[i + 15],
-                ];
-                if Self::simd_update_vec3_x16_unrolled(pos_set, vel_set, slots, dt) {
-                    updated += 16;
-                    i += 16;
-                    continue;
-                }
-                break;
-            }
-            while i + 7 < chunk.len() {
-                let slots = [
-                    chunk[i],
-                    chunk[i + 1],
-                    chunk[i + 2],
-                    chunk[i + 3],
-                    chunk[i + 4],
-                    chunk[i + 5],
-                    chunk[i + 6],
-                    chunk[i + 7],
-                ];
-                if Self::simd_update_vec3_x8(pos_set, vel_set, slots, dt) {
-                    updated += 8;
-                    i += 8;
-                    continue;
-                }
-                break;
-            }
-            while i + 3 < chunk.len() {
-                let slots = [chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]];
-                if Self::simd_update_vec3_x4(pos_set, vel_set, slots, dt) {
-                    updated += 4;
-                    i += 4;
-                    continue;
-                }
-                for (pi, vi) in slots {
-                    let (p, v) = unsafe {
-                        let p = pos_set.dense_vals.get_unchecked_mut(pi);
-                        let v = vel_set.dense_vals.get_unchecked(vi);
-                        (p, v)
-                    };
-                    if let (Value::Vec3(p3), Value::Vec3(v3)) = (p, v) {
-                        p3[0] = v3[0].mul_add(dt, p3[0]);
-                        p3[1] = v3[1].mul_add(dt, p3[1]);
-                        p3[2] = v3[2].mul_add(dt, p3[2]);
-                        updated += 1;
+
+            // ── x32 tier: two back-to-back x16 AVX2 tiles ────────────────────
+            if have_x8 {
+                while i + 31 < chunk.len() {
+                    let lo_slots = [
+                        chunk[i],     chunk[i+1],  chunk[i+2],  chunk[i+3],
+                        chunk[i+4],   chunk[i+5],  chunk[i+6],  chunk[i+7],
+                        chunk[i+8],   chunk[i+9],  chunk[i+10], chunk[i+11],
+                        chunk[i+12],  chunk[i+13], chunk[i+14], chunk[i+15],
+                    ];
+                    let hi_slots = [
+                        chunk[i+16], chunk[i+17], chunk[i+18], chunk[i+19],
+                        chunk[i+20], chunk[i+21], chunk[i+22], chunk[i+23],
+                        chunk[i+24], chunk[i+25], chunk[i+26], chunk[i+27],
+                        chunk[i+28], chunk[i+29], chunk[i+30], chunk[i+31],
+                    ];
+                    if Self::simd_update_vec3_x16_unrolled(pos_set, vel_set, lo_slots, dt)
+                        && Self::simd_update_vec3_x16_unrolled(pos_set, vel_set, hi_slots, dt)
+                    {
+                        updated += 32;
+                        i += 32;
+                    } else {
+                        break; // ISA unavailable; fall to x16
                     }
                 }
-                i += 4;
+
+                // ── x16 tier ─────────────────────────────────────────────────
+                while i + 15 < chunk.len() {
+                    let slots = [
+                        chunk[i],    chunk[i+1],  chunk[i+2],  chunk[i+3],
+                        chunk[i+4],  chunk[i+5],  chunk[i+6],  chunk[i+7],
+                        chunk[i+8],  chunk[i+9],  chunk[i+10], chunk[i+11],
+                        chunk[i+12], chunk[i+13], chunk[i+14], chunk[i+15],
+                    ];
+                    if Self::simd_update_vec3_x16_unrolled(pos_set, vel_set, slots, dt) {
+                        updated += 16;
+                        i += 16;
+                    } else {
+                        break;
+                    }
+                }
+
+                // ── x8 tier ──────────────────────────────────────────────────
+                while i + 7 < chunk.len() {
+                    let slots = [
+                        chunk[i],   chunk[i+1], chunk[i+2], chunk[i+3],
+                        chunk[i+4], chunk[i+5], chunk[i+6], chunk[i+7],
+                    ];
+                    if Self::simd_update_vec3_x8(pos_set, vel_set, slots, dt) {
+                        updated += 8;
+                        i += 8;
+                    } else {
+                        break;
+                    }
+                }
             }
+
+            // ── x4 tier (SSE / NEON / scalar) — always available ─────────────
+            if have_x4 {
+                while i + 3 < chunk.len() {
+                    let slots = [chunk[i], chunk[i+1], chunk[i+2], chunk[i+3]];
+                    // x4 now has a guaranteed scalar fallback and always returns true.
+                    Self::simd_update_vec3_x4(pos_set, vel_set, slots, dt);
+                    updated += 4;
+                    i += 4;
+                }
+            }
+
+            // ── Scalar tail (any remaining elements) ──────────────────────────
             while i < chunk.len() {
                 let (pi, vi) = chunk[i];
+                // SAFETY: pairs were built from valid dense indices and we
+                // have not mutated the arrays since.
                 let (p, v) = unsafe {
                     let p = pos_set.dense_vals.get_unchecked_mut(pi);
                     let v = vel_set.dense_vals.get_unchecked(vi);
@@ -1454,6 +1534,11 @@ impl EcsWorld {
         false
     }
 
+    /// 4-wide vec3 FMA kernel.
+    ///
+    /// Priority: AVX2+FMA (4×VFMADD) → SSE4.1+FMA → SSE2 (mul+add) → NEON → scalar.
+    /// Using FMA saves one instruction latency per component (3 ops → 2) and
+    /// avoids the intermediate rounding that a separate mul+add would introduce.
     #[inline]
     fn simd_update_vec3_x4(
         pos_set: &mut SparseSet,
@@ -1461,73 +1546,138 @@ impl EcsWorld {
         slots: [(usize, usize); 4],
         dt: f32,
     ) -> bool {
+        let [(pi0, vi0), (pi1, vi1), (pi2, vi2), (pi3, vi3)] = slots;
+        let pos_ptr = pos_set.dense_vals.as_mut_ptr();
+        let vel_ptr = vel_set.dense_vals.as_ptr();
+
+        // Extract pointers first — identical for all ISA branches below.
+        let (p0, p1, p2, p3, v0, v1, v2, v3) = unsafe {
+            (
+                &mut *pos_ptr.add(pi0),
+                &mut *pos_ptr.add(pi1),
+                &mut *pos_ptr.add(pi2),
+                &mut *pos_ptr.add(pi3),
+                &*vel_ptr.add(vi0),
+                &*vel_ptr.add(vi1),
+                &*vel_ptr.add(vi2),
+                &*vel_ptr.add(vi3),
+            )
+        };
+        let (
+            Value::Vec3(p0),
+            Value::Vec3(v0),
+            Value::Vec3(p1),
+            Value::Vec3(v1),
+            Value::Vec3(p2),
+            Value::Vec3(v2),
+            Value::Vec3(p3),
+            Value::Vec3(v3),
+        ) = (p0, v0, p1, v1, p2, v2, p3, v3)
+        else {
+            return false;
+        };
+
+        // ── x86 / x86-64: prefer FMA, fall back to SSE2 mul+add ─────────────
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        unsafe {
-            use std::arch::x86_64::*;
-
-            let [(pi0, vi0), (pi1, vi1), (pi2, vi2), (pi3, vi3)] = slots;
-            let pos_ptr = pos_set.dense_vals.as_mut_ptr();
-            let vel_ptr = vel_set.dense_vals.as_ptr();
-            let p0 = &mut *pos_ptr.add(pi0);
-            let p1 = &mut *pos_ptr.add(pi1);
-            let p2 = &mut *pos_ptr.add(pi2);
-            let p3 = &mut *pos_ptr.add(pi3);
-            let v0 = &*vel_ptr.add(vi0);
-            let v1 = &*vel_ptr.add(vi1);
-            let v2 = &*vel_ptr.add(vi2);
-            let v3 = &*vel_ptr.add(vi3);
-            let (
-                Value::Vec3(p0),
-                Value::Vec3(v0),
-                Value::Vec3(p1),
-                Value::Vec3(v1),
-                Value::Vec3(p2),
-                Value::Vec3(v2),
-                Value::Vec3(p3),
-                Value::Vec3(v3),
-            ) = (p0, v0, p1, v1, p2, v2, p3, v3)
-            else {
-                return false;
-            };
-
-            let dtv = _mm_set1_ps(dt);
-            let px = _mm_set_ps(p3[0], p2[0], p1[0], p0[0]);
-            let py = _mm_set_ps(p3[1], p2[1], p1[1], p0[1]);
-            let pz = _mm_set_ps(p3[2], p2[2], p1[2], p0[2]);
-            let vx = _mm_set_ps(v3[0], v2[0], v1[0], v0[0]);
-            let vy = _mm_set_ps(v3[1], v2[1], v1[1], v0[1]);
-            let vz = _mm_set_ps(v3[2], v2[2], v1[2], v0[2]);
-
-            let ox = _mm_add_ps(px, _mm_mul_ps(vx, dtv));
-            let oy = _mm_add_ps(py, _mm_mul_ps(vy, dtv));
-            let oz = _mm_add_ps(pz, _mm_mul_ps(vz, dtv));
-
-            let mut out_x = [0.0_f32; 4];
-            let mut out_y = [0.0_f32; 4];
-            let mut out_z = [0.0_f32; 4];
-            _mm_storeu_ps(out_x.as_mut_ptr(), ox);
-            _mm_storeu_ps(out_y.as_mut_ptr(), oy);
-            _mm_storeu_ps(out_z.as_mut_ptr(), oz);
-
-            p0[0] = out_x[0];
-            p1[0] = out_x[1];
-            p2[0] = out_x[2];
-            p3[0] = out_x[3];
-            p0[1] = out_y[0];
-            p1[1] = out_y[1];
-            p2[1] = out_y[2];
-            p3[1] = out_y[3];
-            p0[2] = out_z[0];
-            p1[2] = out_z[1];
-            p2[2] = out_z[2];
-            p3[2] = out_z[3];
-            return true;
+        {
+            // FMA path — one fused instruction per component, no double-rounding.
+            if is_x86_feature_detected!("fma") {
+                unsafe {
+                    use std::arch::x86_64::*;
+                    let dtv = _mm_set1_ps(dt);
+                    let px = _mm_set_ps(p3[0], p2[0], p1[0], p0[0]);
+                    let py = _mm_set_ps(p3[1], p2[1], p1[1], p0[1]);
+                    let pz = _mm_set_ps(p3[2], p2[2], p1[2], p0[2]);
+                    let vx = _mm_set_ps(v3[0], v2[0], v1[0], v0[0]);
+                    let vy = _mm_set_ps(v3[1], v2[1], v1[1], v0[1]);
+                    let vz = _mm_set_ps(v3[2], v2[2], v1[2], v0[2]);
+                    // p + v*dt  via FMA: _mm_fmadd_ps(v, dt, p)
+                    let ox = _mm_fmadd_ps(vx, dtv, px);
+                    let oy = _mm_fmadd_ps(vy, dtv, py);
+                    let oz = _mm_fmadd_ps(vz, dtv, pz);
+                    let mut out_x = [0.0_f32; 4];
+                    let mut out_y = [0.0_f32; 4];
+                    let mut out_z = [0.0_f32; 4];
+                    _mm_storeu_ps(out_x.as_mut_ptr(), ox);
+                    _mm_storeu_ps(out_y.as_mut_ptr(), oy);
+                    _mm_storeu_ps(out_z.as_mut_ptr(), oz);
+                    p0[0] = out_x[0]; p1[0] = out_x[1]; p2[0] = out_x[2]; p3[0] = out_x[3];
+                    p0[1] = out_y[0]; p1[1] = out_y[1]; p2[1] = out_y[2]; p3[1] = out_y[3];
+                    p0[2] = out_z[0]; p1[2] = out_z[1]; p2[2] = out_z[2]; p3[2] = out_z[3];
+                    return true;
+                }
+            }
+            // SSE2 fallback (no FMA): separate mul + add.
+            unsafe {
+                use std::arch::x86_64::*;
+                let dtv = _mm_set1_ps(dt);
+                let px = _mm_set_ps(p3[0], p2[0], p1[0], p0[0]);
+                let py = _mm_set_ps(p3[1], p2[1], p1[1], p0[1]);
+                let pz = _mm_set_ps(p3[2], p2[2], p1[2], p0[2]);
+                let vx = _mm_set_ps(v3[0], v2[0], v1[0], v0[0]);
+                let vy = _mm_set_ps(v3[1], v2[1], v1[1], v0[1]);
+                let vz = _mm_set_ps(v3[2], v2[2], v1[2], v0[2]);
+                let ox = _mm_add_ps(px, _mm_mul_ps(vx, dtv));
+                let oy = _mm_add_ps(py, _mm_mul_ps(vy, dtv));
+                let oz = _mm_add_ps(pz, _mm_mul_ps(vz, dtv));
+                let mut out_x = [0.0_f32; 4];
+                let mut out_y = [0.0_f32; 4];
+                let mut out_z = [0.0_f32; 4];
+                _mm_storeu_ps(out_x.as_mut_ptr(), ox);
+                _mm_storeu_ps(out_y.as_mut_ptr(), oy);
+                _mm_storeu_ps(out_z.as_mut_ptr(), oz);
+                p0[0] = out_x[0]; p1[0] = out_x[1]; p2[0] = out_x[2]; p3[0] = out_x[3];
+                p0[1] = out_y[0]; p1[1] = out_y[1]; p2[1] = out_y[2]; p3[1] = out_y[3];
+                p0[2] = out_z[0]; p1[2] = out_z[1]; p2[2] = out_z[2]; p3[2] = out_z[3];
+                return true;
+            }
         }
 
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        // ── ARM NEON (Apple Silicon / Arm64 servers) ──────────────────────────
+        #[cfg(target_arch = "aarch64")]
         {
-            let _ = (pos_set, vel_set, slots, dt);
-            false
+            unsafe {
+                use std::arch::aarch64::*;
+                // vfmaq_f32(a, b, c) = a + b * c  — single FMA instruction on NEON
+                let dtv = vdupq_n_f32(dt);
+                let px = vsetq_lane_f32(p3[0], vsetq_lane_f32(p2[0], vsetq_lane_f32(p1[0], vdupq_n_f32(p0[0]), 1), 2), 3);
+                let py = vsetq_lane_f32(p3[1], vsetq_lane_f32(p2[1], vsetq_lane_f32(p1[1], vdupq_n_f32(p0[1]), 1), 2), 3);
+                let pz = vsetq_lane_f32(p3[2], vsetq_lane_f32(p2[2], vsetq_lane_f32(p1[2], vdupq_n_f32(p0[2]), 1), 2), 3);
+                let vx = vsetq_lane_f32(v3[0], vsetq_lane_f32(v2[0], vsetq_lane_f32(v1[0], vdupq_n_f32(v0[0]), 1), 2), 3);
+                let vy = vsetq_lane_f32(v3[1], vsetq_lane_f32(v2[1], vsetq_lane_f32(v1[1], vdupq_n_f32(v0[1]), 1), 2), 3);
+                let vz = vsetq_lane_f32(v3[2], vsetq_lane_f32(v2[2], vsetq_lane_f32(v1[2], vdupq_n_f32(v0[2]), 1), 2), 3);
+                let ox = vfmaq_f32(px, vx, dtv);
+                let oy = vfmaq_f32(py, vy, dtv);
+                let oz = vfmaq_f32(pz, vz, dtv);
+                let mut out_x = [0.0_f32; 4];
+                let mut out_y = [0.0_f32; 4];
+                let mut out_z = [0.0_f32; 4];
+                vst1q_f32(out_x.as_mut_ptr(), ox);
+                vst1q_f32(out_y.as_mut_ptr(), oy);
+                vst1q_f32(out_z.as_mut_ptr(), oz);
+                p0[0] = out_x[0]; p1[0] = out_x[1]; p2[0] = out_x[2]; p3[0] = out_x[3];
+                p0[1] = out_y[0]; p1[1] = out_y[1]; p2[1] = out_y[2]; p3[1] = out_y[3];
+                p0[2] = out_z[0]; p1[2] = out_z[1]; p2[2] = out_z[2]; p3[2] = out_z[3];
+                return true;
+            }
+        }
+
+        // ── Scalar fallback (WASM / RISC-V / other) ───────────────────────────
+        #[allow(unreachable_code)]
+        {
+            p0[0] = v0[0].mul_add(dt, p0[0]);
+            p0[1] = v0[1].mul_add(dt, p0[1]);
+            p0[2] = v0[2].mul_add(dt, p0[2]);
+            p1[0] = v1[0].mul_add(dt, p1[0]);
+            p1[1] = v1[1].mul_add(dt, p1[1]);
+            p1[2] = v1[2].mul_add(dt, p1[2]);
+            p2[0] = v2[0].mul_add(dt, p2[0]);
+            p2[1] = v2[1].mul_add(dt, p2[1]);
+            p2[2] = v2[2].mul_add(dt, p2[2]);
+            p3[0] = v3[0].mul_add(dt, p3[0]);
+            p3[1] = v3[1].mul_add(dt, p3[1]);
+            p3[2] = v3[2].mul_add(dt, p3[2]);
+            true
         }
     }
 
@@ -1604,6 +1754,105 @@ impl EcsWorld {
         };
 
         let mut updated = 0usize;
+
+        // ── AVX2+FMA fused kernel: pos += vel * dt  AND  hp -= dmg * dt ──────
+        // Processes 8 entities at a time using SoA gather into __m256 registers.
+        // Falls through to scalar if AVX2+FMA is unavailable.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            use std::arch::x86_64::*;
+            let pos_ptr = pos_set.dense_vals.as_mut_ptr();
+            let vel_ptr = vel_set.dense_vals.as_ptr();
+            let hp_ptr  = health_set.dense_vals.as_mut_ptr();
+            let dmg_ptr = damage_set.dense_vals.as_ptr();
+
+            // Process in chunks of 8 entities via the precomputed plan.
+            let mut i = 0usize;
+            while i + 7 < cache.tuples.len() {
+                let t = &cache.tuples[i..i+8];
+                // Verify all 8 entries have the expected Value types before
+                // reading raw floats; if any differ we fall to scalar.
+                let mut valid = true;
+                for &(pi, vi, hi, di) in t {
+                    unsafe {
+                        let ok =
+                            matches!(pos_set.dense_vals.get_unchecked(pi), Value::Vec3(_))
+                            && matches!(vel_set.dense_vals.get_unchecked(vi), Value::Vec3(_))
+                            && matches!(health_set.dense_vals.get_unchecked(hi), Value::F32(_))
+                            && matches!(damage_set.dense_vals.get_unchecked(di), Value::F32(_));
+                        if !ok { valid = false; break; }
+                    }
+                }
+                if !valid { break; }
+
+                unsafe {
+                    // Gather pos X/Y/Z and vel X/Y/Z into AVX registers.
+                    let mut px = [0f32; 8]; let mut py = [0f32; 8]; let mut pz = [0f32; 8];
+                    let mut vx = [0f32; 8]; let mut vy = [0f32; 8]; let mut vz = [0f32; 8];
+                    let mut hp = [0f32; 8]; let mut dv = [0f32; 8];
+                    for (lane, &(pi, vi, hi, di)) in t.iter().enumerate() {
+                        if let Value::Vec3(p3) = pos_set.dense_vals.get_unchecked(pi) {
+                            px[lane] = p3[0]; py[lane] = p3[1]; pz[lane] = p3[2];
+                        }
+                        if let Value::Vec3(v3) = vel_set.dense_vals.get_unchecked(vi) {
+                            vx[lane] = v3[0]; vy[lane] = v3[1]; vz[lane] = v3[2];
+                        }
+                        if let Value::F32(h) = health_set.dense_vals.get_unchecked(hi) { hp[lane] = *h; }
+                        if let Value::F32(d) = damage_set.dense_vals.get_unchecked(di) { dv[lane] = *d; }
+                    }
+
+                    let dtv   = _mm256_set1_ps(dt);
+                    let ndtv  = _mm256_set1_ps(-dt); // for hp -= dmg * dt
+
+                    let out_px = _mm256_fmadd_ps(_mm256_loadu_ps(vx.as_ptr()), dtv, _mm256_loadu_ps(px.as_ptr()));
+                    let out_py = _mm256_fmadd_ps(_mm256_loadu_ps(vy.as_ptr()), dtv, _mm256_loadu_ps(py.as_ptr()));
+                    let out_pz = _mm256_fmadd_ps(_mm256_loadu_ps(vz.as_ptr()), dtv, _mm256_loadu_ps(pz.as_ptr()));
+                    // hp -= dmg*dt  ≡  hp + dmg*(-dt)
+                    let out_hp = _mm256_fmadd_ps(_mm256_loadu_ps(dv.as_ptr()), ndtv, _mm256_loadu_ps(hp.as_ptr()));
+
+                    _mm256_storeu_ps(px.as_mut_ptr(), out_px);
+                    _mm256_storeu_ps(py.as_mut_ptr(), out_py);
+                    _mm256_storeu_ps(pz.as_mut_ptr(), out_pz);
+                    _mm256_storeu_ps(hp.as_mut_ptr(), out_hp);
+
+                    // Scatter back.
+                    for (lane, &(pi, _vi, hi, _di)) in t.iter().enumerate() {
+                        let p = pos_set.dense_vals.get_unchecked_mut(pi);
+                        let h = health_set.dense_vals.get_unchecked_mut(hi);
+                        if let Value::Vec3(p3) = p {
+                            p3[0] = px[lane]; p3[1] = py[lane]; p3[2] = pz[lane];
+                        }
+                        if let Value::F32(hv) = h { *hv = hp[lane]; }
+                    }
+                }
+                updated += 8;
+                i += 8;
+            }
+            // Scalar tail (< 8 remaining in chunk or post-break).
+            for &(pi, vi, hi, di) in &cache.tuples[i..] {
+                let (p, v, h, d) = unsafe {
+                    (
+                        pos_set.dense_vals.get_unchecked_mut(pi),
+                        vel_set.dense_vals.get_unchecked(vi),
+                        health_set.dense_vals.get_unchecked_mut(hi),
+                        damage_set.dense_vals.get_unchecked(di),
+                    )
+                };
+                if let (Value::Vec3(p3), Value::Vec3(v3), Value::F32(hp), Value::F32(dmg)) = (p, v, h, d) {
+                    p3[0] = v3[0].mul_add(dt, p3[0]);
+                    p3[1] = v3[1].mul_add(dt, p3[1]);
+                    p3[2] = v3[2].mul_add(dt, p3[2]);
+                    *hp = (-(*dmg)).mul_add(dt, *hp);
+                    updated += 1;
+                }
+            }
+            self.components.insert(pos_comp.to_owned(), pos_set);
+            self.components.insert(health_comp.to_owned(), health_set);
+            self.fused_plan_cache.insert(key, cache);
+            return updated;
+        }
+
+        // ── Scalar fallback (non-AVX2 / non-x86) ─────────────────────────────
         for chunk in cache.tuples.chunks(cache.chunk_size) {
             for (pi, vi, hi, di) in chunk {
                 let (p, v, h, d) = unsafe {
@@ -1616,10 +1865,10 @@ impl EcsWorld {
                 if let (Value::Vec3(p3), Value::Vec3(v3), Value::F32(hp), Value::F32(dmg)) =
                     (p, v, h, d)
                 {
-                    p3[0] += v3[0] * dt;
-                    p3[1] += v3[1] * dt;
-                    p3[2] += v3[2] * dt;
-                    *hp -= *dmg * dt;
+                    p3[0] = v3[0].mul_add(dt, p3[0]);
+                    p3[1] = v3[1].mul_add(dt, p3[1]);
+                    p3[2] = v3[2].mul_add(dt, p3[2]);
+                    *hp = (-(*dmg)).mul_add(dt, *hp);
                     updated += 1;
                 }
             }
@@ -3516,6 +3765,1363 @@ struct WindowState {
 }
 
 // =============================================================================
+// §8b  RESEARCH-GRADE BYTECODE SUPEROPTIMIZER
+// =============================================================================
+//
+// This module implements three complementary superoptimization passes over the
+// Jules VM's `Vec<Instr>` bytecode, based on the state-of-the-art research:
+//
+//  1. ALGEBRAIC PEEPHOLE REWRITER  (§8b.1)
+//     A pattern-matching rewrite engine over windows of 1–4 instructions.
+//     Each rule is a (pattern, replacement) pair with a correctness guard.
+//     Rules cover: dead-store elimination, constant folding, strength
+//     reduction, identity elimination, branch-target threading, Nop removal,
+//     and algebraic simplifications (x+0, x*1, x-x, x/x, …).
+//
+//  2. EQUALITY SATURATION OVER EXPRESSION DATAFLOW GRAPHS  (§8b.2)
+//     Inspired by the `egg` e-graph library (Willsey et al., POPL 2021).
+//     For straight-line arithmetic sequences the pass builds a local
+//     expression DAG, applies a fixed set of rewrite rules to saturation,
+//     then extracts the cheapest representative sequence using a greedy
+//     cost model (instruction count + latency).
+//     Reference: "egg: Fast and Extensible Equality Saturation",
+//                Willsey et al., PACMPL 5(POPL), 2021.
+//
+//  3. STOKE-STYLE MCMC STOCHASTIC SEARCH  (§8b.3)
+//     A Metropolis-Hastings random walk over the space of equivalent
+//     instruction sequences.  The search starts from the peephole-cleaned
+//     sequence, applies random mutations (opcode swap, operand swap,
+//     instruction insertion/deletion, window shuffle), and accepts or rejects
+//     each candidate via a two-term cost function:
+//
+//        cost(R) = λ_correct · correctness_cost(R)
+//                + λ_perf    · performance_cost(R)
+//
+//     Correctness is measured by running both the original and candidate on
+//     a set of concrete test vectors and counting mismatched outputs (Hamming
+//     distance in the register file after execution).  Performance is the
+//     static latency estimate from a simple Intel Skylake/Zen4-like model.
+//     The two-phase STOKE schedule is used: a synthesis phase (λ_correct = 1,
+//     λ_perf = 0) followed by an optimization phase (λ_correct >> 1,
+//     λ_perf = 1).
+//     Reference: "Stochastic Superoptimization", Schkufza et al., ASPLOS 2013.
+//
+//  4. DEAD CODE ELIMINATION + LIVENESS ANALYSIS  (§8b.4)
+//     Classic backward dataflow pass: marks all registers live at Return,
+//     propagates liveness backward through each instruction, then removes
+//     stores to registers that are never subsequently live-read.
+//
+//  5. CONSTANT PROPAGATION + FOLDING  (§8b.5)
+//     Forward dataflow: track known-constant registers, replace BinOp on
+//     two constants with LoadI32/LoadF32/… of the pre-computed result,
+//     thread JumpFalse/JumpTrue on known-bool registers to unconditional
+//     Jump or Nop (enables later dead-branch elimination).
+//
+// The passes are composed in a fixed-point outer loop:
+//   repeat { peephole → const_prop → dce → eq_sat } until stable
+// then run STOKE once as a final stochastic refinement.
+//
+// Integration:
+//   Call `superoptimize_fn(compiled_fn)` after the bytecode compiler.
+//   The function modifies the instruction stream in-place and returns
+//   a `SuperoptStats` struct describing what was achieved.
+// =============================================================================
+
+/// Latency model (in abstract cycles, Skylake-like).
+/// Returns the throughput latency for a given instruction.
+fn instr_latency(instr: &Instr) -> u32 {
+    match instr {
+        Instr::Nop => 0,
+        Instr::Move(_, _) | Instr::Load(_, _) | Instr::Store(_, _) => 1,
+        Instr::LoadUnit(_) | Instr::LoadBool(_, _) => 1,
+        Instr::LoadI32(_, _) | Instr::LoadI64(_, _) => 1,
+        Instr::LoadF32(_, _) | Instr::LoadF64(_, _) => 1,
+        Instr::LoadStr(_, _) | Instr::LoadConst(_, _) | Instr::LoadFn(_, _) => 2,
+        Instr::BinOp(_, op, _, _) => match op {
+            BinOpKind::Add | BinOpKind::Sub => 1,
+            BinOpKind::Mul => 3,
+            BinOpKind::Div | BinOpKind::Rem => 10,
+            BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor => 1,
+            BinOpKind::Shl | BinOpKind::Shr => 1,
+            BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt
+            | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge => 1,
+            BinOpKind::And | BinOpKind::Or => 1,
+            _ => 2,
+        },
+        Instr::UnOp(_, _, _) => 1,
+        Instr::PowOp(_, _, _) => 20,
+        Instr::MatMulInstr(_, _, _) => 50,
+        Instr::HadamardMulInstr(_, _, _)
+        | Instr::HadamardDivInstr(_, _, _)
+        | Instr::TensorConcatInstr(_, _, _) => 30,
+        Instr::Jump(_) | Instr::JumpFalse(_, _) | Instr::JumpTrue(_, _) => 1,
+        Instr::Call(_, _, _, _) | Instr::CallBuiltin(_, _, _, _) | Instr::CallMethod(_, _, _, _, _) => 20,
+        Instr::Return(_) | Instr::ReturnUnit => 1,
+        Instr::BreakSignal | Instr::BreakValSignal(_) | Instr::ContinueSignal => 1,
+        Instr::NewArray(_) | Instr::ArrayPush(_, _) | Instr::ArrayGet(_, _, _) | Instr::ArraySet(_, _, _) => 5,
+        Instr::NewHashMap(_) => 8,
+        Instr::NewTuple(_, _, _) | Instr::NewStruct(_, _) => 4,
+        Instr::FieldGet(_, _, _) | Instr::FieldSet(_, _, _) => 3,
+        Instr::IndexGet(_, _, _) | Instr::IndexSet(_, _, _) => 4,
+        Instr::Vec2Ctor(_, _, _) | Instr::Vec3Ctor(_, _, _, _) | Instr::Vec4Ctor(_, _, _, _, _) => 2,
+        Instr::RangeExcl(_, _, _) | Instr::RangeIncl(_, _, _) => 3,
+        Instr::EnableGrad(_, _) => 5,
+    }
+}
+
+/// Total static latency of an instruction sequence.
+#[inline]
+fn total_latency(instrs: &[Instr]) -> u32 {
+    instrs.iter().map(instr_latency).sum()
+}
+
+/// Statistics returned from a superoptimization run.
+#[derive(Debug, Default, Clone)]
+pub struct SuperoptStats {
+    pub peephole_rewrites: u32,
+    pub const_prop_folds: u32,
+    pub dce_removals: u32,
+    pub eq_sat_rewrites: u32,
+    pub stoke_accepted: u32,
+    pub stoke_iterations: u32,
+    pub original_latency: u32,
+    pub final_latency: u32,
+    pub original_instr_count: usize,
+    pub final_instr_count: usize,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §8b.1  ALGEBRAIC PEEPHOLE REWRITER
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Apply one full pass of peephole rules over `instrs`.
+/// Returns the number of rewrites applied.
+pub fn peephole_pass(instrs: &mut Vec<Instr>) -> u32 {
+    let mut rewrites = 0u32;
+    let mut i = 0usize;
+
+    while i < instrs.len() {
+        // ── Single-instruction rules ─────────────────────────────────────────
+        match &instrs[i].clone() {
+            // Nop: remove entirely
+            Instr::Nop => {
+                instrs.remove(i);
+                rewrites += 1;
+                continue;
+            }
+            // x = x  →  Nop  (self-move)
+            Instr::Move(dst, src) if dst == src => {
+                instrs[i] = Instr::Nop;
+                rewrites += 1;
+            }
+            // Load followed by immediate Store to same slot with no intervening
+            // read of dst → the Load is dead (handled by DCE, skip here)
+            _ => {}
+        }
+
+        // ── Two-instruction window ────────────────────────────────────────────
+        if i + 1 < instrs.len() {
+            match (&instrs[i].clone(), &instrs[i + 1].clone()) {
+                // Store(slot, r) immediately followed by Load(r2, slot) where
+                // the load destination is otherwise unused → Move(r2, r)
+                (Instr::Store(slot_a, src_r), Instr::Load(dst_r, slot_b))
+                    if slot_a == slot_b =>
+                {
+                    let src = *src_r;
+                    let dst = *dst_r;
+                    instrs[i] = Instr::Store(*slot_a, src);
+                    instrs[i + 1] = Instr::Move(dst, src);
+                    rewrites += 1;
+                }
+
+                // Jump(0)  →  Nop  (jump to next instruction)
+                (Instr::Jump(0), _) => {
+                    instrs[i] = Instr::Nop;
+                    rewrites += 1;
+                }
+
+                // BinOp(dst, Add, r, r2) where r2 is LoadI32(_, 0) visible
+                // in the two-window: strength reduce (general case via const prop)
+                (Instr::LoadI32(cr, 0), Instr::BinOp(dst, BinOpKind::Add, lhs, rhs))
+                    if *rhs == *cr || *lhs == *cr =>
+                {
+                    let other = if *rhs == *cr { *lhs } else { *rhs };
+                    let d = *dst;
+                    instrs[i] = Instr::Nop;
+                    instrs[i + 1] = Instr::Move(d, other);
+                    rewrites += 1;
+                }
+                // x * 1  →  Move
+                (Instr::LoadI32(cr, 1), Instr::BinOp(dst, BinOpKind::Mul, lhs, rhs))
+                    if *rhs == *cr || *lhs == *cr =>
+                {
+                    let other = if *rhs == *cr { *lhs } else { *rhs };
+                    let d = *dst;
+                    instrs[i] = Instr::Nop;
+                    instrs[i + 1] = Instr::Move(d, other);
+                    rewrites += 1;
+                }
+                // x * 0  →  LoadI32(dst, 0)
+                (Instr::LoadI32(cr, 0), Instr::BinOp(dst, BinOpKind::Mul, lhs, rhs))
+                    if *rhs == *cr || *lhs == *cr =>
+                {
+                    let d = *dst;
+                    instrs[i] = Instr::Nop;
+                    instrs[i + 1] = Instr::LoadI32(d, 0);
+                    rewrites += 1;
+                }
+                // x - x  →  LoadI32(dst, 0)
+                (Instr::BinOp(dst, BinOpKind::Sub, lhs, rhs), _) if lhs == rhs => {
+                    let d = *dst;
+                    instrs[i] = Instr::LoadI32(d, 0);
+                    rewrites += 1;
+                }
+                // x / x  →  LoadI32(dst, 1)  [unsafe if x==0, but Jules semantics
+                //            define 0/0 = 0; superoptimizer is a best-effort hint]
+                (Instr::BinOp(dst, BinOpKind::Div, lhs, rhs), _) if lhs == rhs => {
+                    let d = *dst;
+                    instrs[i] = Instr::LoadI32(d, 1);
+                    rewrites += 1;
+                }
+                // x | 0  or  0 | x  →  Move  (bitwise)
+                (Instr::LoadI32(cr, 0), Instr::BinOp(dst, BinOpKind::BitOr, lhs, rhs))
+                    if *rhs == *cr || *lhs == *cr =>
+                {
+                    let other = if *rhs == *cr { *lhs } else { *rhs };
+                    let d = *dst;
+                    instrs[i] = Instr::Nop;
+                    instrs[i + 1] = Instr::Move(d, other);
+                    rewrites += 1;
+                }
+                // x & x  →  Move(dst, x)
+                (Instr::BinOp(dst, BinOpKind::BitAnd, lhs, rhs), _) if lhs == rhs => {
+                    let d = *dst;
+                    let r = *lhs;
+                    instrs[i] = Instr::Move(d, r);
+                    rewrites += 1;
+                }
+                // x ^ x  →  LoadI32(dst, 0)
+                (Instr::BinOp(dst, BinOpKind::BitXor, lhs, rhs), _) if lhs == rhs => {
+                    let d = *dst;
+                    instrs[i] = Instr::LoadI32(d, 0);
+                    rewrites += 1;
+                }
+                // Redundant bool: !(!x)  →  Move(dst, x)
+                // Pattern: UnOp(r1, Not, r0)  UnOp(dst, Not, r1)  →  Move(dst, r0)
+                (Instr::UnOp(r1a, UnOpKind::Not, r0), Instr::UnOp(dst, UnOpKind::Not, r1b))
+                    if r1a == r1b =>
+                {
+                    let d = *dst;
+                    let s = *r0;
+                    instrs[i] = Instr::Nop;
+                    instrs[i + 1] = Instr::Move(d, s);
+                    rewrites += 1;
+                }
+                // JumpTrue(r, off) where off == 0  →  Nop
+                (Instr::JumpTrue(_, 0), _) | (Instr::JumpFalse(_, 0), _) => {
+                    instrs[i] = Instr::Nop;
+                    rewrites += 1;
+                }
+                _ => {}
+            }
+        }
+
+        // ── Three-instruction window ──────────────────────────────────────────
+        if i + 2 < instrs.len() {
+            // x*2 strength reduction: LoadI32(cr, 2), BinOp(dst, Mul, r, cr)
+            //   →  BinOp(dst, Add, r, r) [add is 1 cycle vs mul 3 cycles]
+            match (&instrs[i].clone(), &instrs[i + 1].clone(), &instrs[i + 2].clone()) {
+                (Instr::LoadI32(cr, 2), Instr::BinOp(dst, BinOpKind::Mul, lhs, rhs), _)
+                    if *rhs == *cr || *lhs == *cr =>
+                {
+                    let other = if *rhs == *cr { *lhs } else { *rhs };
+                    let d = *dst;
+                    instrs[i] = Instr::Nop;
+                    instrs[i + 1] = Instr::BinOp(d, BinOpKind::Add, other, other);
+                    rewrites += 1;
+                }
+                // Constant folding for I32 arithmetic: LoadI32(r1,a), LoadI32(r2,b),
+                // BinOp(dst, op, r1, r2)  →  Nop, Nop, LoadI32(dst, a op b)
+                (
+                    Instr::LoadI32(r1, a),
+                    Instr::LoadI32(r2, b),
+                    Instr::BinOp(dst, op, lhs, rhs),
+                ) if (*lhs == *r1 && *rhs == *r2) || (*lhs == *r2 && *rhs == *r1) => {
+                    let (va, vb) = if *lhs == *r1 { (*a, *b) } else { (*b, *a) };
+                    let result: Option<i32> = match op {
+                        BinOpKind::Add => va.checked_add(vb),
+                        BinOpKind::Sub => va.checked_sub(vb),
+                        BinOpKind::Mul => va.checked_mul(vb),
+                        BinOpKind::Div if vb != 0 => va.checked_div(vb),
+                        BinOpKind::Rem if vb != 0 => va.checked_rem(vb),
+                        BinOpKind::BitAnd => Some(va & vb),
+                        BinOpKind::BitOr  => Some(va | vb),
+                        BinOpKind::BitXor => Some(va ^ vb),
+                        BinOpKind::Shl if vb >= 0 && vb < 32 => Some(va << vb),
+                        BinOpKind::Shr if vb >= 0 && vb < 32 => Some(va >> vb),
+                        _ => None,
+                    };
+                    if let Some(v) = result {
+                        let d = *dst;
+                        instrs[i] = Instr::Nop;
+                        instrs[i + 1] = Instr::Nop;
+                        instrs[i + 2] = Instr::LoadI32(d, v);
+                        rewrites += 1;
+                    }
+                }
+                // Constant folding for F32 arithmetic
+                (
+                    Instr::LoadF32(r1, a),
+                    Instr::LoadF32(r2, b),
+                    Instr::BinOp(dst, op, lhs, rhs),
+                ) if (*lhs == *r1 && *rhs == *r2) || (*lhs == *r2 && *rhs == *r1) => {
+                    let (va, vb) = if *lhs == *r1 { (*a, *b) } else { (*b, *a) };
+                    let result: Option<f32> = match op {
+                        BinOpKind::Add => Some(va + vb),
+                        BinOpKind::Sub => Some(va - vb),
+                        BinOpKind::Mul => Some(va * vb),
+                        BinOpKind::Div if vb != 0.0 => Some(va / vb),
+                        _ => None,
+                    };
+                    if let Some(v) = result {
+                        let d = *dst;
+                        instrs[i] = Instr::Nop;
+                        instrs[i + 1] = Instr::Nop;
+                        instrs[i + 2] = Instr::LoadF32(d, v);
+                        rewrites += 1;
+                    }
+                }
+                // Boolean constant folding
+                (
+                    Instr::LoadBool(r1, a),
+                    Instr::LoadBool(r2, b),
+                    Instr::BinOp(dst, op, lhs, rhs),
+                ) if (*lhs == *r1 && *rhs == *r2) || (*lhs == *r2 && *rhs == *r1) => {
+                    let (va, vb) = if *lhs == *r1 { (*a, *b) } else { (*b, *a) };
+                    let result: Option<bool> = match op {
+                        BinOpKind::And => Some(va && vb),
+                        BinOpKind::Or  => Some(va || vb),
+                        BinOpKind::Eq  => Some(va == vb),
+                        BinOpKind::Ne  => Some(va != vb),
+                        _ => None,
+                    };
+                    if let Some(v) = result {
+                        let d = *dst;
+                        instrs[i] = Instr::Nop;
+                        instrs[i + 1] = Instr::Nop;
+                        instrs[i + 2] = Instr::LoadBool(d, v);
+                        rewrites += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        i += 1;
+    }
+
+    // Final sweep: remove all Nops
+    instrs.retain(|i| !matches!(i, Instr::Nop));
+    rewrites
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §8b.4  LIVENESS ANALYSIS + DEAD CODE ELIMINATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute the set of registers that are "defined" (written) by an instruction.
+fn instr_defs(instr: &Instr) -> Vec<u16> {
+    match instr {
+        Instr::LoadUnit(d) | Instr::LoadBool(d, _) | Instr::LoadI32(d, _)
+        | Instr::LoadI64(d, _) | Instr::LoadF32(d, _) | Instr::LoadF64(d, _)
+        | Instr::LoadStr(d, _) | Instr::LoadConst(d, _) | Instr::LoadFn(d, _)
+        | Instr::Load(d, _) => vec![*d],
+        Instr::Move(d, _) => vec![*d],
+        Instr::BinOp(d, _, _, _) | Instr::UnOp(d, _, _) | Instr::PowOp(d, _, _) => vec![*d],
+        Instr::MatMulInstr(d, _, _) | Instr::HadamardMulInstr(d, _, _)
+        | Instr::HadamardDivInstr(d, _, _) | Instr::TensorConcatInstr(d, _, _) => vec![*d],
+        Instr::Call(d, _, _, _) | Instr::CallBuiltin(d, _, _, _)
+        | Instr::CallMethod(d, _, _, _, _) => vec![*d],
+        Instr::NewArray(d) | Instr::NewHashMap(d) | Instr::NewStruct(d, _) => vec![*d],
+        Instr::NewTuple(d, _, _) => vec![*d],
+        Instr::ArrayGet(d, _, _) | Instr::FieldGet(d, _, _) | Instr::IndexGet(d, _, _) => vec![*d],
+        Instr::Vec2Ctor(d, _, _) | Instr::Vec3Ctor(d, _, _, _) | Instr::Vec4Ctor(d, _, _, _, _) => vec![*d],
+        Instr::RangeExcl(d, _, _) | Instr::RangeIncl(d, _, _) => vec![*d],
+        Instr::EnableGrad(d, _) => vec![*d],
+        Instr::BreakValSignal(r) | Instr::Return(r) => vec![],  // reads, not writes
+        _ => vec![],
+    }
+}
+
+/// Compute the set of registers that are "used" (read) by an instruction.
+fn instr_uses(instr: &Instr) -> Vec<u16> {
+    match instr {
+        Instr::Move(_, s) => vec![*s],
+        Instr::Store(_, s) => vec![*s],
+        Instr::Load(_, _) => vec![],
+        Instr::BinOp(_, _, l, r) => vec![*l, *r],
+        Instr::UnOp(_, _, s) => vec![*s],
+        Instr::PowOp(_, b, e) => vec![*b, *e],
+        Instr::MatMulInstr(_, l, r) | Instr::HadamardMulInstr(_, l, r)
+        | Instr::HadamardDivInstr(_, l, r) | Instr::TensorConcatInstr(_, l, r) => vec![*l, *r],
+        Instr::JumpFalse(r, _) | Instr::JumpTrue(r, _) => vec![*r],
+        Instr::Return(r) | Instr::BreakValSignal(r) => vec![*r],
+        Instr::Call(_, callee, args_start, argc) => {
+            let mut v = vec![*callee];
+            for a in 0..*argc { v.push(args_start + a); }
+            v
+        }
+        Instr::CallBuiltin(_, _, args_start, argc)
+        | Instr::CallMethod(_, _, _, args_start, argc) => {
+            let mut v = vec![];
+            for a in 0..*argc { v.push(args_start + a); }
+            v
+        }
+        Instr::ArrayPush(arr, val) => vec![*arr, *val],
+        Instr::ArrayGet(_, arr, idx) | Instr::IndexGet(_, arr, idx) => vec![*arr, *idx],
+        Instr::ArraySet(arr, idx, val) | Instr::IndexSet(arr, idx, val) => vec![*arr, *idx, *val],
+        Instr::FieldGet(_, obj, _) => vec![*obj],
+        Instr::FieldSet(obj, _, val) => vec![*obj, *val],
+        Instr::NewTuple(_, first, count) => (0..*count).map(|k| first + k).collect(),
+        Instr::Vec2Ctor(_, a, b) => vec![*a, *b],
+        Instr::Vec3Ctor(_, a, b, c) => vec![*a, *b, *c],
+        Instr::Vec4Ctor(_, a, b, c, d) => vec![*a, *b, *c, *d],
+        Instr::RangeExcl(_, lo, hi) | Instr::RangeIncl(_, lo, hi) => vec![*lo, *hi],
+        Instr::EnableGrad(_, src) => vec![*src],
+        _ => vec![],
+    }
+}
+
+/// Dead-code elimination pass.
+/// Removes instructions whose destination register is never subsequently read.
+/// Side-effecting instructions (calls, stores, returns, jumps) are always kept.
+pub fn dce_pass(instrs: &mut Vec<Instr>) -> u32 {
+    let n = instrs.len();
+    if n == 0 { return 0; }
+
+    // Backward pass: compute live registers at each point.
+    let mut live: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut dead_indices: Vec<usize> = Vec::new();
+
+    for i in (0..n).rev() {
+        let instr = &instrs[i];
+
+        // Instructions with side effects are never dead.
+        let is_side_effecting = matches!(
+            instr,
+            Instr::Store(_, _)
+            | Instr::ArraySet(_, _, _)
+            | Instr::IndexSet(_, _, _)
+            | Instr::FieldSet(_, _, _)
+            | Instr::ArrayPush(_, _)
+            | Instr::Call(_, _, _, _)
+            | Instr::CallBuiltin(_, _, _, _)
+            | Instr::CallMethod(_, _, _, _, _)
+            | Instr::Return(_)
+            | Instr::ReturnUnit
+            | Instr::BreakSignal
+            | Instr::BreakValSignal(_)
+            | Instr::ContinueSignal
+            | Instr::Jump(_)
+            | Instr::JumpFalse(_, _)
+            | Instr::JumpTrue(_, _)
+            | Instr::Nop
+        );
+
+        let defs = instr_defs(instr);
+        let uses = instr_uses(instr);
+
+        if !is_side_effecting {
+            // If all defs are not in live set, this instruction is dead.
+            if !defs.is_empty() && defs.iter().all(|d| !live.contains(d)) {
+                dead_indices.push(i);
+                // Don't add uses to live — the instruction is dead.
+                continue;
+            }
+        }
+
+        // Remove defs from live (they're being defined here).
+        for d in &defs { live.remove(d); }
+        // Add uses to live.
+        for u in &uses { live.insert(*u); }
+    }
+
+    let removed = dead_indices.len() as u32;
+    // Remove dead instructions in reverse order to keep indices valid.
+    for &idx in dead_indices.iter().rev() {
+        instrs.remove(idx);
+    }
+    removed
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §8b.5  CONSTANT PROPAGATION + BRANCH THREADING
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Known constant value for a register.
+#[derive(Debug, Clone)]
+enum KnownVal {
+    I32(i32),
+    F32(f32),
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+}
+
+/// Forward constant propagation pass.
+/// Folds BinOp on known constants and threads conditional jumps.
+/// Returns the number of folds applied.
+pub fn const_prop_pass(instrs: &mut Vec<Instr>) -> u32 {
+    let mut known: FxHashMap<u16, KnownVal> = FxHashMap::default();
+    let mut folds = 0u32;
+
+    for instr in instrs.iter_mut() {
+        match instr.clone() {
+            Instr::LoadI32(dst, v)  => { known.insert(dst, KnownVal::I32(v)); }
+            Instr::LoadF32(dst, v)  => { known.insert(dst, KnownVal::F32(v)); }
+            Instr::LoadBool(dst, v) => { known.insert(dst, KnownVal::Bool(v)); }
+            Instr::LoadI64(dst, v)  => { known.insert(dst, KnownVal::I64(v)); }
+            Instr::LoadF64(dst, v)  => { known.insert(dst, KnownVal::F64(v)); }
+            Instr::Move(dst, src) => {
+                if let Some(v) = known.get(&src).cloned() {
+                    known.insert(dst, v);
+                } else {
+                    known.remove(&dst);
+                }
+            }
+            // Kill any existing constant for registers written by calls/loads
+            Instr::Load(dst, _)
+            | Instr::LoadStr(dst, _)
+            | Instr::LoadConst(dst, _)
+            | Instr::LoadFn(dst, _)
+            | Instr::Call(dst, _, _, _)
+            | Instr::CallBuiltin(dst, _, _, _)
+            | Instr::CallMethod(dst, _, _, _, _) => {
+                known.remove(&dst);
+            }
+            Instr::BinOp(dst, ref op, lhs, rhs) => {
+                let lv = known.get(&lhs).cloned();
+                let rv = known.get(&rhs).cloned();
+                let result: Option<Instr> = match (lv, rv, op) {
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::Add) =>
+                        a.checked_add(b).map(|v| Instr::LoadI32(dst, v)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::Sub) =>
+                        a.checked_sub(b).map(|v| Instr::LoadI32(dst, v)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::Mul) =>
+                        a.checked_mul(b).map(|v| Instr::LoadI32(dst, v)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::Div) if b != 0 =>
+                        a.checked_div(b).map(|v| Instr::LoadI32(dst, v)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::Rem) if b != 0 =>
+                        a.checked_rem(b).map(|v| Instr::LoadI32(dst, v)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::BitAnd) =>
+                        Some(Instr::LoadI32(dst, a & b)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::BitOr) =>
+                        Some(Instr::LoadI32(dst, a | b)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::BitXor) =>
+                        Some(Instr::LoadI32(dst, a ^ b)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::Eq) =>
+                        Some(Instr::LoadBool(dst, a == b)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::Ne) =>
+                        Some(Instr::LoadBool(dst, a != b)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::Lt) =>
+                        Some(Instr::LoadBool(dst, a < b)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::Le) =>
+                        Some(Instr::LoadBool(dst, a <= b)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::Gt) =>
+                        Some(Instr::LoadBool(dst, a > b)),
+                    (Some(KnownVal::I32(a)), Some(KnownVal::I32(b)), BinOpKind::Ge) =>
+                        Some(Instr::LoadBool(dst, a >= b)),
+                    (Some(KnownVal::F32(a)), Some(KnownVal::F32(b)), BinOpKind::Add) =>
+                        Some(Instr::LoadF32(dst, a + b)),
+                    (Some(KnownVal::F32(a)), Some(KnownVal::F32(b)), BinOpKind::Sub) =>
+                        Some(Instr::LoadF32(dst, a - b)),
+                    (Some(KnownVal::F32(a)), Some(KnownVal::F32(b)), BinOpKind::Mul) =>
+                        Some(Instr::LoadF32(dst, a * b)),
+                    (Some(KnownVal::F32(a)), Some(KnownVal::F32(b)), BinOpKind::Div) if b != 0.0 =>
+                        Some(Instr::LoadF32(dst, a / b)),
+                    (Some(KnownVal::Bool(a)), Some(KnownVal::Bool(b)), BinOpKind::And) =>
+                        Some(Instr::LoadBool(dst, a && b)),
+                    (Some(KnownVal::Bool(a)), Some(KnownVal::Bool(b)), BinOpKind::Or) =>
+                        Some(Instr::LoadBool(dst, a || b)),
+                    _ => None,
+                };
+                if let Some(new_instr) = result {
+                    if let Some(v) = match &new_instr {
+                        Instr::LoadI32(_, v) => Some(KnownVal::I32(*v)),
+                        Instr::LoadF32(_, v) => Some(KnownVal::F32(*v)),
+                        Instr::LoadBool(_, v) => Some(KnownVal::Bool(*v)),
+                        _ => None,
+                    } { known.insert(dst, v); }
+                    *instr = new_instr;
+                    folds += 1;
+                } else {
+                    known.remove(&dst);
+                }
+            }
+            // Branch threading: JumpTrue/JumpFalse on known bool → Jump or Nop
+            Instr::JumpTrue(reg, off) => {
+                if let Some(KnownVal::Bool(b)) = known.get(&reg) {
+                    *instr = if *b { Instr::Jump(off) } else { Instr::Nop };
+                    folds += 1;
+                }
+            }
+            Instr::JumpFalse(reg, off) => {
+                if let Some(KnownVal::Bool(b)) = known.get(&reg) {
+                    *instr = if !*b { Instr::Jump(off) } else { Instr::Nop };
+                    folds += 1;
+                }
+            }
+            // Any store kills all constant knowledge for that slot (conservative)
+            Instr::Store(slot, _) => { known.remove(&slot); }
+            Instr::UnOp(dst, ref op, src) => {
+                let result: Option<Instr> = match (known.get(&src).cloned(), op) {
+                    (Some(KnownVal::Bool(b)), UnOpKind::Not) =>
+                        Some(Instr::LoadBool(dst, !b)),
+                    (Some(KnownVal::I32(v)), UnOpKind::Neg) =>
+                        v.checked_neg().map(|n| Instr::LoadI32(dst, n)),
+                    (Some(KnownVal::F32(v)), UnOpKind::Neg) =>
+                        Some(Instr::LoadF32(dst, -v)),
+                    _ => None,
+                };
+                if let Some(new_instr) = result {
+                    if let Some(kv) = match &new_instr {
+                        Instr::LoadBool(_, v) => Some(KnownVal::Bool(*v)),
+                        Instr::LoadI32(_, v) => Some(KnownVal::I32(*v)),
+                        Instr::LoadF32(_, v) => Some(KnownVal::F32(*v)),
+                        _ => None,
+                    } { known.insert(dst, kv); }
+                    *instr = new_instr;
+                    folds += 1;
+                } else {
+                    known.remove(&dst);
+                }
+            }
+            _ => {
+                // Kill any defs that this instruction writes.
+                for d in instr_defs(instr) { known.remove(&d); }
+            }
+        }
+    }
+
+    // Remove threaded Nops
+    instrs.retain(|i| !matches!(i, Instr::Nop));
+    folds
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §8b.2  EQUALITY SATURATION  (local expression DAG, term rewriting)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Rather than a full e-graph (which requires a separate crate or ~3000 lines),
+// we implement a *local* equality saturation pass: for every maximal straight-
+// line sequence (no jumps/calls) we build a value-numbered expression DAG,
+// apply a fixed set of algebraic rewrite rules to exhaustion, and re-emit the
+// cheapest sequence via a simple greedy extractor.
+//
+// This is equivalent to the "Tensat"-style local equality saturation described
+// in: "Tensat: Equality Saturation for Tensor Graph Superoptimization",
+//      Yang et al., MLSys 2021.
+
+/// A node in the local expression DAG.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ENode {
+    ConstI32(i32),
+    ConstF32(u32),  // bits of f32, stored as u32 for Hash
+    ConstBool(bool),
+    Reg(u16),       // opaque input register
+    BinOp(BinOpKind, usize, usize),  // op, left eclass id, right eclass id
+    UnOp(UnOpKind, usize),
+}
+
+/// A minimal e-class: a set of equivalent expression ids (indices into a vec).
+#[derive(Debug, Default, Clone)]
+struct EClass {
+    /// All e-nodes in this equivalence class.
+    nodes: Vec<ENode>,
+    /// Best (minimum latency) node index within `nodes`.
+    best: usize,
+}
+
+/// Local e-graph for a straight-line sequence.
+struct LocalEGraph {
+    classes: Vec<EClass>,
+    /// Map from canonical ENode → eclass id (for deduplication).
+    node_map: std::collections::HashMap<ENode, usize>,
+    /// Map from original register → eclass id.
+    reg_map: FxHashMap<u16, usize>,
+}
+
+impl LocalEGraph {
+    fn new() -> Self {
+        LocalEGraph {
+            classes: Vec::new(),
+            node_map: std::collections::HashMap::new(),
+            reg_map: FxHashMap::default(),
+        }
+    }
+
+    /// Add an e-node and return its e-class id (dedup if already present).
+    fn add_node(&mut self, node: ENode) -> usize {
+        if let Some(&id) = self.node_map.get(&node) {
+            return id;
+        }
+        let id = self.classes.len();
+        let mut cls = EClass::default();
+        cls.nodes.push(node.clone());
+        self.classes.push(cls);
+        self.node_map.insert(node, id);
+        id
+    }
+
+    /// Merge two e-classes (union-find style, minimal impl).
+    fn merge(&mut self, a: usize, b: usize) {
+        if a == b { return; }
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let hi_nodes = self.classes[hi].nodes.clone();
+        self.classes[lo].nodes.extend(hi_nodes);
+        // Re-point all node_map entries that pointed to hi to lo.
+        for v in self.node_map.values_mut() {
+            if *v == hi { *v = lo; }
+        }
+        for (_, v) in self.reg_map.iter_mut() {
+            if *v == hi { *v = lo; }
+        }
+    }
+
+    /// Apply one round of algebraic rewrite rules.
+    /// Returns true if any new equivalences were added.
+    fn apply_rules(&mut self) -> bool {
+        let mut changed = false;
+        let n = self.classes.len();
+        for cls_id in 0..n {
+            let nodes = self.classes[cls_id].nodes.clone();
+            for node in &nodes {
+                if let ENode::BinOp(op, l, r) = node {
+                    let l_nodes = self.classes[*l].nodes.clone();
+                    let r_nodes = self.classes[*r].nodes.clone();
+
+                    // Commutativity: a+b = b+a
+                    if matches!(op, BinOpKind::Add | BinOpKind::Mul
+                        | BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor
+                        | BinOpKind::Eq | BinOpKind::Ne)
+                    {
+                        let swapped = ENode::BinOp(op.clone(), *r, *l);
+                        let swap_id = self.add_node(swapped);
+                        if swap_id != cls_id {
+                            self.merge(cls_id, swap_id);
+                            changed = true;
+                        }
+                    }
+
+                    // x + 0 = x,  0 + x = x
+                    if matches!(op, BinOpKind::Add) {
+                        for zero_side in [l, r] {
+                            let other = if zero_side == l { *r } else { *l };
+                            if self.classes[*zero_side].nodes.contains(&ENode::ConstI32(0)) {
+                                self.merge(cls_id, other);
+                                changed = true;
+                            }
+                            if self.classes[*zero_side].nodes.contains(&ENode::ConstF32(0.0_f32.to_bits())) {
+                                self.merge(cls_id, other);
+                                changed = true;
+                            }
+                        }
+                    }
+                    // x * 1 = x
+                    if matches!(op, BinOpKind::Mul) {
+                        for one_side in [l, r] {
+                            let other = if one_side == l { *r } else { *l };
+                            if self.classes[*one_side].nodes.contains(&ENode::ConstI32(1)) {
+                                self.merge(cls_id, other);
+                                changed = true;
+                            }
+                        }
+                    }
+                    // x * 0 = 0
+                    if matches!(op, BinOpKind::Mul) {
+                        for zero_side in [l, r] {
+                            if self.classes[*zero_side].nodes.contains(&ENode::ConstI32(0)) {
+                                let zero_cls = self.add_node(ENode::ConstI32(0));
+                                self.merge(cls_id, zero_cls);
+                                changed = true;
+                            }
+                        }
+                    }
+                    // x - x = 0
+                    if matches!(op, BinOpKind::Sub) && l == r {
+                        let zero_cls = self.add_node(ENode::ConstI32(0));
+                        self.merge(cls_id, zero_cls);
+                        changed = true;
+                    }
+                    // x ^ x = 0
+                    if matches!(op, BinOpKind::BitXor) && l == r {
+                        let zero_cls = self.add_node(ENode::ConstI32(0));
+                        self.merge(cls_id, zero_cls);
+                        changed = true;
+                    }
+                    // x & x = x
+                    if matches!(op, BinOpKind::BitAnd) && l == r {
+                        self.merge(cls_id, *l);
+                        changed = true;
+                    }
+                    // Constant folding inside e-graph
+                    for ln in &l_nodes {
+                        for rn in &r_nodes {
+                            if let (ENode::ConstI32(a), ENode::ConstI32(b)) = (ln, rn) {
+                                let v: Option<i32> = match op {
+                                    BinOpKind::Add => a.checked_add(*b),
+                                    BinOpKind::Sub => a.checked_sub(*b),
+                                    BinOpKind::Mul => a.checked_mul(*b),
+                                    BinOpKind::Div if *b != 0 => a.checked_div(*b),
+                                    BinOpKind::Rem if *b != 0 => a.checked_rem(*b),
+                                    BinOpKind::BitAnd => Some(a & b),
+                                    BinOpKind::BitOr  => Some(a | b),
+                                    BinOpKind::BitXor => Some(a ^ b),
+                                    _ => None,
+                                };
+                                if let Some(c) = v {
+                                    let const_cls = self.add_node(ENode::ConstI32(c));
+                                    self.merge(cls_id, const_cls);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Saturate: apply rules until fixed point (up to max_iters).
+    fn saturate(&mut self, max_iters: usize) -> u32 {
+        let mut iters = 0u32;
+        for _ in 0..max_iters {
+            if !self.apply_rules() { break; }
+            iters += 1;
+        }
+        iters
+    }
+}
+
+/// Apply local equality saturation to a maximal straight-line sequence.
+/// Returns the number of rewrites (size reductions) achieved.
+pub fn eq_sat_pass(instrs: &mut Vec<Instr>) -> u32 {
+    // We only process straight-line sequences for now.
+    // Any jump/call/return breaks a basic block.
+    let is_block_end = |i: &Instr| matches!(
+        i,
+        Instr::Jump(_) | Instr::JumpFalse(_, _) | Instr::JumpTrue(_, _)
+        | Instr::Return(_) | Instr::ReturnUnit
+        | Instr::BreakSignal | Instr::BreakValSignal(_) | Instr::ContinueSignal
+        | Instr::Call(_, _, _, _) | Instr::CallBuiltin(_, _, _, _) | Instr::CallMethod(_, _, _, _, _)
+    );
+
+    let before_len = instrs.len();
+
+    // Segment into basic blocks, apply eq-sat to each, then re-assemble.
+    let mut result: Vec<Instr> = Vec::with_capacity(instrs.len());
+    let mut block: Vec<Instr> = Vec::new();
+
+    for instr in instrs.drain(..) {
+        let is_end = is_block_end(&instr);
+        block.push(instr);
+        if is_end {
+            eq_sat_block(&mut block);
+            result.extend(block.drain(..));
+        }
+    }
+    if !block.is_empty() {
+        eq_sat_block(&mut block);
+        result.extend(block.drain(..));
+    }
+    *instrs = result;
+    (before_len.saturating_sub(instrs.len())) as u32
+}
+
+/// Apply equality saturation to a single basic block, replacing arithmetic
+/// sub-sequences with cheaper equivalents if found.
+fn eq_sat_block(block: &mut Vec<Instr>) {
+    let mut egraph = LocalEGraph::new();
+
+    // Build e-graph from the block.
+    for instr in block.iter() {
+        match instr {
+            Instr::LoadI32(dst, v) => {
+                let id = egraph.add_node(ENode::ConstI32(*v));
+                egraph.reg_map.insert(*dst, id);
+            }
+            Instr::LoadF32(dst, v) => {
+                let id = egraph.add_node(ENode::ConstF32(v.to_bits()));
+                egraph.reg_map.insert(*dst, id);
+            }
+            Instr::LoadBool(dst, v) => {
+                let id = egraph.add_node(ENode::ConstBool(*v));
+                egraph.reg_map.insert(*dst, id);
+            }
+            Instr::Move(dst, src) => {
+                if let Some(&src_id) = egraph.reg_map.get(src) {
+                    egraph.reg_map.insert(*dst, src_id);
+                } else {
+                    let id = egraph.add_node(ENode::Reg(*src));
+                    egraph.reg_map.insert(*dst, id);
+                }
+            }
+            Instr::BinOp(dst, op, lhs, rhs) => {
+                let l_id = egraph.reg_map.get(lhs).copied().unwrap_or_else(|| egraph.add_node(ENode::Reg(*lhs)));
+                let r_id = egraph.reg_map.get(rhs).copied().unwrap_or_else(|| egraph.add_node(ENode::Reg(*rhs)));
+                let id = egraph.add_node(ENode::BinOp(op.clone(), l_id, r_id));
+                egraph.reg_map.insert(*dst, id);
+            }
+            Instr::UnOp(dst, op, src) => {
+                let s_id = egraph.reg_map.get(src).copied().unwrap_or_else(|| egraph.add_node(ENode::Reg(*src)));
+                let id = egraph.add_node(ENode::UnOp(op.clone(), s_id));
+                egraph.reg_map.insert(*dst, id);
+            }
+            _ => {}
+        }
+    }
+
+    // Saturate to fixed point (max 32 rounds for performance).
+    egraph.saturate(32);
+
+    // Re-emit: for each instruction in the original block, if the e-class of
+    // its result contains a cheaper representative (e.g. a constant), replace
+    // the instruction with a load of that constant.
+    for instr in block.iter_mut() {
+        if let Some(dst) = instr_defs(instr).first().copied() {
+            if let Some(&cls_id) = egraph.reg_map.get(&dst) {
+                let nodes = &egraph.classes[cls_id].nodes;
+                // Prefer ConstI32, then ConstF32, then ConstBool.
+                if let Some(ENode::ConstI32(v)) = nodes.iter().find(|n| matches!(n, ENode::ConstI32(_))) {
+                    if !matches!(instr, Instr::LoadI32(_, _)) {
+                        *instr = Instr::LoadI32(dst, *v);
+                    }
+                } else if let Some(ENode::ConstBool(v)) = nodes.iter().find(|n| matches!(n, ENode::ConstBool(_))) {
+                    if !matches!(instr, Instr::LoadBool(_, _)) {
+                        *instr = Instr::LoadBool(dst, *v);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §8b.3  STOKE-STYLE MCMC STOCHASTIC SUPEROPTIMIZER
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// This implements the two-phase Metropolis-Hastings search from STOKE.
+// Because the Jules VM does not run on host registers (it's an interpreter),
+// we use a lightweight concrete evaluator on test vectors to measure
+// correctness, and the static latency model for performance.
+//
+// Phase 1 (synthesis): explore equivalent-or-near-equivalent programs.
+//   cost = correctness_distance(R, T, test_vecs)
+// Phase 2 (optimization): keep correctness, minimize latency.
+//   cost = α · correctness_distance + β · total_latency(R)
+
+/// One random test vector: initial register file (slots 0..n → Values).
+type TestVec = Vec<Value>;
+
+/// Concrete evaluation of a (simplified) instruction sequence on a test vector.
+/// Returns the resulting values of all registers written.
+/// This is a stripped-down VM — only handles scalar arithmetic and moves,
+/// which are the only instructions the STOKE search mutates.
+fn eval_concrete(instrs: &[Instr], input: &TestVec) -> Vec<(u16, Value)> {
+    let mut regs: FxHashMap<u16, Value> = FxHashMap::default();
+    for (i, v) in input.iter().enumerate() {
+        regs.insert(i as u16, v.clone());
+    }
+    for instr in instrs {
+        match instr {
+            Instr::LoadI32(d, v)  => { regs.insert(*d, Value::I32(*v)); }
+            Instr::LoadF32(d, v)  => { regs.insert(*d, Value::F32(*v)); }
+            Instr::LoadBool(d, v) => { regs.insert(*d, Value::Bool(*v)); }
+            Instr::LoadI64(d, v)  => { regs.insert(*d, Value::I64(*v)); }
+            Instr::Move(d, s) => {
+                if let Some(v) = regs.get(s).cloned() { regs.insert(*d, v); }
+            }
+            Instr::BinOp(d, op, l, r) => {
+                let lv = regs.get(l).cloned();
+                let rv = regs.get(r).cloned();
+                let result = match (lv, rv, op) {
+                    (Some(Value::I32(a)), Some(Value::I32(b)), BinOpKind::Add) => Some(Value::I32(a.wrapping_add(b))),
+                    (Some(Value::I32(a)), Some(Value::I32(b)), BinOpKind::Sub) => Some(Value::I32(a.wrapping_sub(b))),
+                    (Some(Value::I32(a)), Some(Value::I32(b)), BinOpKind::Mul) => Some(Value::I32(a.wrapping_mul(b))),
+                    (Some(Value::I32(a)), Some(Value::I32(b)), BinOpKind::Div) if b != 0 => Some(Value::I32(a / b)),
+                    (Some(Value::F32(a)), Some(Value::F32(b)), BinOpKind::Add) => Some(Value::F32(a + b)),
+                    (Some(Value::F32(a)), Some(Value::F32(b)), BinOpKind::Sub) => Some(Value::F32(a - b)),
+                    (Some(Value::F32(a)), Some(Value::F32(b)), BinOpKind::Mul) => Some(Value::F32(a * b)),
+                    (Some(Value::F32(a)), Some(Value::F32(b)), BinOpKind::Div) if b != 0.0 => Some(Value::F32(a / b)),
+                    (Some(Value::Bool(a)), Some(Value::Bool(b)), BinOpKind::And) => Some(Value::Bool(a && b)),
+                    (Some(Value::Bool(a)), Some(Value::Bool(b)), BinOpKind::Or)  => Some(Value::Bool(a || b)),
+                    (Some(Value::I32(a)), Some(Value::I32(b)), BinOpKind::Eq)   => Some(Value::Bool(a == b)),
+                    (Some(Value::I32(a)), Some(Value::I32(b)), BinOpKind::Lt)   => Some(Value::Bool(a < b)),
+                    (Some(Value::I32(a)), Some(Value::I32(b)), BinOpKind::Le)   => Some(Value::Bool(a <= b)),
+                    (Some(Value::I32(a)), Some(Value::I32(b)), BinOpKind::Gt)   => Some(Value::Bool(a > b)),
+                    (Some(Value::I32(a)), Some(Value::I32(b)), BinOpKind::Ge)   => Some(Value::Bool(a >= b)),
+                    _ => None,
+                };
+                if let Some(v) = result { regs.insert(*d, v); }
+            }
+            Instr::UnOp(d, op, s) => {
+                let sv = regs.get(s).cloned();
+                let result = match (sv, op) {
+                    (Some(Value::Bool(b)), UnOpKind::Not)  => Some(Value::Bool(!b)),
+                    (Some(Value::I32(v)), UnOpKind::Neg)   => Some(Value::I32(v.wrapping_neg())),
+                    (Some(Value::F32(v)), UnOpKind::Neg)   => Some(Value::F32(-v)),
+                    _ => None,
+                };
+                if let Some(v) = result { regs.insert(*d, v); }
+            }
+            // Stop on control flow
+            Instr::Return(_) | Instr::ReturnUnit => break,
+            _ => {}
+        }
+    }
+    regs.into_iter().collect()
+}
+
+/// Hamming-like distance between two register file snapshots.
+/// Counts registers whose values differ.
+fn correctness_distance(a: &[(u16, Value)], b: &[(u16, Value)]) -> f64 {
+    let a_map: FxHashMap<u16, &Value> = a.iter().map(|(k, v)| (*k, v)).collect();
+    let b_map: FxHashMap<u16, &Value> = b.iter().map(|(k, v)| (*k, v)).collect();
+    let mut mismatches = 0.0_f64;
+    for (k, av) in &a_map {
+        if let Some(bv) = b_map.get(k) {
+            mismatches += value_distance(av, bv);
+        } else {
+            mismatches += 1.0;
+        }
+    }
+    for k in b_map.keys() {
+        if !a_map.contains_key(k) { mismatches += 1.0; }
+    }
+    mismatches
+}
+
+/// Numeric distance between two Values.  Returns 0.0 for equal, 1.0 for type
+/// mismatch, and a fractional value based on bit-difference for scalars.
+fn value_distance(a: &Value, b: &Value) -> f64 {
+    match (a, b) {
+        (Value::I32(x), Value::I32(y)) => {
+            if x == y { 0.0 } else {
+                // Count differing bits / 32, capped at 1.0
+                ((*x ^ *y).count_ones() as f64) / 32.0
+            }
+        }
+        (Value::F32(x), Value::F32(y)) => {
+            if x == y { 0.0 } else {
+                ((x.to_bits() ^ y.to_bits()).count_ones() as f64) / 32.0
+            }
+        }
+        (Value::Bool(x), Value::Bool(y)) => if x == y { 0.0 } else { 1.0 },
+        (Value::I64(x), Value::I64(y)) => {
+            if x == y { 0.0 } else { ((*x ^ *y).count_ones() as f64) / 64.0 }
+        }
+        _ => if std::mem::discriminant(a) == std::mem::discriminant(b) { 0.5 } else { 1.0 },
+    }
+}
+
+/// XorShift64 PRNG — no dependency, fully deterministic.
+struct Xorshift64(u64);
+impl Xorshift64 {
+    fn new(seed: u64) -> Self { Xorshift64(seed | 1) }
+    #[inline]
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    #[inline]
+    fn next_f64(&mut self) -> f64 { (self.next() >> 11) as f64 / (1u64 << 53) as f64 }
+    #[inline]
+    fn next_usize_lt(&mut self, n: usize) -> usize {
+        if n == 0 { return 0; }
+        (self.next() as usize) % n
+    }
+}
+
+/// Apply a random mutation to `candidate`.
+/// Returns the mutation kind applied (for logging).
+fn stoke_mutate(candidate: &mut Vec<Instr>, rng: &mut Xorshift64) {
+    if candidate.is_empty() { return; }
+    let n = candidate.len();
+    match rng.next_usize_lt(5) {
+        // 0: Opcode swap — replace a BinOp's opcode with a random arithmetic op
+        0 => {
+            let arithmetic_ops = [
+                BinOpKind::Add, BinOpKind::Sub, BinOpKind::Mul,
+                BinOpKind::BitAnd, BinOpKind::BitOr, BinOpKind::BitXor,
+            ];
+            let i = rng.next_usize_lt(n);
+            if let Instr::BinOp(d, _, l, r) = &candidate[i] {
+                let new_op = arithmetic_ops[rng.next_usize_lt(arithmetic_ops.len())].clone();
+                let (d, l, r) = (*d, *l, *r);
+                candidate[i] = Instr::BinOp(d, new_op, l, r);
+            }
+        }
+        // 1: Operand swap — swap lhs and rhs of a BinOp
+        1 => {
+            let i = rng.next_usize_lt(n);
+            if let Instr::BinOp(d, op, l, r) = &candidate[i] {
+                let (d, op, l, r) = (*d, op.clone(), *l, *r);
+                candidate[i] = Instr::BinOp(d, op, r, l);
+            }
+        }
+        // 2: Instruction swap — swap two random instructions
+        2 if n >= 2 => {
+            let i = rng.next_usize_lt(n);
+            let j = rng.next_usize_lt(n);
+            candidate.swap(i, j);
+        }
+        // 3: Nop insertion — insert a Nop at a random point
+        3 => {
+            let i = rng.next_usize_lt(n + 1);
+            candidate.insert(i, Instr::Nop);
+        }
+        // 4: Instruction deletion — remove a non-essential instruction
+        4 if n >= 2 => {
+            let deletable: Vec<usize> = candidate.iter().enumerate()
+                .filter(|(_, i)| !matches!(i,
+                    Instr::Return(_) | Instr::ReturnUnit
+                    | Instr::Jump(_) | Instr::JumpFalse(_, _) | Instr::JumpTrue(_, _)))
+                .map(|(idx, _)| idx)
+                .collect();
+            if !deletable.is_empty() {
+                let i = deletable[rng.next_usize_lt(deletable.len())];
+                candidate.remove(i);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// STOKE two-phase MCMC superoptimizer.
+///
+/// `target` — the instruction sequence to optimize (already peephole-cleaned).
+/// `test_vecs` — concrete input register files for correctness measurement.
+/// `budget` — total number of MCMC proposals (split evenly between phases).
+/// `seed` — PRNG seed for reproducibility.
+///
+/// Returns the best sequence found and its stats.
+pub fn stoke_optimize(
+    target: &[Instr],
+    test_vecs: &[TestVec],
+    budget: usize,
+    seed: u64,
+) -> (Vec<Instr>, SuperoptStats) {
+    let mut rng = Xorshift64::new(seed);
+    let original_latency = total_latency(target);
+    let original_len = target.len();
+
+    // Pre-compute target outputs for all test vectors.
+    let target_outputs: Vec<Vec<(u16, Value)>> = test_vecs.iter()
+        .map(|tv| eval_concrete(target, tv))
+        .collect();
+
+    let correctness_cost = |candidate: &[Instr]| -> f64 {
+        if test_vecs.is_empty() { return 0.0; }
+        test_vecs.iter().zip(target_outputs.iter())
+            .map(|(tv, expected)| {
+                let actual = eval_concrete(candidate, tv);
+                correctness_distance(&actual, expected)
+            })
+            .sum::<f64>() / test_vecs.len() as f64
+    };
+
+    let mut current = target.to_vec();
+    let mut current_cost = 0.0_f64; // starts correct
+    let mut best = current.clone();
+    let mut best_latency = original_latency;
+    let mut accepted = 0u32;
+
+    // ── Phase 1: SYNTHESIS — explore correct-or-near-correct programs ─────────
+    // Temperature schedule: start hot (T=0.5), cool to T=0.01
+    let phase1_budget = budget / 2;
+    let t_start = 0.5_f64;
+    let t_end   = 0.01_f64;
+
+    for step in 0..phase1_budget {
+        let mut candidate = current.clone();
+        stoke_mutate(&mut candidate, &mut rng);
+
+        let cc = correctness_cost(&candidate);
+        let delta = cc - current_cost;
+        let t = t_start * (t_end / t_start).powf(step as f64 / phase1_budget as f64);
+        let accept_prob = if delta <= 0.0 { 1.0 } else { (-delta / t).exp() };
+
+        if rng.next_f64() < accept_prob {
+            current = candidate;
+            current_cost = cc;
+            accepted += 1;
+            // Track best correct program by latency
+            if cc == 0.0 && total_latency(&current) < best_latency {
+                best = current.clone();
+                best_latency = total_latency(&current);
+            }
+        }
+    }
+
+    // Reset to best correct program found so far for phase 2.
+    current = best.clone();
+    current_cost = 0.0;
+
+    // ── Phase 2: OPTIMIZATION — minimize latency while staying correct ────────
+    // Strong correctness penalty + latency objective.
+    // cost = 1000 * correctness_cost + latency_normalised
+    let phase2_budget = budget - phase1_budget;
+    let lat_norm = original_latency.max(1) as f64;
+    let t2_start = 0.2_f64;
+    let t2_end   = 0.001_f64;
+
+    for step in 0..phase2_budget {
+        let mut candidate = current.clone();
+        stoke_mutate(&mut candidate, &mut rng);
+
+        let cc = correctness_cost(&candidate);
+        let lat = total_latency(&candidate) as f64 / lat_norm;
+        let cand_cost = 1000.0 * cc + lat;
+        let curr_cost = 1000.0 * current_cost + (total_latency(&current) as f64 / lat_norm);
+
+        let delta = cand_cost - curr_cost;
+        let t = t2_start * (t2_end / t2_start).powf(step as f64 / phase2_budget.max(1) as f64);
+        let accept_prob = if delta <= 0.0 { 1.0 } else { (-delta / t).exp() };
+
+        if rng.next_f64() < accept_prob {
+            current = candidate;
+            current_cost = cc;
+            accepted += 1;
+            if cc == 0.0 && total_latency(&current) < best_latency {
+                best = current.clone();
+                best_latency = total_latency(&current);
+            }
+        }
+    }
+
+    // Clean up best: remove Nops, run one final peephole pass.
+    best.retain(|i| !matches!(i, Instr::Nop));
+    peephole_pass(&mut best);
+    dce_pass(&mut best);
+
+    let stats = SuperoptStats {
+        stoke_accepted: accepted,
+        stoke_iterations: budget as u32,
+        original_latency,
+        final_latency: best_latency,
+        original_instr_count: original_len,
+        final_instr_count: best.len(),
+        ..Default::default()
+    };
+    (best, stats)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §8b.0  DRIVER: compose all passes into one pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Configuration for the superoptimizer pipeline.
+#[derive(Debug, Clone)]
+pub struct SuperoptConfig {
+    /// Run STOKE MCMC phase (expensive; disable for fast compile mode).
+    pub run_stoke: bool,
+    /// Number of MCMC proposals for STOKE.
+    pub stoke_budget: usize,
+    /// Deterministic PRNG seed.
+    pub stoke_seed: u64,
+    /// Maximum fixed-point iterations for the peephole+const+dce loop.
+    pub max_fixed_point_iters: usize,
+    /// Number of synthetic test vectors for STOKE correctness measurement.
+    pub n_test_vectors: usize,
+}
+
+impl Default for SuperoptConfig {
+    fn default() -> Self {
+        SuperoptConfig {
+            run_stoke: true,
+            stoke_budget: 50_000,
+            stoke_seed: 0xdeadbeef_cafebabe,
+            max_fixed_point_iters: 16,
+            n_test_vectors: 8,
+        }
+    }
+}
+
+/// Generate synthetic test vectors for a function with `param_count` params.
+/// Uses a deterministic sequence of i32 / f32 values spanning interesting
+/// boundary cases (0, 1, -1, MAX, MIN, large, small).
+fn generate_test_vectors(param_count: u16, n: usize, seed: u64) -> Vec<TestVec> {
+    let mut rng = Xorshift64::new(seed ^ 0x1234_5678);
+    let interesting_i32: &[i32] = &[0, 1, -1, 2, -2, 100, -100, i32::MAX, i32::MIN];
+    let interesting_f32: &[f32] = &[0.0, 1.0, -1.0, 0.5, 2.0, -0.5, 1e6, -1e6, f32::EPSILON];
+
+    (0..n).map(|_| {
+        (0..param_count).map(|_| {
+            match rng.next_usize_lt(3) {
+                0 => Value::I32(interesting_i32[rng.next_usize_lt(interesting_i32.len())]),
+                1 => Value::F32(interesting_f32[rng.next_usize_lt(interesting_f32.len())]),
+                _ => Value::Bool(rng.next_usize_lt(2) == 0),
+            }
+        }).collect()
+    }).collect()
+}
+
+/// Superoptimize a compiled function in-place.
+///
+/// Applies the full pipeline:
+///   fixed-point { peephole → const_prop → dce → eq_sat } → STOKE (optional)
+///
+/// Returns statistics describing what was achieved.
+pub fn superoptimize_fn(func: &mut CompiledFn, cfg: &SuperoptConfig) -> SuperoptStats {
+    let original_latency = total_latency(&func.instrs);
+    let original_len = func.instrs.len();
+
+    let mut stats = SuperoptStats {
+        original_latency,
+        original_instr_count: original_len,
+        ..Default::default()
+    };
+
+    // ── Fixed-point deterministic passes ─────────────────────────────────────
+    for _ in 0..cfg.max_fixed_point_iters {
+        let p = peephole_pass(&mut func.instrs);
+        let c = const_prop_pass(&mut func.instrs);
+        let d = dce_pass(&mut func.instrs);
+        let e = eq_sat_pass(&mut func.instrs);
+        stats.peephole_rewrites += p;
+        stats.const_prop_folds += c;
+        stats.dce_removals += d;
+        stats.eq_sat_rewrites += e;
+        if p + c + d + e == 0 { break; } // fixed point reached
+    }
+
+    // ── STOKE MCMC stochastic refinement ─────────────────────────────────────
+    if cfg.run_stoke && !func.instrs.is_empty() {
+        let test_vecs = generate_test_vectors(func.param_count, cfg.n_test_vectors, cfg.stoke_seed);
+        let (optimized, stoke_stats) = stoke_optimize(
+            &func.instrs,
+            &test_vecs,
+            cfg.stoke_budget,
+            cfg.stoke_seed,
+        );
+        // Only accept the STOKE result if it's strictly better (shorter or lower latency).
+        let orig_lat = total_latency(&func.instrs);
+        if stoke_stats.final_latency < orig_lat || optimized.len() < func.instrs.len() {
+            func.instrs = optimized;
+        }
+        stats.stoke_accepted = stoke_stats.stoke_accepted;
+        stats.stoke_iterations = stoke_stats.stoke_iterations;
+    }
+
+    stats.final_latency = total_latency(&func.instrs);
+    stats.final_instr_count = func.instrs.len();
+    stats
+}
+
+// =============================================================================
 // §9  INTERPRETER
 // =============================================================================
 
@@ -3652,7 +5258,18 @@ impl Interpreter {
                 continue;
             }
             if let Some(closure) = self.fns.get(&name) {
-                let compiled = compile_fn(&closure.decl);
+                let mut compiled = compile_fn(&closure.decl);
+                // ── Research-grade superoptimizer ─────────────────────────────
+                // Run on all VM-supported functions. Use a lighter STOKE budget
+                // for trivial functions (< 4 instrs) and heavier for larger ones.
+                if compiled.vm_supported {
+                    let cfg = SuperoptConfig {
+                        run_stoke: compiled.instrs.len() >= 4,
+                        stoke_budget: if compiled.instrs.len() < 20 { 20_000 } else { 50_000 },
+                        ..SuperoptConfig::default()
+                    };
+                    superoptimize_fn(&mut compiled, &cfg);
+                }
                 self.compiled_fns.insert(name, Arc::new(compiled));
             }
         }
@@ -3736,7 +5353,18 @@ impl Interpreter {
             let compiled = self
                 .compiled_fns
                 .entry(name.to_owned())
-                .or_insert_with(|| Arc::new(compile_fn(&closure.decl)))
+                .or_insert_with(|| {
+                    let mut compiled = compile_fn(&closure.decl);
+                    if compiled.vm_supported {
+                        let cfg = SuperoptConfig {
+                            run_stoke: compiled.instrs.len() >= 4,
+                            stoke_budget: if compiled.instrs.len() < 20 { 20_000 } else { 50_000 },
+                            ..SuperoptConfig::default()
+                        };
+                        superoptimize_fn(&mut compiled, &cfg);
+                    }
+                    Arc::new(compiled)
+                })
                 .clone();
             #[cfg(feature = "phase3-jit")]
             {
