@@ -286,24 +286,32 @@ impl Emitter {
     //
     // For [rdi + disp32]: ModRM = mod10 | reg_field<<3 | 7
 
-    /// mov reg64, [rdi + disp32]
+    /// mov reg64, [rdi + disp]
+    /// Uses disp8 encoding when possible to reduce code size on hot load paths.
     fn load_reg_mem(&mut self, reg: u8, disp: i32) {
-        self.emit3(
-            0x48 | ((reg & 8) >> 1), // REX.W | REX.R
-            0x8B,
-            0x87 | ((reg & 7) << 3), // mod=10, reg, rm=7(rdi)
-        );
-        self.d(disp);
+        self.emit2(0x48 | ((reg & 8) >> 1), 0x8B); // REX.W | REX.R, MOV r64, r/m64
+        if let Ok(d8) = i8::try_from(disp) {
+            // mod=01, reg, rm=111(rdi)
+            self.b(0x47 | ((reg & 7) << 3));
+            self.b(d8 as u8);
+        } else {
+            // mod=10, reg, rm=111(rdi)
+            self.b(0x87 | ((reg & 7) << 3));
+            self.d(disp);
+        }
     }
 
-    /// mov [rdi + disp32], reg64
+    /// mov [rdi + disp], reg64
+    /// Uses disp8 encoding when possible to reduce code size on hot store paths.
     fn store_mem_reg(&mut self, disp: i32, reg: u8) {
-        self.emit3(
-            0x48 | ((reg & 8) >> 1),
-            0x89,
-            0x87 | ((reg & 7) << 3),
-        );
-        self.d(disp);
+        self.emit2(0x48 | ((reg & 8) >> 1), 0x89); // REX.W | REX.R, MOV r/m64, r64
+        if let Ok(d8) = i8::try_from(disp) {
+            self.b(0x47 | ((reg & 7) << 3)); // mod=01
+            self.b(d8 as u8);
+        } else {
+            self.b(0x87 | ((reg & 7) << 3)); // mod=10
+            self.d(disp);
+        }
     }
 
     /// mov dst64, src64  — no-op when dst == src.
@@ -629,7 +637,12 @@ fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterv
 
 // ── Linear-scan allocator ─────────────────────────────────────────────────────
 
-fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
+fn linear_scan(
+    intervals: &[LiveInterval],
+    slot_count: usize,
+    pinned: &[(u16, u8)],
+    hotness: &[u32],
+) -> RegAlloc {
     let cap = slot_count + 1;
     let mut slots: Vec<RegLoc> = (0..cap).map(|s| RegLoc::Spill((s as i32) * 8)).collect();
 
@@ -653,7 +666,21 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
         matches!(reg, 3 | 12..=15)
     }
 
+    // Reserve pinned hot slots first (typically r12-r15).
+    for &(slot, reg) in pinned {
+        ensure_slot(&mut slots, slot);
+        slots[slot as usize] = RegLoc::Reg(reg);
+        free.retain(|r| *r != reg);
+        if is_callee_saved(reg) && (callee_saved_mask & (1u16 << reg)) == 0 {
+            callee_saved_mask |= 1u16 << reg;
+            used_callee_saved.push(reg);
+        }
+    }
+
     for iv in intervals {
+        if matches!(slots.get(iv.slot as usize), Some(RegLoc::Reg(_))) {
+            continue;
+        }
         // Expire intervals that ended strictly before this one's start.
         let expired = active.partition_point(|(end, _, _)| *end < iv.first);
         for i in 0..expired {
@@ -679,14 +706,20 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
         } else {
             match active.last().copied() {
                 Some((end, spill_slot, reg)) if end > iv.last => {
-                    ensure_slot(&mut slots, spill_slot);
-                    slots[spill_slot as usize] = RegLoc::Spill((spill_slot as i32) * 8);
-                    active.pop();
-                    track_callee(reg);
-                    ensure_slot(&mut slots, iv.slot);
-                    slots[iv.slot as usize] = RegLoc::Reg(reg);
-                    let pos = active.partition_point(|(e, _, _)| *e <= iv.last);
-                    active.insert(pos, (iv.last, iv.slot, reg));
+                    let curr_hot = hotness.get(iv.slot as usize).copied().unwrap_or(0);
+                    let spill_hot = hotness.get(spill_slot as usize).copied().unwrap_or(0);
+                    if curr_hot >= spill_hot {
+                        ensure_slot(&mut slots, spill_slot);
+                        slots[spill_slot as usize] = RegLoc::Spill((spill_slot as i32) * 8);
+                        active.pop();
+                        track_callee(reg);
+                        ensure_slot(&mut slots, iv.slot);
+                        slots[iv.slot as usize] = RegLoc::Reg(reg);
+                        let pos = active.partition_point(|(e, _, _)| *e <= iv.last);
+                        active.insert(pos, (iv.last, iv.slot, reg));
+                    } else {
+                        ensure_slot(&mut slots, iv.slot);
+                    }
                 }
                 _ => {
                     ensure_slot(&mut slots, iv.slot);
@@ -700,6 +733,78 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
         slots,
         used_callee_saved,
     }
+}
+
+fn compute_loop_body_weight(instrs: &[Instr]) -> Vec<u32> {
+    let mut weight = vec![1u32; instrs.len()];
+    for (pc, instr) in instrs.iter().enumerate() {
+        let back_edge = match instr {
+            Instr::Jump(off) if *off < 0 => Some(((pc as i32) + 1 + *off) as usize),
+            Instr::JumpFalse(_, off) if *off < 0 => Some(((pc as i32) + 1 + *off) as usize),
+            Instr::JumpTrue(_, off) if *off < 0 => Some(((pc as i32) + 1 + *off) as usize),
+            _ => None,
+        };
+        if let Some(target) = back_edge {
+            if target <= pc && target < instrs.len() {
+                for w in &mut weight[target..=pc] {
+                    *w = w.saturating_add(3);
+                }
+            }
+        }
+    }
+    weight
+}
+
+fn compute_slot_hotness(instrs: &[Instr], slot_count: usize) -> Vec<u32> {
+    let mut heat = vec![0u32; slot_count + 1];
+    let loop_weight = compute_loop_body_weight(instrs);
+    let bump = |slot: u16, weight: u32, heat: &mut Vec<u32>| {
+        let idx = slot as usize;
+        if idx >= heat.len() {
+            heat.resize(idx + 1, 0);
+        }
+        heat[idx] = heat[idx].saturating_add(weight);
+    };
+
+    for (pc, instr) in instrs.iter().enumerate() {
+        let w = loop_weight.get(pc).copied().unwrap_or(1);
+        match instr {
+            Instr::LoadI32(d, _)
+            | Instr::LoadI64(d, _)
+            | Instr::LoadBool(d, _)
+            | Instr::LoadUnit(d) => bump(*d, 1 * w, &mut heat),
+            Instr::Move(d, s) | Instr::Load(d, s) => {
+                bump(*s, 3 * w, &mut heat);
+                bump(*d, 2 * w, &mut heat);
+            }
+            Instr::Store(slot, s) => {
+                bump(*s, 3 * w, &mut heat);
+                bump(*slot, 2 * w, &mut heat);
+            }
+            Instr::BinOp(d, _, l, r) => {
+                bump(*l, 4 * w, &mut heat);
+                bump(*r, 4 * w, &mut heat);
+                bump(*d, 3 * w, &mut heat);
+            }
+            Instr::JumpFalse(s, _) | Instr::JumpTrue(s, _) | Instr::Return(s) => {
+                bump(*s, 4 * w, &mut heat)
+            }
+            _ => {}
+        }
+    }
+
+    heat
+}
+
+fn rank_hot_slots(heat: &[u32]) -> Vec<(u16, u32)> {
+    let mut pairs: Vec<(u16, u32)> = heat
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(slot, score)| (score > 0).then_some((slot as u16, score)))
+        .collect();
+    pairs.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    pairs
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1126,7 +1231,16 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
     // ── Pass 1: liveness + linear-scan register allocation ───────────────
     let intervals = compute_live_intervals(instrs, slot_count);
-    let ra = linear_scan(&intervals, slot_count);
+    let hotness = compute_slot_hotness(instrs, slot_count);
+    let hot_slots = rank_hot_slots(&hotness);
+    const PIN_POOL: &[u8] = &[12, 13, 14, 15, 6];
+    let pinned: Vec<(u16, u8)> = hot_slots
+        .iter()
+        .take(PIN_POOL.len())
+        .zip(PIN_POOL.iter().copied())
+        .map(|((slot, _), reg)| (*slot, reg))
+        .collect();
+    let ra = linear_scan(&intervals, slot_count, &pinned, &hotness);
 
     // ── Emission ──────────────────────────────────────────────────────────
     let mut em = Emitter::new();
@@ -1138,9 +1252,16 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         em.push_reg(reg);
     }
 
-    // Pre-load every register-allocated slot from the slot array.
+    // Pre-load pinned hot slots first, then any remaining register-allocated slots.
     {
         let mut preloaded: u32 = 0u32; // bitmask for regs 0-31
+        for &(slot, reg) in &pinned {
+            let bit = 1u32 << reg;
+            if preloaded & bit == 0 {
+                preloaded |= bit;
+                em.load_reg_mem(reg, (slot as i32) * 8);
+            }
+        }
         for iv in &intervals {
             if let RegLoc::Reg(r) = ra.location(iv.slot) {
                 let bit = 1u32 << r;
@@ -1466,7 +1587,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 if let Some(c) = const_at.get(*s) {
                     const_at.insert(*d, c);
                 } else {
-                    const_at.remove(d);
+                    const_at.remove(*d);
                 }
             }
             Instr::Store(slot, s) => {
@@ -1477,7 +1598,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 if let Some(c) = const_at.get(*s) {
                     const_at.insert(*slot, c);
                 } else {
-                    const_at.remove(slot);
+                    const_at.remove(*slot);
                 }
             }
             Instr::BinOp(d, op, l, r) => {
@@ -1496,7 +1617,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     .and_then(|(lv, rv)| fold_binop(*op, lv, rv));
                 match folded {
                     Some(c) => const_at.insert(*d, c),
-                    None => const_at.remove(d),
+                    None => const_at.remove(*d),
                 }
             }
             Instr::Jump(off) => {

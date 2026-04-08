@@ -123,7 +123,7 @@ fn main() {
         }
         let ts = Instant::now();
         for _ in 0..steps {
-            let _ = world_superopt.integrate_vec3_superoptimizer("pos", "vel", dt, 64);
+            let _ = world_superopt.integrate_vec3_superoptimizer("pos", "vel", dt, 512);
         }
         let elapsed = ts.elapsed().as_secs_f64();
         superopt_elapsed_s = Some(elapsed);
@@ -145,10 +145,14 @@ fn main() {
             world_aot.insert_component(id, "damage", Value::F32(0.25));
         }
         let cache = AotStepCache::build(&world_aot);
+        println!("aot-hash kernel: {:?}", cache.kernel);
         let mut hotspot = StepHotspot::default();
+        let t_prepare = Instant::now();
+        let cache_valid = validate_aot_cache(&world_aot, &cache, &mut hotspot);
+        let prepare_elapsed = t_prepare.elapsed();
         let t1 = Instant::now();
         for _ in 0..steps {
-            run_step_aot_hash(&mut world_aot, dt, &cache, &mut hotspot);
+            run_step_aot_hash(&mut world_aot, dt, &cache, cache_valid, &mut hotspot);
         }
         let elapsed = t1.elapsed();
         aot_elapsed_s = Some(elapsed.as_secs_f64());
@@ -157,7 +161,12 @@ fn main() {
             "aot-hash elapsed: {:.3}s ({:.1} steps/s) cache_hash={:016x}",
             elapsed.as_secs_f64(),
             sps,
-            cache.layout_hash
+            cache.layout_fp
+        );
+        println!(
+            "aot-hash prepare: {:.6}s, iterate: {:.6}s",
+            prepare_elapsed.as_secs_f64(),
+            elapsed.as_secs_f64()
         );
         println!(
             "hotspot weights: query={:.1}% fetch={:.1}% math={:.1}% write={:.1}%",
@@ -227,9 +236,19 @@ fn main() {
 
 #[derive(Debug, Clone)]
 struct AotStepCache {
-    ids: Vec<u64>,
-    layout_hash: u64,
+    layout_fp: u64,
+    cache_key: u64,
+    kernel: AotKernel,
+    vec3_pairs: Vec<(usize, usize)>,
 }
+
+#[derive(Debug, Clone, Copy)]
+enum AotKernel {
+    Avx2Fma,
+    Superoptimizer,
+}
+
+const AOT_CACHE_SCHEMA_VERSION: u64 = 2;
 
 struct RustWorld {
     pos: Vec<[f32; 3]>,
@@ -251,11 +270,27 @@ impl RustWorld {
 
 impl AotStepCache {
     fn build(world: &EcsWorld) -> Self {
-        let ids = world.query2("pos", "vel");
-        let mut hasher = DefaultHasher::new();
-        ids.hash(&mut hasher);
-        let layout_hash = hasher.finish();
-        Self { ids, layout_hash }
+        let layout_fp = world.vec3_layout_fingerprint("pos", "vel").unwrap_or(0);
+        let mut key_hasher = DefaultHasher::new();
+        AOT_CACHE_SCHEMA_VERSION.hash(&mut key_hasher);
+        "pos".hash(&mut key_hasher);
+        "vel".hash(&mut key_hasher);
+        layout_fp.hash(&mut key_hasher);
+        let cache_key = key_hasher.finish();
+        #[allow(unused_mut)]
+        let mut kernel = AotKernel::Superoptimizer;
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+                kernel = AotKernel::Avx2Fma;
+            }
+        }
+        Self {
+            layout_fp,
+            cache_key,
+            kernel,
+            vec3_pairs: world.build_vec3_join_plan("pos", "vel"),
+        }
     }
 }
 
@@ -285,41 +320,52 @@ impl StepHotspot {
     }
 }
 
+fn validate_aot_cache(world: &EcsWorld, cache: &AotStepCache, hotspot: &mut StepHotspot) -> bool {
+    let t_query = Instant::now();
+    let live_fp = world.vec3_layout_fingerprint("pos", "vel").unwrap_or(0);
+    let mut key_hasher = DefaultHasher::new();
+    AOT_CACHE_SCHEMA_VERSION.hash(&mut key_hasher);
+    "pos".hash(&mut key_hasher);
+    "vel".hash(&mut key_hasher);
+    live_fp.hash(&mut key_hasher);
+    let live_key = key_hasher.finish();
+    hotspot.query_ns += t_query.elapsed().as_nanos();
+    live_fp == cache.layout_fp && live_key == cache.cache_key
+}
+
 fn run_step_aot_hash(
     world: &mut EcsWorld,
     dt: f32,
     cache: &AotStepCache,
+    cache_valid: bool,
     hotspot: &mut StepHotspot,
 ) {
-    let t_query = Instant::now();
-    let mut hasher = DefaultHasher::new();
-    cache.ids.hash(&mut hasher);
-    let live_hash = hasher.finish();
-    hotspot.query_ns += t_query.elapsed().as_nanos();
-    if live_hash != cache.layout_hash {
+    if !cache_valid {
         run_step(world, dt);
         return;
     }
-
-    for id in &cache.ids {
-        let t_fetch = Instant::now();
-        let pos_val = world.get_component(*id, "pos").unwrap().clone();
-        let vel_val = world.get_component(*id, "vel").unwrap().clone();
-        hotspot.fetch_ns += t_fetch.elapsed().as_nanos();
-
-        let t_math = Instant::now();
-        let new_pos = match (pos_val, vel_val) {
-            (Value::Vec3(p), Value::Vec3(v)) => {
-                Value::Vec3([p[0] + v[0] * dt, p[1] + v[1] * dt, p[2] + v[2] * dt])
-            }
-            _ => continue,
-        };
-        hotspot.math_ns += t_math.elapsed().as_nanos();
-
-        let t_write = Instant::now();
-        world.insert_component(*id, "pos", new_pos);
-        hotspot.write_ns += t_write.elapsed().as_nanos();
+    let t_exec = Instant::now();
+    match cache.kernel {
+        AotKernel::Avx2Fma => {
+            let _ = world.integrate_vec3_superoptimizer_precomputed(
+                "pos",
+                "vel",
+                dt,
+                512,
+                &cache.vec3_pairs,
+            );
+        }
+        AotKernel::Superoptimizer => {
+            let _ = world.integrate_vec3_superoptimizer_precomputed(
+                "pos",
+                "vel",
+                dt,
+                512,
+                &cache.vec3_pairs,
+            );
+        }
     }
+    hotspot.math_ns += t_exec.elapsed().as_nanos();
 }
 
 fn run_step_rust(world: &mut RustWorld, dt: f32) {
