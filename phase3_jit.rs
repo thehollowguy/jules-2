@@ -1,4 +1,4 @@
-//! Phase 3 real machine-code JIT backend (x86-64, System V).
+//!JIT backend
 //!
 //! Optimizations active:
 //!
