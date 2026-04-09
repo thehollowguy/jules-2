@@ -27,10 +27,39 @@
 // └────────────────────────────────────────────────────────────────────────────┘
 
 #[inline(always)]
-pub fn simd_available() -> bool { true }
+pub fn simd_available() -> bool {
+    true
+}
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::arch::x86_64::{__m128, __m256, __m512};
+use std::sync::OnceLock;
+
+type UpdateFn = fn(&mut [[f32; 3]], &[[f32; 3]], f32, usize);
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn pick_update_impl() -> UpdateFn {
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx2") {
+        return |p, v, dt, n| unsafe { update_avx512(p, v, dt, n) };
+    }
+    if is_x86_feature_detected!("fma") && is_x86_feature_detected!("avx2") {
+        return |p, v, dt, n| unsafe { update_avx2_fma(p, v, dt, n) };
+    }
+    if is_x86_feature_detected!("avx") {
+        return |p, v, dt, n| unsafe { update_avx(p, v, dt, n) };
+    }
+    if is_x86_feature_detected!("sse2") {
+        return |p, v, dt, n| unsafe { update_sse2(p, v, dt, n) };
+    }
+    scalar_tail
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline]
+fn pick_update_impl() -> UpdateFn {
+    scalar_tail
+}
 
 // ── Public dispatch ───────────────────────────────────────────────────────────
 //
@@ -38,36 +67,18 @@ use std::arch::x86_64::{__m128, __m256, __m512};
 #[inline(never)]
 pub fn update_positions(positions: &mut [[f32; 3]], velocities: &[[f32; 3]], dt: f32) {
     let n = positions.len().min(velocities.len());
-    if n == 0 { return; }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx2") {
-            return unsafe { update_avx512(positions, velocities, dt, n) };
-        }
-        if is_x86_feature_detected!("fma") && is_x86_feature_detected!("avx2") {
-            return unsafe { update_avx2_fma(positions, velocities, dt, n) };
-        }
-        if is_x86_feature_detected!("avx") {
-            return unsafe { update_avx(positions, velocities, dt, n) };
-        }
-        if is_x86_feature_detected!("sse2") {
-            return unsafe { update_sse2(positions, velocities, dt, n) };
-        }
+    if n == 0 {
+        return;
     }
-
-    scalar_tail(positions, velocities, dt, 0, n);
+    static UPDATE_DISPATCH: OnceLock<UpdateFn> = OnceLock::new();
+    let update = *UPDATE_DISPATCH.get_or_init(pick_update_impl);
+    update(positions, velocities, dt, n);
 }
 
 // ── AVX-512F  (16 particles / iter) ──────────────────────────────────────────
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx2")]
-unsafe fn update_avx512(
-    positions:  &mut [[f32; 3]],
-    velocities: &[[f32; 3]],
-    dt: f32,
-    n: usize,
-) {
+unsafe fn update_avx512(positions: &mut [[f32; 3]], velocities: &[[f32; 3]], dt: f32, n: usize) {
     use std::arch::x86_64::*;
     let dtv = _mm512_set1_ps(dt);
     let mut i = 0usize;
@@ -75,10 +86,16 @@ unsafe fn update_avx512(
     while i + 16 <= n {
         let off = i * 3;
         // Prefetch 3 cache lines ahead: 48 floats × 4 bytes = 192 bytes = 3 × 64 B.
-        _mm_prefetch(positions .as_ptr().cast::<i8>().add((off + 48) * 4), _MM_HINT_T0);
-        _mm_prefetch(velocities.as_ptr().cast::<i8>().add((off + 48) * 4), _MM_HINT_T0);
+        _mm_prefetch(
+            positions.as_ptr().cast::<i8>().add((off + 48) * 4),
+            _MM_HINT_T0,
+        );
+        _mm_prefetch(
+            velocities.as_ptr().cast::<i8>().add((off + 48) * 4),
+            _MM_HINT_T0,
+        );
 
-        let (px, py, pz) = load_aos16(positions .as_ptr().cast::<f32>().add(off));
+        let (px, py, pz) = load_aos16(positions.as_ptr().cast::<f32>().add(off));
         let (vx, vy, vz) = load_aos16(velocities.as_ptr().cast::<f32>().add(off));
 
         let ox = _mm512_fmadd_ps(vx, dtv, px);
@@ -97,30 +114,29 @@ unsafe fn update_avx512(
 // and keeps the prefetch buffer primed across 128 B of AoS data per block.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn update_avx2_fma(
-    positions:  &mut [[f32; 3]],
-    velocities: &[[f32; 3]],
-    dt: f32,
-    n: usize,
-) {
+unsafe fn update_avx2_fma(positions: &mut [[f32; 3]], velocities: &[[f32; 3]], dt: f32, n: usize) {
     use std::arch::x86_64::*;
     let dtv = _mm256_set1_ps(dt);
 
-    // Scalar prefix: bring the pointer to a 32-byte boundary so the
-    // 256-bit aligned inner loop can use aligned loads where possible.
-    let (p_pre, _, _) = positions.align_to::<__m256>();
-    let align_skip = (p_pre.len() / 3).min(n);
-    scalar_tail(positions, velocities, dt, 0, align_skip);
-    let mut i = align_skip;
+    // `[[f32; 3]]` has 4-byte element alignment, so align_to::<__m256>()
+    // rarely provides a useful aligned prefix in practice. Start at 0 and
+    // let the unaligned loads/stores handle all iterations.
+    let mut i = 0usize;
 
     // 4× unrolled main body: 4 × 8 = 32 particles per iteration.
     while i + 32 <= n {
         macro_rules! blk {
             ($k:expr) => {{
                 let off = (i + $k) * 3;
-                _mm_prefetch(positions .as_ptr().cast::<i8>().add((off + 48) * 4), _MM_HINT_T0);
-                _mm_prefetch(velocities.as_ptr().cast::<i8>().add((off + 48) * 4), _MM_HINT_T0);
-                let (px, py, pz) = load_aos8(positions .as_ptr().cast::<f32>().add(off));
+                _mm_prefetch(
+                    positions.as_ptr().cast::<i8>().add((off + 48) * 4),
+                    _MM_HINT_T0,
+                );
+                _mm_prefetch(
+                    velocities.as_ptr().cast::<i8>().add((off + 48) * 4),
+                    _MM_HINT_T0,
+                );
+                let (px, py, pz) = load_aos8(positions.as_ptr().cast::<f32>().add(off));
                 let (vx, vy, vz) = load_aos8(velocities.as_ptr().cast::<f32>().add(off));
                 let ox = _mm256_fmadd_ps(vx, dtv, px);
                 let oy = _mm256_fmadd_ps(vy, dtv, py);
@@ -128,14 +144,17 @@ unsafe fn update_avx2_fma(
                 store_aos8(positions.as_mut_ptr().cast::<f32>().add(off), ox, oy, oz);
             }};
         }
-        blk!(0); blk!(8); blk!(16); blk!(24);
+        blk!(0);
+        blk!(8);
+        blk!(16);
+        blk!(24);
         i += 32;
     }
 
     // Drain remaining complete 8-particle blocks.
     while i + 8 <= n {
         let off = i * 3;
-        let (px, py, pz) = load_aos8(positions .as_ptr().cast::<f32>().add(off));
+        let (px, py, pz) = load_aos8(positions.as_ptr().cast::<f32>().add(off));
         let (vx, vy, vz) = load_aos8(velocities.as_ptr().cast::<f32>().add(off));
         let ox = _mm256_fmadd_ps(vx, dtv, px);
         let oy = _mm256_fmadd_ps(vy, dtv, py);
@@ -152,12 +171,7 @@ unsafe fn update_avx2_fma(
 // out-of-order engine interleave loads and arithmetic freely.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
-unsafe fn update_avx(
-    positions:  &mut [[f32; 3]],
-    velocities: &[[f32; 3]],
-    dt: f32,
-    n: usize,
-) {
+unsafe fn update_avx(positions: &mut [[f32; 3]], velocities: &[[f32; 3]], dt: f32, n: usize) {
     use std::arch::x86_64::*;
     let dtv = _mm256_set1_ps(dt);
     let mut i = 0usize;
@@ -166,7 +180,7 @@ unsafe fn update_avx(
         macro_rules! blk {
             ($k:expr) => {{
                 let off = (i + $k) * 3;
-                let (px, py, pz) = load_aos8(positions .as_ptr().cast::<f32>().add(off));
+                let (px, py, pz) = load_aos8(positions.as_ptr().cast::<f32>().add(off));
                 let (vx, vy, vz) = load_aos8(velocities.as_ptr().cast::<f32>().add(off));
                 let ox = _mm256_add_ps(px, _mm256_mul_ps(vx, dtv));
                 let oy = _mm256_add_ps(py, _mm256_mul_ps(vy, dtv));
@@ -174,12 +188,13 @@ unsafe fn update_avx(
                 store_aos8(positions.as_mut_ptr().cast::<f32>().add(off), ox, oy, oz);
             }};
         }
-        blk!(0); blk!(8);
+        blk!(0);
+        blk!(8);
         i += 16;
     }
     if i + 8 <= n {
         let off = i * 3;
-        let (px, py, pz) = load_aos8(positions .as_ptr().cast::<f32>().add(off));
+        let (px, py, pz) = load_aos8(positions.as_ptr().cast::<f32>().add(off));
         let (vx, vy, vz) = load_aos8(velocities.as_ptr().cast::<f32>().add(off));
         let ox = _mm256_add_ps(px, _mm256_mul_ps(vx, dtv));
         let oy = _mm256_add_ps(py, _mm256_mul_ps(vy, dtv));
@@ -193,12 +208,7 @@ unsafe fn update_avx(
 // ── SSE2  (8 particles / iter, 2× unrolled) ──────────────────────────────────
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse2")]
-unsafe fn update_sse2(
-    positions:  &mut [[f32; 3]],
-    velocities: &[[f32; 3]],
-    dt: f32,
-    n: usize,
-) {
+unsafe fn update_sse2(positions: &mut [[f32; 3]], velocities: &[[f32; 3]], dt: f32, n: usize) {
     use std::arch::x86_64::*;
     let dtv = _mm_set1_ps(dt);
     let mut i = 0usize;
@@ -207,7 +217,7 @@ unsafe fn update_sse2(
         macro_rules! blk {
             ($k:expr) => {{
                 let off = (i + $k) * 3;
-                let (px, py, pz) = load_aos4(positions .as_ptr().cast::<f32>().add(off));
+                let (px, py, pz) = load_aos4(positions.as_ptr().cast::<f32>().add(off));
                 let (vx, vy, vz) = load_aos4(velocities.as_ptr().cast::<f32>().add(off));
                 let ox = _mm_add_ps(px, _mm_mul_ps(vx, dtv));
                 let oy = _mm_add_ps(py, _mm_mul_ps(vy, dtv));
@@ -215,12 +225,13 @@ unsafe fn update_sse2(
                 store_aos4(positions.as_mut_ptr().cast::<f32>().add(off), ox, oy, oz);
             }};
         }
-        blk!(0); blk!(4);
+        blk!(0);
+        blk!(4);
         i += 8;
     }
     if i + 4 <= n {
         let off = i * 3;
-        let (px, py, pz) = load_aos4(positions .as_ptr().cast::<f32>().add(off));
+        let (px, py, pz) = load_aos4(positions.as_ptr().cast::<f32>().add(off));
         let (vx, vy, vz) = load_aos4(velocities.as_ptr().cast::<f32>().add(off));
         let ox = _mm_add_ps(px, _mm_mul_ps(vx, dtv));
         let oy = _mm_add_ps(py, _mm_mul_ps(vy, dtv));
@@ -293,15 +304,15 @@ unsafe fn load_aos4(ptr: *const f32) -> (__m128, __m128, __m128) {
 
     let xa = _mm_shuffle_ps(t0, t1, 0xA0); // [x0 x0 x1 x1]
     let xb = _mm_shuffle_ps(t3, t2, 0xF0); // [x2 x2 x3 x3]
-    let x  = _mm_shuffle_ps(xa, xb, 0x88); // [x0 x1 x2 x3]
+    let x = _mm_shuffle_ps(xa, xb, 0x88); // [x0 x1 x2 x3]
 
     let ya = _mm_shuffle_ps(t0, t0, 0x5A); // [y0 y0 y1 y1]
     let yb = _mm_shuffle_ps(t3, t3, 0x5A); // [y2 y2 y3 y3]
-    let y  = _mm_shuffle_ps(ya, yb, 0x88); // [y0 y1 y2 y3]
+    let y = _mm_shuffle_ps(ya, yb, 0x88); // [y0 y1 y2 y3]
 
     let za = _mm_shuffle_ps(t1, t2, 0xA0); // [z0 z0 z1 z1]
     let zb = _mm_shuffle_ps(t2, t3, 0xF5); // [z2 z2 z3 z3]
-    let z  = _mm_shuffle_ps(za, zb, 0x88); // [z0 z1 z2 z3]
+    let z = _mm_shuffle_ps(za, zb, 0x88); // [z0 z1 z2 z3]
 
     (x, y, z)
 }
@@ -340,17 +351,17 @@ unsafe fn store_aos4(ptr: *mut f32, x: __m128, y: __m128, z: __m128) {
     let p_lo = _mm_unpacklo_ps(x, y); // [x0 y0 x1 y1]
     let p_hi = _mm_unpackhi_ps(x, y); // [x2 y2 x3 y3]
 
-    let q0   = _mm_shuffle_ps(z, x, 0x50);    // [z0 z0 x1 x1]
+    let q0 = _mm_shuffle_ps(z, x, 0x50); // [z0 z0 x1 x1]
     let out0 = _mm_shuffle_ps(p_lo, q0, 0x84); // [x0 y0 z0 x1]
 
-    let r1   = _mm_shuffle_ps(p_lo, z,  0x5F); // [y1 y1 z1 z1]
-    let out1 = _mm_shuffle_ps(r1,   p_hi, 0x48); // [y1 z1 x2 y2]
+    let r1 = _mm_shuffle_ps(p_lo, z, 0x5F); // [y1 y1 z1 z1]
+    let out1 = _mm_shuffle_ps(r1, p_hi, 0x48); // [y1 z1 x2 y2]
 
-    let q2   = _mm_shuffle_ps(z, x,  0xFA);  // [z2 z2 x3 x3]
-    let r2   = _mm_shuffle_ps(p_hi, z, 0xFF); // [y3 y3 z3 z3]
+    let q2 = _mm_shuffle_ps(z, x, 0xFA); // [z2 z2 x3 x3]
+    let r2 = _mm_shuffle_ps(p_hi, z, 0xFF); // [y3 y3 z3 z3]
     let out2 = _mm_shuffle_ps(q2, r2, 0x88); // [z2 x3 y3 z3]
 
-    _mm_storeu_ps(ptr,        out0);
+    _mm_storeu_ps(ptr, out0);
     _mm_storeu_ps(ptr.add(4), out1);
     _mm_storeu_ps(ptr.add(8), out2);
 }
@@ -438,7 +449,7 @@ unsafe fn store_aos16(ptr: *mut f32, x: __m512, y: __m512, z: __m512) {
 #[cold]
 #[inline(never)]
 fn scalar_tail(
-    positions:  &mut [[f32; 3]],
+    positions: &mut [[f32; 3]],
     velocities: &[[f32; 3]],
     dt: f32,
     start: usize,
@@ -459,40 +470,52 @@ mod tests {
     use super::*;
 
     // ── Smoke ─────────────────────────────────────────────────────────────────
-    #[test] fn module_active() { assert!(simd_available()); }
+    #[test]
+    fn module_active() {
+        assert!(simd_available());
+    }
 
-    #[test] fn basic() {
+    #[test]
+    fn basic() {
         let mut p = vec![[0.0f32; 3]; 4];
-        let v     = vec![[1.0f32, 0.5, -0.25]; 4];
+        let v = vec![[1.0f32, 0.5, -0.25]; 4];
         update_positions(&mut p, &v, 0.5);
         assert_eq!(p[0], [0.5, 0.25, -0.125]);
     }
 
-    #[test] fn exact_batch_4() {
+    #[test]
+    fn exact_batch_4() {
         let mut p = vec![[0.0f32; 3]; 4];
-        let v     = vec![[2.0f32, 4.0, -1.0]; 4];
+        let v = vec![[2.0f32, 4.0, -1.0]; 4];
         update_positions(&mut p, &v, 1.0);
-        for pp in &p { assert_eq!(*pp, [2.0, 4.0, -1.0]); }
+        for pp in &p {
+            assert_eq!(*pp, [2.0, 4.0, -1.0]);
+        }
     }
 
-    #[test] fn tail_handling() {
+    #[test]
+    fn tail_handling() {
         let mut p = vec![[0.0f32; 3]; 7];
-        let v     = vec![[1.0f32; 3]; 7];
+        let v = vec![[1.0f32; 3]; 7];
         update_positions(&mut p, &v, 2.0);
-        for pp in &p { assert_eq!(*pp, [2.0f32; 3]); }
+        for pp in &p {
+            assert_eq!(*pp, [2.0f32; 3]);
+        }
     }
 
-    #[test] fn mismatched_lengths() {
+    #[test]
+    fn mismatched_lengths() {
         let mut p = vec![[0.0f32; 3]; 6];
-        let v     = vec![[1.0f32; 3]; 4];
+        let v = vec![[1.0f32; 3]; 4];
         update_positions(&mut p, &v, 1.0);
         assert!(p[..4].iter().all(|x| *x == [1.0f32; 3]));
         assert!(p[4..].iter().all(|x| *x == [0.0f32; 3]));
     }
 
-    #[test] fn empty_slices() {
+    #[test]
+    fn empty_slices() {
         let mut p: Vec<[f32; 3]> = vec![];
-        let     v: Vec<[f32; 3]> = vec![];
+        let v: Vec<[f32; 3]> = vec![];
         update_positions(&mut p, &v, 1.0);
     }
 
@@ -500,40 +523,55 @@ mod tests {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn transpose_roundtrip_sse2() {
-        if !is_x86_feature_detected!("sse2") { return; }
+        if !is_x86_feature_detected!("sse2") {
+            return;
+        }
         let src: Vec<f32> = (0..12).map(|i| i as f32).collect();
         let mut dst = vec![0.0f32; 12];
         unsafe {
             let (x, y, z) = load_aos4(src.as_ptr());
             store_aos4(dst.as_mut_ptr(), x, y, z);
         }
-        assert_eq!(src, dst, "SSE2 4-particle round-trip\nsrc={src:?}\ndst={dst:?}");
+        assert_eq!(
+            src, dst,
+            "SSE2 4-particle round-trip\nsrc={src:?}\ndst={dst:?}"
+        );
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn transpose_roundtrip_avx2() {
-        if !is_x86_feature_detected!("avx2") { return; }
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
         let src: Vec<f32> = (0..24).map(|i| i as f32).collect();
         let mut dst = vec![0.0f32; 24];
         unsafe {
             let (x, y, z) = load_aos8(src.as_ptr());
             store_aos8(dst.as_mut_ptr(), x, y, z);
         }
-        assert_eq!(src, dst, "AVX2 8-particle round-trip\nsrc={src:?}\ndst={dst:?}");
+        assert_eq!(
+            src, dst,
+            "AVX2 8-particle round-trip\nsrc={src:?}\ndst={dst:?}"
+        );
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn transpose_roundtrip_avx512() {
-        if !is_x86_feature_detected!("avx512f") { return; }
+        if !is_x86_feature_detected!("avx512f") {
+            return;
+        }
         let src: Vec<f32> = (0..48).map(|i| i as f32).collect();
         let mut dst = vec![0.0f32; 48];
         unsafe {
             let (x, y, z) = load_aos16(src.as_ptr());
             store_aos16(dst.as_mut_ptr(), x, y, z);
         }
-        assert_eq!(src, dst, "AVX-512 16-particle round-trip\nsrc={src:?}\ndst={dst:?}");
+        assert_eq!(
+            src, dst,
+            "AVX-512 16-particle round-trip\nsrc={src:?}\ndst={dst:?}"
+        );
     }
 
     // ── SoA lane correctness ──────────────────────────────────────────────────
@@ -543,15 +581,17 @@ mod tests {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn soa_lanes_sse2() {
-        if !is_x86_feature_detected!("sse2") { return; }
+        if !is_x86_feature_detected!("sse2") {
+            return;
+        }
         let src: Vec<f32> = (0..12).map(|i| i as f32).collect();
         let (x, y, z) = unsafe { load_aos4(src.as_ptr()) };
         let xv: [f32; 4] = unsafe { std::mem::transmute(x) };
         let yv: [f32; 4] = unsafe { std::mem::transmute(y) };
         let zv: [f32; 4] = unsafe { std::mem::transmute(z) };
-        assert_eq!(xv, [0.0, 3.0,  6.0,  9.0],  "x lane: {xv:?}");
-        assert_eq!(yv, [1.0, 4.0,  7.0, 10.0],  "y lane: {yv:?}");
-        assert_eq!(zv, [2.0, 5.0,  8.0, 11.0],  "z lane: {zv:?}");
+        assert_eq!(xv, [0.0, 3.0, 6.0, 9.0], "x lane: {xv:?}");
+        assert_eq!(yv, [1.0, 4.0, 7.0, 10.0], "y lane: {yv:?}");
+        assert_eq!(zv, [2.0, 5.0, 8.0, 11.0], "z lane: {zv:?}");
     }
 
     // ── Full correctness sweep: SIMD vs scalar reference ──────────────────────
@@ -562,9 +602,8 @@ mod tests {
     fn correctness_sweep() {
         let dt = 0.016_f32;
         let sizes = [
-            0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17,
-            31, 32, 33, 63, 64, 65, 127, 128, 129,
-            255, 256, 257, 1000, 1023, 1024, 10_001,
+            0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256,
+            257, 1000, 1023, 1024, 10_001,
         ];
         for &n in &sizes {
             let p_init: Vec<[f32; 3]> = (0..n)
@@ -586,7 +625,8 @@ mod tests {
                     assert!(
                         diff < 1e-5,
                         "n={n} i={i} k={k}: simd={:.9} ref={:.9} diff={diff:.2e}",
-                        p_simd[i][k], p_ref[i][k],
+                        p_simd[i][k],
+                        p_ref[i][k],
                     );
                 }
             }
@@ -601,8 +641,8 @@ mod tests {
     #[test]
     fn fma_precision_bound() {
         let mut p = vec![[1.000_000_1_f32; 3]];
-        let v     = vec![[9_999_999.0_f32; 3]];
-        let dt    = 1e-7_f32;
+        let v = vec![[9_999_999.0_f32; 3]];
+        let dt = 1e-7_f32;
         update_positions(&mut p, &v, dt);
         for &val in p[0].iter() {
             // ~1.0000001 + 9999999 * 1e-7 ≈ 2.0
@@ -621,7 +661,7 @@ mod tests {
     fn no_alias_between_particles() {
         let n = 128;
         let mut p: Vec<[f32; 3]> = (0..n).map(|i| [i as f32; 3]).collect();
-        let v: Vec<[f32; 3]>     = vec![[1.0f32; 3]; n];
+        let v: Vec<[f32; 3]> = vec![[1.0f32; 3]; n];
         update_positions(&mut p, &v, 1.0);
         for (i, &pp) in p.iter().enumerate() {
             let expected = i as f32 + 1.0;

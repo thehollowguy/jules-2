@@ -2452,6 +2452,26 @@ impl ComponentAccessCollector {
         let entry = self.accesses.entry(field.to_string()).or_insert(mode);
         *entry = entry.merge(mode);
     }
+
+    /// Returns the first field accessed from the tracked entity variable, e.g.:
+    /// - `entity.pos` -> `Some("pos")`
+    /// - `entity.transform.pos` -> `Some("transform")`
+    fn entity_component_field<'a>(&self, mut expr: &'a Expr) -> Option<&'a str> {
+        loop {
+            match expr {
+                Expr::Field { object, field, .. } => {
+                    if matches!(
+                        object.as_ref(),
+                        Expr::Ident { name, .. } if name == &self.entity_var
+                    ) {
+                        return Some(field.as_str());
+                    }
+                    expr = object.as_ref();
+                }
+                _ => return None,
+            }
+        }
+    }
 }
 
 /// Convert a snake_case field name to a PascalCase component name:
@@ -2476,14 +2496,21 @@ impl Visitor for ComponentAccessCollector {
             Expr::Assign {
                 target, value, op, ..
             } => {
-                // Mark target side
-                self.in_assign_target = true;
-                self.visit_expr(target);
-                self.in_assign_target = false;
-                // For compound assignments (+=, -=, …) the target is also read
-                if op.is_compound() {
-                    self.in_assign_target = false;
+                if let Some(field) = self.entity_component_field(target) {
+                    self.record(field, AccessMode::Write);
+                    if op.is_compound() {
+                        self.record(field, AccessMode::Read);
+                    }
+                } else {
+                    // Mark target side
+                    self.in_assign_target = true;
                     self.visit_expr(target);
+                    self.in_assign_target = false;
+                    // For compound assignments (+=, -=, …) the target is also read
+                    if op.is_compound() {
+                        self.in_assign_target = false;
+                        self.visit_expr(target);
+                    }
                 }
                 self.visit_expr(value);
             }
@@ -2801,6 +2828,51 @@ mod tests {
         col.visit_block(&body);
         let accesses = col.finish();
         assert_eq!(accesses[0].mode, AccessMode::Write);
+    }
+
+    /// Compound assignment through nested fields should still mark the root
+    /// entity component as ReadWrite exactly once.
+    #[test]
+    fn test_component_access_nested_compound_target() {
+        let target = Expr::Field {
+            span: dummy(),
+            object: Box::new(Expr::Field {
+                span: dummy(),
+                object: Box::new(Expr::Ident {
+                    span: dummy(),
+                    name: "entity".into(),
+                }),
+                field: "transform".into(),
+            }),
+            field: "position".into(),
+        };
+        let rhs = Expr::FloatLit {
+            span: dummy(),
+            value: 1.0,
+        };
+        let assign = Expr::Assign {
+            span: dummy(),
+            op: AssignOpKind::AddAssign,
+            target: Box::new(target),
+            value: Box::new(rhs),
+        };
+        let body = Block {
+            span: dummy(),
+            stmts: vec![Stmt::Expr {
+                span: dummy(),
+                expr: assign,
+                has_semi: true,
+            }],
+            tail: None,
+        };
+
+        let mut col = ComponentAccessCollector::new("entity");
+        col.visit_block(&body);
+        let accesses = col.finish();
+
+        assert_eq!(accesses.len(), 1);
+        assert_eq!(accesses[0].field_alias, "transform");
+        assert_eq!(accesses[0].mode, AccessMode::ReadWrite);
     }
 
     // ── SystemDecl helpers ────────────────────────────────────────────────
