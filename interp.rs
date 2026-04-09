@@ -1940,7 +1940,12 @@ impl Env {
     #[inline]
     pub fn pop(&mut self) {
         if let Some(log) = self.frames.pop() {
+            let old_len = self.values.len();
+            let mut min_popped_slot = old_len as u32;
             for (name, old_slot) in log {
+                if let Some(&current_slot) = self.name_to_slot.get(&name) {
+                    min_popped_slot = min_popped_slot.min(current_slot);
+                }
                 match old_slot {
                     Some(slot) => {
                         self.name_to_slot.insert(name, slot);
@@ -1953,6 +1958,9 @@ impl Env {
             // Truncate the slab to remove dangling slots.
             // Safe: after restoring old mappings, high slots are unreachable.
             // We keep the slab capacity for reuse.
+            if min_popped_slot < old_len as u32 {
+                self.values.truncate(min_popped_slot as usize);
+            }
         }
     }
 
@@ -2161,7 +2169,8 @@ impl Compiler {
             const_pool: Vec::new(),
             scopes: vec![FxHashMap::default()],
             next_slot: param_count,
-            next_tmp: 512, // temporaries live above the 512 slot mark
+            // Temporaries live immediately above slots to keep register files compact.
+            next_tmp: param_count,
             captures: FxHashMap::default(),
         }
     }
@@ -2243,9 +2252,13 @@ impl Compiler {
 
     /// Compile a block, returning the register holding the tail value.
     fn compile_block(&mut self, block: &Block, dst: u16) {
+        let block_tmp_base = self.next_slot;
+        self.next_tmp = self.next_tmp.max(block_tmp_base);
         self.push_scope();
         for stmt in &block.stmts {
             self.compile_stmt(stmt);
+            // Statement temporaries are not live across statement boundaries.
+            self.next_tmp = self.next_tmp.min(self.next_slot).max(block_tmp_base);
             // If stmt itself ends in Return/Break/Continue we can stop.
         }
         if let Some(tail) = &block.tail {
@@ -2254,6 +2267,7 @@ impl Compiler {
             self.emit(Instr::LoadUnit(dst));
         }
         self.pop_scope();
+        self.next_tmp = self.next_tmp.min(self.next_slot).max(block_tmp_base);
     }
 
     /// Compile a statement.
@@ -2717,6 +2731,7 @@ pub fn compile_fn(decl: &FnDecl) -> CompiledFn {
     }
     let result_dst = c.next_slot;
     c.next_slot += 1;
+    c.next_tmp = c.next_slot;
     if let Some(body) = &decl.body {
         c.compile_block(body, result_dst);
     }
@@ -2758,41 +2773,43 @@ pub fn vm_exec(
 
     macro_rules! reg {
         ($r:expr) => {
-            // SAFETY: register operands are emitted by the compiler and always
-            // in-range for `slot_count`; `regs` is over-allocated by +32 as guard.
-            unsafe { regs.get_unchecked($r as usize) }
+            regs.get($r as usize)
+                .expect("vm_exec: register index out of bounds")
         };
     }
     macro_rules! reg_mut {
         ($r:expr) => {
-            // SAFETY: same argument as `reg!`.
-            unsafe { regs.get_unchecked_mut($r as usize) }
+            regs.get_mut($r as usize)
+                .expect("vm_exec: register index out of bounds")
         };
     }
     macro_rules! slot {
         ($s:expr) => {
-            // SAFETY: bytecode slots are compiler-produced and bounded by function slots.
-            unsafe { regs.get_unchecked($s as usize) }
+            regs.get($s as usize)
+                .expect("vm_exec: slot index out of bounds")
         };
     }
     macro_rules! slot_mut {
         ($s:expr) => {
-            // SAFETY: bytecode slots are compiler-produced and bounded by function slots.
-            unsafe { regs.get_unchecked_mut($s as usize) }
+            regs.get_mut($s as usize)
+                .expect("vm_exec: slot index out of bounds")
         };
     }
     macro_rules! str_c {
         ($i:expr) => {
-            // SAFETY: string indices are interned at compile time.
-            unsafe { str_pool.get_unchecked($i as usize).as_str() }
+            str_pool
+                .get($i as usize)
+                .expect("vm_exec: string index out of bounds")
+                .as_str()
         };
     }
     loop {
         if pc >= instrs.len() {
             return Ok(Value::Unit);
         }
-        // SAFETY: pc is always checked before dereferencing.
-        let instr = unsafe { instrs.get_unchecked(pc) };
+        let instr = instrs
+            .get(pc)
+            .expect("vm_exec: instruction pointer out of bounds");
         pc += 1;
 
         match instr {
@@ -2805,7 +2822,10 @@ pub fn vm_exec(
             Instr::LoadF64(d, v) => *reg_mut!(*d) = Value::F64(*v),
             Instr::LoadStr(d, si) => *reg_mut!(*d) = Value::Str(str_c!(*si).to_owned()),
             Instr::LoadConst(d, ci) => {
-                *reg_mut!(*d) = unsafe { const_pool.get_unchecked(*ci as usize) }.clone()
+                *reg_mut!(*d) = const_pool
+                    .get(*ci as usize)
+                    .expect("vm_exec: const index out of bounds")
+                    .clone()
             }
             Instr::LoadFn(d, si) => {
                 let name = str_c!(*si);
@@ -3302,8 +3322,14 @@ pub struct Interpreter {
     runtime_profile: FxHashMap<String, (u64, u128)>, // fn -> (calls, total_nanos)
     /// Global VM/JIT switch. When disabled, execution falls back to tree-walking.
     jit_enabled: bool,
+    /// Native machine-code JIT switch (phase3). Off by default for safety.
+    native_jit_enabled: bool,
     /// If enabled, compile all top-level functions at load time to remove first-call latency.
     advance_jit_enabled: bool,
+    /// Runtime path counters used by benchmarking/telemetry.
+    jit_native_calls: u64,
+    jit_vm_calls: u64,
+    jit_fallback_calls: u64,
 }
 
 impl Interpreter {
@@ -3338,8 +3364,30 @@ impl Interpreter {
             runtime_profile_enabled: false,
             runtime_profile: FxHashMap::default(),
             jit_enabled: true,
+            native_jit_enabled: std::env::var("JULES_ENABLE_NATIVE_JIT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             advance_jit_enabled: true,
+            jit_native_calls: 0,
+            jit_vm_calls: 0,
+            jit_fallback_calls: 0,
         }
+    }
+
+    /// Reset runtime execution-path counters used by benchmarks.
+    pub fn reset_jit_counters(&mut self) {
+        self.jit_native_calls = 0;
+        self.jit_vm_calls = 0;
+        self.jit_fallback_calls = 0;
+    }
+
+    /// Return `(native_jit, vm_jit, treewalk_fallback)` call counts.
+    pub fn jit_counters(&self) -> (u64, u64, u64) {
+        (
+            self.jit_native_calls,
+            self.jit_vm_calls,
+            self.jit_fallback_calls,
+        )
     }
 
     fn record_runtime_profile(&mut self, name: &str, elapsed: Duration) {
@@ -3367,6 +3415,15 @@ impl Interpreter {
                 self.pgo_started_at = Instant::now();
                 self.pgo_call_counts.clear();
             }
+        }
+    }
+
+    /// Enable/disable native machine-code JIT execution.
+    pub fn set_native_jit_enabled(&mut self, enabled: bool) {
+        self.native_jit_enabled = enabled;
+        #[cfg(feature = "phase3-jit")]
+        if !enabled {
+            self.native_fns.clear();
         }
     }
 
@@ -3501,9 +3558,10 @@ impl Interpreter {
             // If the arg count matches expectation, run the VM.
             if closure.capture.is_empty() && args.len() == closure.decl.params.len() {
                 #[cfg(feature = "phase3-jit")]
-                {
+                if self.native_jit_enabled {
                     if let Some(native) = self.native_fns.get(name).cloned() {
                         if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
+                            self.jit_native_calls = self.jit_native_calls.saturating_add(1);
                             self.record_runtime_profile(name, started.elapsed());
                             return Ok(v);
                         }
@@ -3511,11 +3569,13 @@ impl Interpreter {
                         let native = Arc::new(native);
                         self.native_fns.insert(name.to_owned(), native.clone());
                         if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
+                            self.jit_native_calls = self.jit_native_calls.saturating_add(1);
                             self.record_runtime_profile(name, started.elapsed());
                             return Ok(v);
                         }
                     }
                 }
+                self.jit_vm_calls = self.jit_vm_calls.saturating_add(1);
                 let result = vm_exec(self, &compiled, args).map(|r| match r {
                     Value::Return(v) => *v,
                     other => other,
@@ -3526,6 +3586,7 @@ impl Interpreter {
         }
 
         // ── Fallback: tree-walker (captures, mismatched args, etc.) ──────────
+        self.jit_fallback_calls = self.jit_fallback_calls.saturating_add(1);
         let mut env = Env::new();
         env.push();
         // Inject captured environment for closures.

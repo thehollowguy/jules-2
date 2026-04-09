@@ -298,11 +298,7 @@ impl Emitter {
 
     /// mov [rdi + disp32], reg64
     fn store_mem_reg(&mut self, disp: i32, reg: u8) {
-        self.emit3(
-            0x48 | ((reg & 8) >> 1),
-            0x89,
-            0x87 | ((reg & 7) << 3),
-        );
+        self.emit3(0x48 | ((reg & 8) >> 1), 0x89, 0x87 | ((reg & 7) << 3));
         self.d(disp);
     }
 
@@ -811,9 +807,7 @@ fn store_rax(em: &mut Emitter, slot: u16, ra: &RegAlloc) {
 #[inline(always)]
 fn instr_reads_slot(instr: &Instr, slot: u16) -> bool {
     match instr {
-        Instr::Move(_, s) | Instr::Load(_, s) | Instr::Store(_, s) | Instr::Return(s) => {
-            *s == slot
-        }
+        Instr::Move(_, s) | Instr::Load(_, s) | Instr::Store(_, s) | Instr::Return(s) => *s == slot,
         Instr::BinOp(_, _, l, r) => *l == slot || *r == slot,
         Instr::JumpFalse(s, _) | Instr::JumpTrue(s, _) => *s == slot,
         _ => false,
@@ -1048,11 +1042,7 @@ struct Fixup {
 
 /// Patch all branch displacements.  Returns None if any target is unreachable
 /// or any displacement overflows i32.
-fn patch_fixups(
-    buf: &mut Vec<u8>,
-    fixups: &[Fixup],
-    pc_to_off: &[usize],
-) -> Option<()> {
+fn patch_fixups(buf: &mut Vec<u8>, fixups: &[Fixup], pc_to_off: &[usize]) -> Option<()> {
     for fx in fixups {
         let target_off = *pc_to_off.get(fx.target_pc)? as isize;
         let next_ip = (fx.disp_pos + 4) as isize;
@@ -1063,7 +1053,7 @@ fn patch_fixups(
             // The rel32 form sits at disp_pos-1 (or disp_pos-2 for 0F 8x).
             // Overwrite with rel8 opcode + 1-byte disp + NOPs for remainder.
             let opcode_start = match fx.kind {
-                BranchKind::Jmp => fx.disp_pos - 1, // E9 [d32]
+                BranchKind::Jmp => fx.disp_pos - 1,                  // E9 [d32]
                 BranchKind::Jz | BranchKind::Jnz => fx.disp_pos - 2, // 0F 84/85 [d32]
             };
             let short_op: u8 = match fx.kind {
@@ -1138,15 +1128,16 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         em.push_reg(reg);
     }
 
-    // Pre-load every register-allocated slot from the slot array.
+    // Pre-load register-assigned *parameter* slots from the slot array.
+    // Non-parameter slots may be uninitialized at entry and must not be read.
     {
         let mut preloaded: u32 = 0u32; // bitmask for regs 0-31
-        for iv in &intervals {
-            if let RegLoc::Reg(r) = ra.location(iv.slot) {
+        for slot in 0..compiled.param_count {
+            if let RegLoc::Reg(r) = ra.location(slot) {
                 let bit = 1u32 << r;
                 if preloaded & bit == 0 {
                     preloaded |= bit;
-                    let off = (iv.slot as i32) * 8;
+                    let off = (slot as i32) * 8;
                     em.load_reg_mem(r, off);
                 }
             }
@@ -1257,7 +1248,11 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                         }
                         if c == 0 {
                             let p = em.jmp_rel32_placeholder();
-                            fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jmp });
+                            fixups.push(Fixup {
+                                disp_pos: p,
+                                target_pc: target,
+                                kind: BranchKind::Jmp,
+                            });
                         }
                         folded = true;
                     }
@@ -1268,7 +1263,11 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                         }
                         if c != 0 {
                             let p = em.jmp_rel32_placeholder();
-                            fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jmp });
+                            fixups.push(Fixup {
+                                disp_pos: p,
+                                target_pc: target,
+                                kind: BranchKind::Jmp,
+                            });
                         }
                         folded = true;
                     }
@@ -1355,7 +1354,11 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     emit_binop_rax_rcx(&mut em, *op);
                     em.test_rax_rax();
                     let p = em.jz_rel32_placeholder();
-                    fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jz });
+                    fixups.push(Fixup {
+                        disp_pos: p,
+                        target_pc: target,
+                        kind: BranchKind::Jz,
+                    });
                     pc_to_off[pc + 1] = em.pos();
                     pc += 2;
                     continue;
@@ -1378,7 +1381,11 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     emit_binop_rax_rcx(&mut em, *op);
                     em.test_rax_rax();
                     let p = em.jnz_rel32_placeholder();
-                    fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jnz });
+                    fixups.push(Fixup {
+                        disp_pos: p,
+                        target_pc: target,
+                        kind: BranchKind::Jnz,
+                    });
                     pc_to_off[pc + 1] = em.pos();
                     pc += 2;
                     continue;
@@ -1388,8 +1395,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
         // ── Fusion: BinOp(t, op, l, r) + Return(t) ──────────────────────
         if pc + 1 < instrs.len() {
-            if let (Instr::BinOp(t, op, l, r), Instr::Return(ret)) =
-                (&instrs[pc], &instrs[pc + 1])
+            if let (Instr::BinOp(t, op, l, r), Instr::Return(ret)) = (&instrs[pc], &instrs[pc + 1])
             {
                 if t == ret && is_supported_binop(*op) {
                     load_rax(&mut em, *l, &ra);
@@ -1466,7 +1472,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 if let Some(c) = const_at.get(*s) {
                     const_at.insert(*d, c);
                 } else {
-                    const_at.remove(d);
+                    const_at.remove(*d);
                 }
             }
             Instr::Store(slot, s) => {
@@ -1477,7 +1483,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 if let Some(c) = const_at.get(*s) {
                     const_at.insert(*slot, c);
                 } else {
-                    const_at.remove(slot);
+                    const_at.remove(*slot);
                 }
             }
             Instr::BinOp(d, op, l, r) => {
@@ -1496,7 +1502,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     .and_then(|(lv, rv)| fold_binop(*op, lv, rv));
                 match folded {
                     Some(c) => const_at.insert(*d, c),
-                    None => const_at.remove(d),
+                    None => const_at.remove(*d),
                 }
             }
             Instr::Jump(off) => {
@@ -1505,7 +1511,11 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     return None;
                 }
                 let p = em.jmp_rel32_placeholder();
-                fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jmp });
+                fixups.push(Fixup {
+                    disp_pos: p,
+                    target_pc: target,
+                    kind: BranchKind::Jmp,
+                });
                 const_at.clear();
             }
             Instr::JumpFalse(cond, off) => {
@@ -1516,7 +1526,11 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 load_rax(&mut em, *cond, &ra);
                 em.test_rax_rax();
                 let p = em.jz_rel32_placeholder();
-                fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jz });
+                fixups.push(Fixup {
+                    disp_pos: p,
+                    target_pc: target,
+                    kind: BranchKind::Jz,
+                });
                 const_at.clear();
             }
             Instr::JumpTrue(cond, off) => {
@@ -1527,7 +1541,11 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 load_rax(&mut em, *cond, &ra);
                 em.test_rax_rax();
                 let p = em.jnz_rel32_placeholder();
-                fixups.push(Fixup { disp_pos: p, target_pc: target, kind: BranchKind::Jnz });
+                fixups.push(Fixup {
+                    disp_pos: p,
+                    target_pc: target,
+                    kind: BranchKind::Jnz,
+                });
                 const_at.clear();
             }
             Instr::Return(r) => {
