@@ -1,1 +1,0 @@
-std::sync::MutexGuard<'_, Vec<Box<(dyn for<'a> Fn(&'a PathBuf) + Send + Sync + 'static)>>>
