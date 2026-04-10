@@ -49,9 +49,9 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    AccessMode, AgentDecl, BinOpKind, Block, ComponentAccess, ComponentDecl, DimExpr, ElemType,
-    EnumDecl, Expr, FnDecl, GenericParam, Item, ModelDecl, ModelLayer, Param, Pattern, Program,
-    StructDecl, StructField, SystemDecl, TrainDecl, Type, UnOpKind, VecFamily, VecSize,
+    AgentDecl, BinOpKind, Block, ComponentDecl, DimExpr, ElemType, Expr, FnDecl, GenericParam,
+    Item, ModelDecl, ModelLayer, Pattern, Program, StructDecl, SystemDecl, TrainDecl, Type,
+    UnOpKind, VecFamily, VecSize,
 };
 use crate::lexer::Span;
 
@@ -3250,10 +3250,8 @@ impl TypeCk {
                                 );
                             }
                         } else {
-                            self.diag.error(
-                                value.span(),
-                                format!("@{} gamma must be numeric", dec),
-                            );
+                            self.diag
+                                .error(value.span(), format!("@{} gamma must be numeric", dec));
                         }
                     }
                     "lambda" => {
@@ -3265,10 +3263,8 @@ impl TypeCk {
                                 );
                             }
                         } else {
-                            self.diag.error(
-                                value.span(),
-                                format!("@{} lambda must be numeric", dec),
-                            );
+                            self.diag
+                                .error(value.span(), format!("@{} lambda must be numeric", dec));
                         }
                     }
                     "input" | "output" => {
@@ -3290,7 +3286,10 @@ impl TypeCk {
         }
 
         if dec == "PPO" && !has_learning_rate {
-            self.diag.error(a.span, "@PPO requires `learning_rate` (or `lr`)".to_string());
+            self.diag.error(
+                a.span,
+                "@PPO requires `learning_rate` (or `lr`)".to_string(),
+            );
         }
 
         let _ = a;

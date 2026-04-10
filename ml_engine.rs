@@ -643,7 +643,6 @@ impl Tensor {
         );
 
         let m = self.shape[0];
-        let k = self.shape[1];
         let n = other.shape[1];
 
         let a = memory.allocate_from_data(self.shape.clone(), self.data.clone())?;
@@ -846,17 +845,30 @@ fn matmul_blocked_rows(
                 while i + MR <= m_end {
                     let mut j = nb;
                     while j + NR <= n_end {
-                        microkernel_8x4(a_data, bt_data, out_chunk, out_row_base, k, n, i, j, kb, k_end);
+                        microkernel_8x4(
+                            a_data,
+                            bt_data,
+                            out_chunk,
+                            out_row_base,
+                            k,
+                            n,
+                            i,
+                            j,
+                            kb,
+                            k_end,
+                        );
                         j += NR;
                     }
                     if j < n_end {
                         for ii in i..i + MR {
                             let out_row_local = ii - out_row_base;
-                            let out_row = &mut out_chunk[out_row_local * n..(out_row_local + 1) * n];
+                            let out_row =
+                                &mut out_chunk[out_row_local * n..(out_row_local + 1) * n];
                             let a_row = &a_data[ii * k..(ii + 1) * k];
                             for col in j..n_end {
                                 let b_row = &bt_data[col * k..(col + 1) * k];
-                                out_row[col] += dot_unrolled_8(&a_row[kb..k_end], &b_row[kb..k_end]);
+                                out_row[col] +=
+                                    dot_unrolled_8(&a_row[kb..k_end], &b_row[kb..k_end]);
                             }
                         }
                     }
@@ -928,7 +940,7 @@ fn microkernel_8x4(
     while p + 4 <= k_end {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         unsafe {
-            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
             let a_pref = (i + 7) * k + p + 16;
             if a_pref < a_data.len() {
                 _mm_prefetch(a_data.as_ptr().add(a_pref).cast::<i8>(), _MM_HINT_T0);
@@ -1642,7 +1654,7 @@ impl LossFunctions {
             .iter()
             .zip(&targets.data)
             .enumerate()
-            .map(|(i, (logit, target))| {
+            .map(|(i, (_logit, target))| {
                 let prob = exp_logits[i] / sum_exp;
                 -target * (prob.max(1e-8).ln())
             })

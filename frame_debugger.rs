@@ -2,9 +2,7 @@
 // Minimal, non-invasive API intended for future expansion into a full
 // frame debugger with history, inspection, and rewind.
 
-use std::sync::{Arc, Mutex};
-
-use crate::interp::{ComponentMap, EcsWorld, EntityId, Value, WorldSnapshot};
+use crate::interp::{ComponentMap, EcsWorld, EntityId, WorldSnapshot};
 
 /// Simple frame debugger storing a bounded history of world snapshots.
 pub struct Debugger {
@@ -15,7 +13,11 @@ pub struct Debugger {
 
 impl Debugger {
     pub fn new(max_history: usize) -> Self {
-        Debugger { history: Vec::new(), max_history, paused: false }
+        Debugger {
+            history: Vec::new(),
+            max_history,
+            paused: false,
+        }
     }
 
     /// Capture the current world state into the debugger history.
@@ -60,9 +62,15 @@ impl Debugger {
         Ok(())
     }
 
-    pub fn pause(&mut self) { self.paused = true; }
-    pub fn resume(&mut self) { self.paused = false; }
-    pub fn is_paused(&self) -> bool { self.paused }
+    pub fn pause(&mut self) {
+        self.paused = true;
+    }
+    pub fn resume(&mut self) {
+        self.paused = false;
+    }
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
 }
 
 #[cfg(test)]

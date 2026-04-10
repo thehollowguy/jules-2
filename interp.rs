@@ -48,7 +48,7 @@
 )]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -57,10 +57,9 @@ use std::time::{Duration, Instant};
 use rustc_hash::FxHashMap;
 
 use crate::ast::{
-    Activation, AgentDecl, AssignOpKind, Attribute, BinOpKind, Block, ElemType, EntityQuery, Expr,
-    FnDecl, Item, LearningKind, MatchArm, ModelDecl, ModelLayer, NormKind, OptimizerKind, Padding,
-    ParallelismHint, Pattern, PoolOp, Program, RecurrentCell, ScheduleKind, Stmt, SystemDecl,
-    TrainDecl, UnOpKind, VecSize,
+    Activation, AgentDecl, AssignOpKind, BinOpKind, Block, ElemType, EntityQuery, Expr, FnDecl,
+    Item, ModelDecl, ModelLayer, NormKind, OptimizerKind, ParallelismHint, Pattern, PoolOp,
+    Program, RecurrentCell, Stmt, SystemDecl, TrainDecl, UnOpKind, VecSize,
 };
 use crate::game_systems::{InputState, PhysicsShape, PhysicsWorld, RenderCommand, RenderState};
 use crate::lexer::Span;
@@ -2673,7 +2672,7 @@ impl Compiler {
                 // Fallback: emit a builtin call to "cast"
                 self.emit(Instr::Move(dst, s)); // no-op cast; full cast via tree-walker
             }
-            Expr::Closure { params, body, .. } => {
+            Expr::Closure { .. } => {
                 // Closures fall back to const pool.
                 self.emit(Instr::LoadUnit(dst));
             }
@@ -3930,7 +3929,7 @@ impl Interpreter {
             Expr::BoolLit { value, .. } => Ok(Value::Bool(*value)),
             Expr::StrLit { value, .. } => Ok(Value::Str(value.clone())),
 
-            Expr::Ident { name, span } => {
+            Expr::Ident { name, span: _ } => {
                 // Check local env first, then built-ins.
                 if let Some(v) = env.get(name) {
                     return Ok(v.clone());
@@ -3959,7 +3958,11 @@ impl Interpreter {
             }
 
             // ── Vector constructors ────────────────────────────────────────────
-            Expr::VecCtor { size, elems, span } => {
+            Expr::VecCtor {
+                size,
+                elems,
+                span: _,
+            } => {
                 let vals: Vec<f32> = elems
                     .iter()
                     .map(|e| {
@@ -4039,7 +4042,7 @@ impl Interpreter {
             Expr::Call {
                 func,
                 args,
-                named,
+                named: _,
                 span,
             } => {
                 // Check for built-in functions by name first
@@ -4083,21 +4086,21 @@ impl Interpreter {
                 self.eval_matmul(l, r).map_err(|e| e.at(*span))
             }
 
-            Expr::HadamardMul { lhs, rhs, span } => {
+            Expr::HadamardMul { lhs, rhs, span: _ } => {
                 let l = self.eval_tensor(lhs, env)?;
                 let r = self.eval_tensor(rhs, env)?;
                 let out = l.read().unwrap().hadamard_mul(&r.read().unwrap())?;
                 Ok(Value::Tensor(Arc::new(RwLock::new(out))))
             }
 
-            Expr::HadamardDiv { lhs, rhs, span } => {
+            Expr::HadamardDiv { lhs, rhs, span: _ } => {
                 let l = self.eval_tensor(lhs, env)?;
                 let r = self.eval_tensor(rhs, env)?;
                 let out = l.read().unwrap().hadamard_div(&r.read().unwrap())?;
                 Ok(Value::Tensor(Arc::new(RwLock::new(out))))
             }
 
-            Expr::TensorConcat { lhs, rhs, span } => {
+            Expr::TensorConcat { lhs, rhs, span: _ } => {
                 let l = self.eval_tensor(lhs, env)?;
                 let r = self.eval_tensor(rhs, env)?;
                 let out = l.read().unwrap().concat(&r.read().unwrap())?;
@@ -4385,7 +4388,7 @@ impl Interpreter {
                         } else {
                             w.insert_component(id, field, effective_rhs);
                         }
-                    } else if let Some(Value::Struct { fields, .. }) = env.get(name).cloned() {
+                    } else if let Some(Value::Struct { fields: _, .. }) = env.get(name).cloned() {
                         let mut s = env.get(name).unwrap().clone();
                         if let Value::Struct { ref mut fields, .. } = s {
                             fields.insert(field.clone(), effective_rhs);
@@ -4489,7 +4492,7 @@ impl Interpreter {
         &mut self,
         func: Value,
         args: Vec<Value>,
-        env: &mut Env,
+        _env: &mut Env,
     ) -> Result<Value, RuntimeError> {
         match func {
             Value::Fn(closure) => {
@@ -6384,7 +6387,7 @@ impl Interpreter {
                     args.get(2).and_then(|v| v.as_f64()),
                     args.get(3).and_then(|v| v.as_f64()),
                 ) {
-                    let world = self.physics_world.as_ref().unwrap().lock().unwrap();
+                    let _world = self.physics_world.as_ref().unwrap().lock().unwrap();
                     // Placeholder: force integration API is not currently exposed.
                     let _ = (body_id, fx, fy, fz);
                     Ok(Value::Bool(false))
@@ -6633,7 +6636,7 @@ impl Interpreter {
             // ── Input functions ───────────────────────────────────────────────────
             "input::is_key_pressed" => {
                 if let Some(Value::Str(key)) = args.first() {
-                    let input = self.input_state.as_ref().unwrap().lock().unwrap();
+                    let _input = self.input_state.as_ref().unwrap().lock().unwrap();
                     let _ = key;
                     let pressed = false;
                     Ok(Value::Bool(pressed))
@@ -6934,7 +6937,7 @@ impl Interpreter {
         recv: Value,
         method: &str,
         args: Vec<Value>,
-        env: &mut Env,
+        _env: &mut Env,
     ) -> Result<Value, RuntimeError> {
         match (&recv, method) {
             // ── Tensor methods ─────────────────────────────────────────────────
@@ -7587,7 +7590,7 @@ impl Interpreter {
                 let obs = Tensor::zeros(vec![1, 4]);
 
                 // 2. Forward pass through policy network.
-                let action = if let Some(model_name) = &decl.model {
+                let _action = if let Some(model_name) = &decl.model {
                     if let Some(m) = self.models.get(model_name).cloned() {
                         let out = m.lock().unwrap().forward(obs)?;
                         Value::Tensor(Arc::new(RwLock::new(out)))
