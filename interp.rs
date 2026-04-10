@@ -50,7 +50,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 // ── Fast HashMap — ~2x faster than SipHash for short string keys ─────────────
@@ -772,6 +772,9 @@ impl Tensor {
 // =============================================================================
 
 pub type EntityId = u64;
+thread_local! {
+    static VM_REG_POOL: RefCell<Vec<Value>> = RefCell::new(Vec::new());
+}
 
 /// The Entity-Component-System world that backs all `system` and entity-for loops.
 ///
@@ -916,24 +919,28 @@ impl EcsWorld {
 
     /// Returns all live entities matching a query.
     pub fn query(&self, with: &[String], without: &[String]) -> Vec<EntityId> {
-        // Start from the smallest `with` component set for efficiency.
-        let base: Vec<EntityId> = if with.is_empty() {
-            self.alive.iter().cloned().collect()
+        let mut out = Vec::new();
+        self.query_into(with, without, &mut out);
+        out
+    }
+
+    /// Writes all live entities matching a query into a caller-provided output buffer.
+    pub fn query_into(&self, with: &[String], without: &[String], out: &mut Vec<EntityId>) {
+        out.clear();
+        let base: Cow<'_, [EntityId]> = if with.is_empty() {
+            Cow::Owned(self.alive.iter().copied().collect())
         } else {
-            // Find the component with the fewest entities (cheapest to iterate).
             let smallest = with
                 .iter()
                 .filter_map(|c| self.components.get(c))
                 .min_by_key(|s| s.dense_ids.len());
             match smallest {
-                None => return vec![],
-                Some(s) => s.entity_ids().to_vec(),
+                None => return,
+                Some(s) => Cow::Borrowed(s.entity_ids()),
             }
         };
-
-        // Collect with pre-allocated capacity equal to the base set size.
-        let mut out = Vec::with_capacity(base.len());
-        for id in base {
+        out.reserve(base.len());
+        for id in base.iter().copied() {
             if !self.alive.contains(&id) {
                 continue;
             }
@@ -952,7 +959,6 @@ impl EcsWorld {
             }
             out.push(id);
         }
-        out
     }
 
     /// Allocation-lean query for the common 2-component include case.
@@ -2755,8 +2761,26 @@ pub fn vm_exec(
     func: &CompiledFn,
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
-    // Allocate register file.
-    let mut regs: Vec<Value> = vec![Value::Unit; func.slot_count as usize + 32];
+    struct VmRegPoolGuard {
+        regs: Vec<Value>,
+    }
+    impl Drop for VmRegPoolGuard {
+        fn drop(&mut self) {
+            self.regs.clear();
+            let regs = std::mem::take(&mut self.regs);
+            VM_REG_POOL.with(|pool| {
+                *pool.borrow_mut() = regs;
+            });
+        }
+    }
+
+    let needed = func.slot_count as usize + 32;
+    let mut reg_guard = VmRegPoolGuard {
+        regs: VM_REG_POOL.with(|pool| std::mem::take(&mut *pool.borrow_mut())),
+    };
+    reg_guard.regs.clear();
+    reg_guard.regs.resize(needed, Value::Unit);
+    let regs = &mut reg_guard.regs;
 
     // Load arguments.
     for (i, arg) in args.into_iter().enumerate() {
@@ -3329,6 +3353,7 @@ pub struct Interpreter {
     jit_native_calls: u64,
     jit_vm_calls: u64,
     jit_fallback_calls: u64,
+    ecs_query_scratch: Vec<EntityId>,
 }
 
 impl Interpreter {
@@ -3370,6 +3395,7 @@ impl Interpreter {
             jit_native_calls: 0,
             jit_vm_calls: 0,
             jit_fallback_calls: 0,
+            ecs_query_scratch: Vec::new(),
         }
     }
 
@@ -3861,14 +3887,16 @@ impl Interpreter {
         env: &mut Env,
     ) -> Result<Value, RuntimeError> {
         // Snapshot the matching entity list (safe: world locked briefly).
-        let entity_ids = {
+        self.ecs_query_scratch.clear();
+        {
             let w = self.world.lock().unwrap();
-            w.query(&query.with, &query.without)
-        };
+            w.query_into(&query.with, &query.without, &mut self.ecs_query_scratch);
+        }
 
         // Apply optional filter expression.
         let mut ids_to_run = Vec::new();
-        for id in entity_ids {
+        for idx in 0..self.ecs_query_scratch.len() {
+            let id = self.ecs_query_scratch[idx];
             if let Some(filter_expr) = &query.filter {
                 env.push();
                 env.set_local(var, Value::Entity(id));
@@ -4527,62 +4555,67 @@ impl Interpreter {
 
     // ── Built-in function dispatch ────────────────────────────────────────────
 
-    fn canonical_builtin_name<'a>(&self, name: &'a str) -> Cow<'a, str> {
-        let canonical = match name {
-            // stdlib module aliases (core/math/tensor/nn/train/data/io/collections/...)
-            "core::some" | "core::Some" => "Some",
-            "core::none" | "core::None" => "None",
-            "core::ok" | "core::Ok" => "Ok",
-            "core::err" | "core::Err" => "Err",
-            "core::unwrap" => "unwrap",
-            "core::is_some" => "is_some",
-            "core::is_none" => "is_none",
-            "core::is_ok" => "is_ok",
-            "core::is_err" => "is_err",
-            "collections::map_new" => "HashMap::new",
-            "collections::len" => "len",
-            "collections::range" => "range",
-            "math::sin" => "sin",
-            "math::cos" => "cos",
-            "math::tan" => "tan",
-            "math::exp" => "exp",
-            "math::log" => "log",
-            "math::sqrt" => "sqrt",
-            "math::tanh" => "tanh",
-            "math::lerp" => "mix",
-            "math::smoothstep" => "smoothstep",
-            "math::clamp01" => "math::clamp01",
-            "math::approach" => "math::approach",
-            "math::move_towards2" => "math::move_towards2",
-            "math::angle_to" => "math::angle_to",
-            "math::rand_unit2" => "math::rand_unit2",
-            "tensor::zeros" => "zeros",
-            "tensor::ones" => "ones",
-            "tensor::random_seed" => "math::random_seed",
-            "nn::cross_entropy" => "loss::cross_entropy",
-            "nn::mse" => "loss::mse",
-            "train::optimizer_create" => "optimizer::create",
-            "train::optimizer_step" => "optimizer::step",
-            "data::dataloader" => "dataloader",
-            "data::pipeline" => "pipeline",
-            "io::read_text" => "read_file",
-            "io::write_text" => "write_file",
-            "model::load_ir" => "read_file",
-            "model::save_ir" => "write_file",
-            "model::load_weights" => "sys::read_bytes",
-            "model::save_weights" => "sys::write_bytes",
-            "debug::trace" => "dbg",
-            "sim::world_new" => "sim::world",
-            "window::new" => "window::create",
-            "render::begin_frame" => "render::begin_frame",
-            "render::clear" => "render::clear",
-            "render::rect" => "render::rect",
-            "render::sprite" => "render::sprite",
-            "render::flush" => "render::flush",
-            "render::stats" => "render::stats",
-            _ => return Cow::Borrowed(name),
-        };
-        Cow::Borrowed(canonical)
+    fn canonical_builtin_name<'a>(name: &'a str) -> &'a str {
+        static ALIASES: OnceLock<FxHashMap<&'static str, &'static str>> = OnceLock::new();
+        let aliases = ALIASES.get_or_init(|| {
+            FxHashMap::from_iter([
+                ("core::some", "Some"),
+                ("core::Some", "Some"),
+                ("core::none", "None"),
+                ("core::None", "None"),
+                ("core::ok", "Ok"),
+                ("core::Ok", "Ok"),
+                ("core::err", "Err"),
+                ("core::Err", "Err"),
+                ("core::unwrap", "unwrap"),
+                ("core::is_some", "is_some"),
+                ("core::is_none", "is_none"),
+                ("core::is_ok", "is_ok"),
+                ("core::is_err", "is_err"),
+                ("collections::map_new", "HashMap::new"),
+                ("collections::len", "len"),
+                ("collections::range", "range"),
+                ("math::sin", "sin"),
+                ("math::cos", "cos"),
+                ("math::tan", "tan"),
+                ("math::exp", "exp"),
+                ("math::log", "log"),
+                ("math::sqrt", "sqrt"),
+                ("math::tanh", "tanh"),
+                ("math::lerp", "mix"),
+                ("math::smoothstep", "smoothstep"),
+                ("math::clamp01", "math::clamp01"),
+                ("math::approach", "math::approach"),
+                ("math::move_towards2", "math::move_towards2"),
+                ("math::angle_to", "math::angle_to"),
+                ("math::rand_unit2", "math::rand_unit2"),
+                ("tensor::zeros", "zeros"),
+                ("tensor::ones", "ones"),
+                ("tensor::random_seed", "math::random_seed"),
+                ("nn::cross_entropy", "loss::cross_entropy"),
+                ("nn::mse", "loss::mse"),
+                ("train::optimizer_create", "optimizer::create"),
+                ("train::optimizer_step", "optimizer::step"),
+                ("data::dataloader", "dataloader"),
+                ("data::pipeline", "pipeline"),
+                ("io::read_text", "read_file"),
+                ("io::write_text", "write_file"),
+                ("model::load_ir", "read_file"),
+                ("model::save_ir", "write_file"),
+                ("model::load_weights", "sys::read_bytes"),
+                ("model::save_weights", "sys::write_bytes"),
+                ("debug::trace", "dbg"),
+                ("sim::world_new", "sim::world"),
+                ("window::new", "window::create"),
+                ("render::begin_frame", "render::begin_frame"),
+                ("render::clear", "render::clear"),
+                ("render::rect", "render::rect"),
+                ("render::sprite", "render::sprite"),
+                ("render::flush", "render::flush"),
+                ("render::stats", "render::stats"),
+            ])
+        });
+        aliases.get(name).copied().unwrap_or(name)
     }
 
     fn stdlib_modules_value(&self) -> Value {
@@ -4727,8 +4760,7 @@ impl Interpreter {
 
     fn eval_builtin(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         use std::f64::consts;
-        let canonical = self.canonical_builtin_name(name);
-        let name = canonical.as_ref();
+        let name = Self::canonical_builtin_name(name);
 
         match name {
             // ── Math functions ────────────────────────────────────────────────
