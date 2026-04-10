@@ -48,7 +48,6 @@
 )]
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
