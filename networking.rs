@@ -1,10 +1,10 @@
 // Networking tools (basic UDP server/client for state sync).
 
-use std::net::{UdpSocket, SocketAddr};
-use std::thread;
-use std::time::Duration;
+use std::net::{SocketAddr, UdpSocket};
 
-pub fn available() -> bool { true }
+pub fn available() -> bool {
+    true
+}
 
 pub struct Server {
     socket: UdpSocket,
@@ -66,7 +66,9 @@ mod tests {
                 assert_eq!(payload, b"hello");
                 break;
             }
-            if start.elapsed() > Duration::from_secs(1) { panic!("timeout"); }
+            if start.elapsed() > Duration::from_secs(1) {
+                panic!("timeout");
+            }
             thread::sleep(Duration::from_millis(10));
         }
     }

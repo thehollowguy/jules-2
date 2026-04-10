@@ -76,10 +76,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    AccessMode, AgentDecl, AssignOpKind, Attribute, BehaviorRule, Block, ComponentAccess,
-    ComponentDecl, EntityQuery, EpisodeSpec, Expr, FnDecl, GoalDecl, Item, LearningKind, MatchArm,
-    ModelDecl, ModelLayer, ParallelFor, Param, Pattern, PerceptionKind, Program, SignalSpec, Stmt,
-    SystemDecl, TrainDecl,
+    AccessMode, AgentDecl, Attribute, BehaviorRule, Block, ComponentDecl, EntityQuery, Expr,
+    FnDecl, GoalDecl, Item, MatchArm, ModelDecl, ModelLayer, ParallelFor, Pattern, PerceptionKind,
+    Program, Stmt, SystemDecl, TrainDecl,
 };
 use crate::lexer::Span;
 
@@ -537,7 +536,7 @@ impl SemaCtx {
             .declare(name, Binding::new(span, mutable, wildcard));
     }
 
-    fn use_var(&mut self, name: &str, span: Span) {
+    fn use_var(&mut self, name: &str, _span: Span) {
         // Known built-ins that don't live in the scope stack.
         if matches!(name, "world" | "self" | "true" | "false") {
             return;

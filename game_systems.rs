@@ -4,7 +4,6 @@
 // =========================================================================
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 // Physics component that can be attached to entities
 #[derive(Debug, Clone)]
@@ -515,13 +514,25 @@ impl RenderState {
         id
     }
 
-    pub fn set_grid_cell(&mut self, map_id: u32, x: usize, y: usize, object_id: u32) -> Result<(), String> {
+    pub fn set_grid_cell(
+        &mut self,
+        map_id: u32,
+        x: usize,
+        y: usize,
+        object_id: u32,
+    ) -> Result<(), String> {
         if object_id != 0 && !self.objects.contains_key(&object_id) {
             return Err(format!("unknown object_id {}", object_id));
         }
-        let map = self.maps.get_mut(&map_id).ok_or_else(|| format!("unknown map_id {}", map_id))?;
+        let map = self
+            .maps
+            .get_mut(&map_id)
+            .ok_or_else(|| format!("unknown map_id {}", map_id))?;
         if x >= map.width || y >= map.height {
-            return Err(format!("grid index out of bounds ({}, {}) for {}x{}", x, y, map.width, map.height));
+            return Err(format!(
+                "grid index out of bounds ({}, {}) for {}x{}",
+                x, y, map.width, map.height
+            ));
         }
         map.cells[y * map.width + x] = object_id;
         Ok(())
@@ -536,7 +547,10 @@ impl RenderState {
     }
 
     pub fn render_grid_map(&self, map_id: u32) -> Result<usize, String> {
-        let map = self.maps.get(&map_id).ok_or_else(|| format!("unknown map_id {}", map_id))?;
+        let map = self
+            .maps
+            .get(&map_id)
+            .ok_or_else(|| format!("unknown map_id {}", map_id))?;
         let mut drawn = 0usize;
         for object_id in &map.cells {
             if *object_id == 0 {
@@ -549,7 +563,12 @@ impl RenderState {
         Ok(drawn)
     }
 
-    pub fn create_chunked_grid_map(&mut self, width: usize, height: usize, chunk_size: usize) -> u32 {
+    pub fn create_chunked_grid_map(
+        &mut self,
+        width: usize,
+        height: usize,
+        chunk_size: usize,
+    ) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         self.chunked_maps.insert(
@@ -606,7 +625,10 @@ impl RenderState {
             .ok_or_else(|| format!("unknown chunked map_id {}", map_id))?;
         let mut drawn = 0usize;
         for chunk in map.chunks.values() {
-            drawn += chunk.iter().filter(|&&id| id != 0 && self.objects.contains_key(&id)).count();
+            drawn += chunk
+                .iter()
+                .filter(|&&id| id != 0 && self.objects.contains_key(&id))
+                .count();
         }
         Ok(drawn)
     }
@@ -825,7 +847,10 @@ mod tests {
     #[test]
     fn test_grid_map_with_sprite_and_model_objects() {
         let mut render = RenderState::new();
-        let mesh = render.create_mesh(vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], vec![0, 1, 2]);
+        let mesh = render.create_mesh(
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![0, 1, 2],
+        );
         let mat = render.create_material([1.0, 1.0, 1.0, 1.0]);
         let sprite = render.create_sprite("grass".into(), 1.0, 1.0);
         let model = render.create_model("tree".into(), mesh).unwrap();

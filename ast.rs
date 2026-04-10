@@ -26,7 +26,6 @@
 use crate::lexer::Span;
 
 // ─── Re-export Span for convenience in other modules ─────────────────────────
-pub use crate::lexer::Span as AstSpan;
 
 // =============================================================================
 // TYPES
