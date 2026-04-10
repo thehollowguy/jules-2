@@ -11,11 +11,11 @@
 
 #![allow(dead_code)]
 
-use std::sync::{Arc, Mutex};
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+use std::sync::Mutex;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -452,7 +452,10 @@ pub extern "C" fn jules_ml_memory_configure(min_bytes: usize, extra_bytes: usize
     let mut state = ML_MEMORY_STATE.lock().unwrap();
     let new_total = min_bytes.saturating_add(extra_bytes);
     let used_total = state.total_used_bytes();
-    if used_total > new_total || state.core_used_bytes > min_bytes || state.extra_used_bytes > extra_bytes {
+    if used_total > new_total
+        || state.core_used_bytes > min_bytes
+        || state.extra_used_bytes > extra_bytes
+    {
         return JulesError::OutOfMemory;
     }
     state.min_bytes = min_bytes;
