@@ -2167,7 +2167,9 @@ fn cmd_fmt(args: &CliArgs) -> i32 {
                 out.push_str(&indent_str.repeat(indent));
             }
             kind => {
-                out.push_str(&format!("{kind:?} "));
+                let _ = kind;
+                out.push_str(&tok.raw);
+                out.push(' ');
             }
         }
     }

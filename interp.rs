@@ -1945,12 +1945,7 @@ impl Env {
     #[inline]
     pub fn pop(&mut self) {
         if let Some(log) = self.frames.pop() {
-            let old_len = self.values.len();
-            let mut min_popped_slot = old_len as u32;
             for (name, old_slot) in log {
-                if let Some(&current_slot) = self.name_to_slot.get(&name) {
-                    min_popped_slot = min_popped_slot.min(current_slot);
-                }
                 match old_slot {
                     Some(slot) => {
                         self.name_to_slot.insert(name, slot);
@@ -1960,12 +1955,16 @@ impl Env {
                     }
                 }
             }
-            // Truncate the slab to remove dangling slots.
-            // Safe: after restoring old mappings, high slots are unreachable.
-            // We keep the slab capacity for reuse.
-            if min_popped_slot < old_len as u32 {
-                self.values.truncate(min_popped_slot as usize);
-            }
+            // Recompute highest reachable slot after undo, then truncate.
+            // This is O(bindings) but correct for shadow/rebind patterns.
+            let next_len = self
+                .name_to_slot
+                .values()
+                .copied()
+                .max()
+                .map(|v| v as usize + 1)
+                .unwrap_or(0);
+            self.values.truncate(next_len);
         }
     }
 
@@ -3903,26 +3902,43 @@ impl Interpreter {
                 let ok = self.eval_expr(filter_expr, env)?.is_truthy();
                 env.pop();
                 if ok {
-                    ids_to_run.push(id);
+                    filtered.push(id);
                 }
-            } else {
-                ids_to_run.push(id);
             }
-        }
+            filtered
+        } else {
+            Vec::new()
+        };
 
         match parallelism {
             ParallelismHint::Sequential | ParallelismHint::Auto => {
                 // Sequential: deterministic order guaranteed.
-                for id in &ids_to_run {
-                    env.push();
-                    env.set_local(var, Value::Entity(*id));
-                    let r = self.eval_block(body, env)?;
-                    env.pop();
-                    match r {
-                        Value::Break(_) => break,
-                        Value::Continue => continue,
-                        v if v.is_signal() => return Ok(v),
-                        _ => {}
+                if query.filter.is_some() {
+                    for id in ids_to_run.iter().copied() {
+                        env.push();
+                        env.set_local(var, Value::Entity(id));
+                        let r = self.eval_block(body, env)?;
+                        env.pop();
+                        match r {
+                            Value::Break(_) => break,
+                            Value::Continue => continue,
+                            v if v.is_signal() => return Ok(v),
+                            _ => {}
+                        }
+                    }
+                } else {
+                    for idx in 0..self.ecs_query_scratch.len() {
+                        let id = self.ecs_query_scratch[idx];
+                        env.push();
+                        env.set_local(var, Value::Entity(id));
+                        let r = self.eval_block(body, env)?;
+                        env.pop();
+                        match r {
+                            Value::Break(_) => break,
+                            Value::Continue => continue,
+                            v if v.is_signal() => return Ok(v),
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -3932,13 +3948,26 @@ impl Interpreter {
             | ParallelismHint::SimdOrGpu { .. } => {
                 // Parallel: interpreter falls back to sequential with a note.
                 // A real backend uses rayon::par_iter() or GPU dispatch here.
-                for id in &ids_to_run {
-                    env.push();
-                    env.set_local(var, Value::Entity(*id));
-                    let r = self.eval_block(body, env)?;
-                    env.pop();
-                    if r.is_signal() {
-                        return Ok(r);
+                if query.filter.is_some() {
+                    for id in ids_to_run.iter().copied() {
+                        env.push();
+                        env.set_local(var, Value::Entity(id));
+                        let r = self.eval_block(body, env)?;
+                        env.pop();
+                        if r.is_signal() {
+                            return Ok(r);
+                        }
+                    }
+                } else {
+                    for idx in 0..self.ecs_query_scratch.len() {
+                        let id = self.ecs_query_scratch[idx];
+                        env.push();
+                        env.set_local(var, Value::Entity(id));
+                        let r = self.eval_block(body, env)?;
+                        env.pop();
+                        if r.is_signal() {
+                            return Ok(r);
+                        }
                     }
                 }
             }
@@ -4073,21 +4102,16 @@ impl Interpreter {
                 named: _,
                 span,
             } => {
-                // Check for built-in functions by name first
-                if let Expr::Ident { name, .. } = func.as_ref() {
-                    let args_v: Vec<Value> = args
-                        .iter()
-                        .map(|a| self.eval_expr(a, env))
-                        .collect::<Result<_, _>>()?;
-                    if let Ok(result) = self.eval_builtin(name, args_v) {
-                        return Ok(result);
-                    }
-                }
-                // Otherwise, try normal function evaluation
                 let args_v: Vec<Value> = args
                     .iter()
                     .map(|a| self.eval_expr(a, env))
                     .collect::<Result<_, _>>()?;
+                // Check for built-in functions by name first
+                if let Expr::Ident { name, .. } = func.as_ref() {
+                    if let Ok(result) = self.eval_builtin(name, args_v.clone()) {
+                        return Ok(result);
+                    }
+                }
                 let func_v = self.eval_expr(func, env)?;
                 self.eval_call(func_v, args_v, env).map_err(|e| e.at(*span))
             }
