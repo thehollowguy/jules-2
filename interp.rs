@@ -48,7 +48,6 @@
 )]
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -3894,10 +3893,10 @@ impl Interpreter {
         }
 
         // Apply optional filter expression.
-        let ids_to_run = if let Some(filter_expr) = &query.filter {
-            let mut filtered = Vec::with_capacity(self.ecs_query_scratch.len());
-            for idx in 0..self.ecs_query_scratch.len() {
-                let id = self.ecs_query_scratch[idx];
+        let mut ids_to_run = Vec::new();
+        for idx in 0..self.ecs_query_scratch.len() {
+            let id = self.ecs_query_scratch[idx];
+            if let Some(filter_expr) = &query.filter {
                 env.push();
                 env.set_local(var, Value::Entity(id));
                 let ok = self.eval_expr(filter_expr, env)?.is_truthy();
