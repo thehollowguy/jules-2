@@ -48,19 +48,19 @@
 )]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 // ── Fast HashMap — ~2x faster than SipHash for short string keys ─────────────
 use rustc_hash::FxHashMap;
 
 use crate::ast::{
-    Activation, AgentDecl, AssignOpKind, Attribute, BinOpKind, Block, ElemType, EntityQuery, Expr,
-    FnDecl, Item, LearningKind, MatchArm, ModelDecl, ModelLayer, NormKind, OptimizerKind, Padding,
-    ParallelismHint, Pattern, PoolOp, Program, RecurrentCell, ScheduleKind, Stmt, SystemDecl,
-    TrainDecl, UnOpKind, VecSize,
+    Activation, AgentDecl, AssignOpKind, BinOpKind, Block, ElemType, EntityQuery, Expr, FnDecl,
+    Item, ModelDecl, ModelLayer, NormKind, OptimizerKind, ParallelismHint, Pattern, PoolOp,
+    Program, RecurrentCell, Stmt, SystemDecl, TrainDecl, UnOpKind, VecSize,
 };
 use crate::game_systems::{InputState, PhysicsShape, PhysicsWorld, RenderCommand, RenderState};
 use crate::lexer::Span;
@@ -773,6 +773,9 @@ impl Tensor {
 // =============================================================================
 
 pub type EntityId = u64;
+thread_local! {
+    static VM_REG_POOL: RefCell<Vec<Value>> = RefCell::new(Vec::new());
+}
 
 /// The Entity-Component-System world that backs all `system` and entity-for loops.
 ///
@@ -917,24 +920,28 @@ impl EcsWorld {
 
     /// Returns all live entities matching a query.
     pub fn query(&self, with: &[String], without: &[String]) -> Vec<EntityId> {
-        // Start from the smallest `with` component set for efficiency.
-        let base: Vec<EntityId> = if with.is_empty() {
-            self.alive.iter().cloned().collect()
+        let mut out = Vec::new();
+        self.query_into(with, without, &mut out);
+        out
+    }
+
+    /// Writes all live entities matching a query into a caller-provided output buffer.
+    pub fn query_into(&self, with: &[String], without: &[String], out: &mut Vec<EntityId>) {
+        out.clear();
+        let base: Cow<'_, [EntityId]> = if with.is_empty() {
+            Cow::Owned(self.alive.iter().copied().collect())
         } else {
-            // Find the component with the fewest entities (cheapest to iterate).
             let smallest = with
                 .iter()
                 .filter_map(|c| self.components.get(c))
                 .min_by_key(|s| s.dense_ids.len());
             match smallest {
-                None => return vec![],
-                Some(s) => s.entity_ids().to_vec(),
+                None => return,
+                Some(s) => Cow::Borrowed(s.entity_ids()),
             }
         };
-
-        // Collect with pre-allocated capacity equal to the base set size.
-        let mut out = Vec::with_capacity(base.len());
-        for id in base {
+        out.reserve(base.len());
+        for id in base.iter().copied() {
             if !self.alive.contains(&id) {
                 continue;
             }
@@ -953,7 +960,6 @@ impl EcsWorld {
             }
             out.push(id);
         }
-        out
     }
 
     /// Allocation-lean query for the common 2-component include case.
@@ -1940,12 +1946,7 @@ impl Env {
     #[inline]
     pub fn pop(&mut self) {
         if let Some(log) = self.frames.pop() {
-            let old_len = self.values.len();
-            let mut min_popped_slot = old_len as u32;
             for (name, old_slot) in log {
-                if let Some(&current_slot) = self.name_to_slot.get(&name) {
-                    min_popped_slot = min_popped_slot.min(current_slot);
-                }
                 match old_slot {
                     Some(slot) => {
                         self.name_to_slot.insert(name, slot);
@@ -1955,12 +1956,16 @@ impl Env {
                     }
                 }
             }
-            // Truncate the slab to remove dangling slots.
-            // Safe: after restoring old mappings, high slots are unreachable.
-            // We keep the slab capacity for reuse.
-            if min_popped_slot < old_len as u32 {
-                self.values.truncate(min_popped_slot as usize);
-            }
+            // Recompute highest reachable slot after undo, then truncate.
+            // This is O(bindings) but correct for shadow/rebind patterns.
+            let next_len = self
+                .name_to_slot
+                .values()
+                .copied()
+                .max()
+                .map(|v| v as usize + 1)
+                .unwrap_or(0);
+            self.values.truncate(next_len);
         }
     }
 
@@ -2673,7 +2678,7 @@ impl Compiler {
                 // Fallback: emit a builtin call to "cast"
                 self.emit(Instr::Move(dst, s)); // no-op cast; full cast via tree-walker
             }
-            Expr::Closure { params, body, .. } => {
+            Expr::Closure { .. } => {
                 // Closures fall back to const pool.
                 self.emit(Instr::LoadUnit(dst));
             }
@@ -2756,8 +2761,26 @@ pub fn vm_exec(
     func: &CompiledFn,
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
-    // Allocate register file.
-    let mut regs: Vec<Value> = vec![Value::Unit; func.slot_count as usize + 32];
+    struct VmRegPoolGuard {
+        regs: Vec<Value>,
+    }
+    impl Drop for VmRegPoolGuard {
+        fn drop(&mut self) {
+            self.regs.clear();
+            let regs = std::mem::take(&mut self.regs);
+            VM_REG_POOL.with(|pool| {
+                *pool.borrow_mut() = regs;
+            });
+        }
+    }
+
+    let needed = func.slot_count as usize + 32;
+    let mut reg_guard = VmRegPoolGuard {
+        regs: VM_REG_POOL.with(|pool| std::mem::take(&mut *pool.borrow_mut())),
+    };
+    reg_guard.regs.clear();
+    reg_guard.regs.resize(needed, Value::Unit);
+    let regs = &mut reg_guard.regs;
 
     // Load arguments.
     for (i, arg) in args.into_iter().enumerate() {
@@ -3330,6 +3353,7 @@ pub struct Interpreter {
     jit_native_calls: u64,
     jit_vm_calls: u64,
     jit_fallback_calls: u64,
+    ecs_query_scratch: Vec<EntityId>,
 }
 
 impl Interpreter {
@@ -3371,6 +3395,7 @@ impl Interpreter {
             jit_native_calls: 0,
             jit_vm_calls: 0,
             jit_fallback_calls: 0,
+            ecs_query_scratch: Vec::new(),
         }
     }
 
@@ -3862,40 +3887,59 @@ impl Interpreter {
         env: &mut Env,
     ) -> Result<Value, RuntimeError> {
         // Snapshot the matching entity list (safe: world locked briefly).
-        let entity_ids = {
+        self.ecs_query_scratch.clear();
+        {
             let w = self.world.lock().unwrap();
-            w.query(&query.with, &query.without)
-        };
+            w.query_into(&query.with, &query.without, &mut self.ecs_query_scratch);
+        }
 
         // Apply optional filter expression.
-        let mut ids_to_run = Vec::new();
-        for id in entity_ids {
-            if let Some(filter_expr) = &query.filter {
+        let ids_to_run = if let Some(filter_expr) = &query.filter {
+            let mut filtered = Vec::with_capacity(self.ecs_query_scratch.len());
+            for idx in 0..self.ecs_query_scratch.len() {
+                let id = self.ecs_query_scratch[idx];
                 env.push();
                 env.set_local(var, Value::Entity(id));
                 let ok = self.eval_expr(filter_expr, env)?.is_truthy();
                 env.pop();
                 if ok {
-                    ids_to_run.push(id);
+                    filtered.push(id);
                 }
-            } else {
-                ids_to_run.push(id);
             }
-        }
+            filtered
+        } else {
+            Vec::new()
+        };
 
         match parallelism {
             ParallelismHint::Sequential | ParallelismHint::Auto => {
                 // Sequential: deterministic order guaranteed.
-                for id in &ids_to_run {
-                    env.push();
-                    env.set_local(var, Value::Entity(*id));
-                    let r = self.eval_block(body, env)?;
-                    env.pop();
-                    match r {
-                        Value::Break(_) => break,
-                        Value::Continue => continue,
-                        v if v.is_signal() => return Ok(v),
-                        _ => {}
+                if query.filter.is_some() {
+                    for id in ids_to_run.iter().copied() {
+                        env.push();
+                        env.set_local(var, Value::Entity(id));
+                        let r = self.eval_block(body, env)?;
+                        env.pop();
+                        match r {
+                            Value::Break(_) => break,
+                            Value::Continue => continue,
+                            v if v.is_signal() => return Ok(v),
+                            _ => {}
+                        }
+                    }
+                } else {
+                    for idx in 0..self.ecs_query_scratch.len() {
+                        let id = self.ecs_query_scratch[idx];
+                        env.push();
+                        env.set_local(var, Value::Entity(id));
+                        let r = self.eval_block(body, env)?;
+                        env.pop();
+                        match r {
+                            Value::Break(_) => break,
+                            Value::Continue => continue,
+                            v if v.is_signal() => return Ok(v),
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -3905,13 +3949,26 @@ impl Interpreter {
             | ParallelismHint::SimdOrGpu { .. } => {
                 // Parallel: interpreter falls back to sequential with a note.
                 // A real backend uses rayon::par_iter() or GPU dispatch here.
-                for id in &ids_to_run {
-                    env.push();
-                    env.set_local(var, Value::Entity(*id));
-                    let r = self.eval_block(body, env)?;
-                    env.pop();
-                    if r.is_signal() {
-                        return Ok(r);
+                if query.filter.is_some() {
+                    for id in ids_to_run.iter().copied() {
+                        env.push();
+                        env.set_local(var, Value::Entity(id));
+                        let r = self.eval_block(body, env)?;
+                        env.pop();
+                        if r.is_signal() {
+                            return Ok(r);
+                        }
+                    }
+                } else {
+                    for idx in 0..self.ecs_query_scratch.len() {
+                        let id = self.ecs_query_scratch[idx];
+                        env.push();
+                        env.set_local(var, Value::Entity(id));
+                        let r = self.eval_block(body, env)?;
+                        env.pop();
+                        if r.is_signal() {
+                            return Ok(r);
+                        }
                     }
                 }
             }
@@ -3930,7 +3987,7 @@ impl Interpreter {
             Expr::BoolLit { value, .. } => Ok(Value::Bool(*value)),
             Expr::StrLit { value, .. } => Ok(Value::Str(value.clone())),
 
-            Expr::Ident { name, span } => {
+            Expr::Ident { name, span: _ } => {
                 // Check local env first, then built-ins.
                 if let Some(v) = env.get(name) {
                     return Ok(v.clone());
@@ -3959,7 +4016,11 @@ impl Interpreter {
             }
 
             // ── Vector constructors ────────────────────────────────────────────
-            Expr::VecCtor { size, elems, span } => {
+            Expr::VecCtor {
+                size,
+                elems,
+                span: _,
+            } => {
                 let vals: Vec<f32> = elems
                     .iter()
                     .map(|e| {
@@ -4039,24 +4100,19 @@ impl Interpreter {
             Expr::Call {
                 func,
                 args,
-                named,
+                named: _,
                 span,
             } => {
-                // Check for built-in functions by name first
-                if let Expr::Ident { name, .. } = func.as_ref() {
-                    let args_v: Vec<Value> = args
-                        .iter()
-                        .map(|a| self.eval_expr(a, env))
-                        .collect::<Result<_, _>>()?;
-                    if let Ok(result) = self.eval_builtin(name, args_v) {
-                        return Ok(result);
-                    }
-                }
-                // Otherwise, try normal function evaluation
                 let args_v: Vec<Value> = args
                     .iter()
                     .map(|a| self.eval_expr(a, env))
                     .collect::<Result<_, _>>()?;
+                // Check for built-in functions by name first
+                if let Expr::Ident { name, .. } = func.as_ref() {
+                    if let Ok(result) = self.eval_builtin(name, args_v.clone()) {
+                        return Ok(result);
+                    }
+                }
                 let func_v = self.eval_expr(func, env)?;
                 self.eval_call(func_v, args_v, env).map_err(|e| e.at(*span))
             }
@@ -4083,21 +4139,21 @@ impl Interpreter {
                 self.eval_matmul(l, r).map_err(|e| e.at(*span))
             }
 
-            Expr::HadamardMul { lhs, rhs, span } => {
+            Expr::HadamardMul { lhs, rhs, span: _ } => {
                 let l = self.eval_tensor(lhs, env)?;
                 let r = self.eval_tensor(rhs, env)?;
                 let out = l.read().unwrap().hadamard_mul(&r.read().unwrap())?;
                 Ok(Value::Tensor(Arc::new(RwLock::new(out))))
             }
 
-            Expr::HadamardDiv { lhs, rhs, span } => {
+            Expr::HadamardDiv { lhs, rhs, span: _ } => {
                 let l = self.eval_tensor(lhs, env)?;
                 let r = self.eval_tensor(rhs, env)?;
                 let out = l.read().unwrap().hadamard_div(&r.read().unwrap())?;
                 Ok(Value::Tensor(Arc::new(RwLock::new(out))))
             }
 
-            Expr::TensorConcat { lhs, rhs, span } => {
+            Expr::TensorConcat { lhs, rhs, span: _ } => {
                 let l = self.eval_tensor(lhs, env)?;
                 let r = self.eval_tensor(rhs, env)?;
                 let out = l.read().unwrap().concat(&r.read().unwrap())?;
@@ -4385,7 +4441,7 @@ impl Interpreter {
                         } else {
                             w.insert_component(id, field, effective_rhs);
                         }
-                    } else if let Some(Value::Struct { fields, .. }) = env.get(name).cloned() {
+                    } else if let Some(Value::Struct { fields: _, .. }) = env.get(name).cloned() {
                         let mut s = env.get(name).unwrap().clone();
                         if let Value::Struct { ref mut fields, .. } = s {
                             fields.insert(field.clone(), effective_rhs);
@@ -4489,7 +4545,7 @@ impl Interpreter {
         &mut self,
         func: Value,
         args: Vec<Value>,
-        env: &mut Env,
+        _env: &mut Env,
     ) -> Result<Value, RuntimeError> {
         match func {
             Value::Fn(closure) => {
@@ -4524,62 +4580,67 @@ impl Interpreter {
 
     // ── Built-in function dispatch ────────────────────────────────────────────
 
-    fn canonical_builtin_name<'a>(&self, name: &'a str) -> Cow<'a, str> {
-        let canonical = match name {
-            // stdlib module aliases (core/math/tensor/nn/train/data/io/collections/...)
-            "core::some" | "core::Some" => "Some",
-            "core::none" | "core::None" => "None",
-            "core::ok" | "core::Ok" => "Ok",
-            "core::err" | "core::Err" => "Err",
-            "core::unwrap" => "unwrap",
-            "core::is_some" => "is_some",
-            "core::is_none" => "is_none",
-            "core::is_ok" => "is_ok",
-            "core::is_err" => "is_err",
-            "collections::map_new" => "HashMap::new",
-            "collections::len" => "len",
-            "collections::range" => "range",
-            "math::sin" => "sin",
-            "math::cos" => "cos",
-            "math::tan" => "tan",
-            "math::exp" => "exp",
-            "math::log" => "log",
-            "math::sqrt" => "sqrt",
-            "math::tanh" => "tanh",
-            "math::lerp" => "mix",
-            "math::smoothstep" => "smoothstep",
-            "math::clamp01" => "math::clamp01",
-            "math::approach" => "math::approach",
-            "math::move_towards2" => "math::move_towards2",
-            "math::angle_to" => "math::angle_to",
-            "math::rand_unit2" => "math::rand_unit2",
-            "tensor::zeros" => "zeros",
-            "tensor::ones" => "ones",
-            "tensor::random_seed" => "math::random_seed",
-            "nn::cross_entropy" => "loss::cross_entropy",
-            "nn::mse" => "loss::mse",
-            "train::optimizer_create" => "optimizer::create",
-            "train::optimizer_step" => "optimizer::step",
-            "data::dataloader" => "dataloader",
-            "data::pipeline" => "pipeline",
-            "io::read_text" => "read_file",
-            "io::write_text" => "write_file",
-            "model::load_ir" => "read_file",
-            "model::save_ir" => "write_file",
-            "model::load_weights" => "sys::read_bytes",
-            "model::save_weights" => "sys::write_bytes",
-            "debug::trace" => "dbg",
-            "sim::world_new" => "sim::world",
-            "window::new" => "window::create",
-            "render::begin_frame" => "render::begin_frame",
-            "render::clear" => "render::clear",
-            "render::rect" => "render::rect",
-            "render::sprite" => "render::sprite",
-            "render::flush" => "render::flush",
-            "render::stats" => "render::stats",
-            _ => return Cow::Borrowed(name),
-        };
-        Cow::Borrowed(canonical)
+    fn canonical_builtin_name<'a>(name: &'a str) -> &'a str {
+        static ALIASES: OnceLock<FxHashMap<&'static str, &'static str>> = OnceLock::new();
+        let aliases = ALIASES.get_or_init(|| {
+            FxHashMap::from_iter([
+                ("core::some", "Some"),
+                ("core::Some", "Some"),
+                ("core::none", "None"),
+                ("core::None", "None"),
+                ("core::ok", "Ok"),
+                ("core::Ok", "Ok"),
+                ("core::err", "Err"),
+                ("core::Err", "Err"),
+                ("core::unwrap", "unwrap"),
+                ("core::is_some", "is_some"),
+                ("core::is_none", "is_none"),
+                ("core::is_ok", "is_ok"),
+                ("core::is_err", "is_err"),
+                ("collections::map_new", "HashMap::new"),
+                ("collections::len", "len"),
+                ("collections::range", "range"),
+                ("math::sin", "sin"),
+                ("math::cos", "cos"),
+                ("math::tan", "tan"),
+                ("math::exp", "exp"),
+                ("math::log", "log"),
+                ("math::sqrt", "sqrt"),
+                ("math::tanh", "tanh"),
+                ("math::lerp", "mix"),
+                ("math::smoothstep", "smoothstep"),
+                ("math::clamp01", "math::clamp01"),
+                ("math::approach", "math::approach"),
+                ("math::move_towards2", "math::move_towards2"),
+                ("math::angle_to", "math::angle_to"),
+                ("math::rand_unit2", "math::rand_unit2"),
+                ("tensor::zeros", "zeros"),
+                ("tensor::ones", "ones"),
+                ("tensor::random_seed", "math::random_seed"),
+                ("nn::cross_entropy", "loss::cross_entropy"),
+                ("nn::mse", "loss::mse"),
+                ("train::optimizer_create", "optimizer::create"),
+                ("train::optimizer_step", "optimizer::step"),
+                ("data::dataloader", "dataloader"),
+                ("data::pipeline", "pipeline"),
+                ("io::read_text", "read_file"),
+                ("io::write_text", "write_file"),
+                ("model::load_ir", "read_file"),
+                ("model::save_ir", "write_file"),
+                ("model::load_weights", "sys::read_bytes"),
+                ("model::save_weights", "sys::write_bytes"),
+                ("debug::trace", "dbg"),
+                ("sim::world_new", "sim::world"),
+                ("window::new", "window::create"),
+                ("render::begin_frame", "render::begin_frame"),
+                ("render::clear", "render::clear"),
+                ("render::rect", "render::rect"),
+                ("render::sprite", "render::sprite"),
+                ("render::flush", "render::flush"),
+                ("render::stats", "render::stats"),
+            ])
+        });
+        aliases.get(name).copied().unwrap_or(name)
     }
 
     fn stdlib_modules_value(&self) -> Value {
@@ -4724,8 +4785,7 @@ impl Interpreter {
 
     fn eval_builtin(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         use std::f64::consts;
-        let canonical = self.canonical_builtin_name(name);
-        let name = canonical.as_ref();
+        let name = Self::canonical_builtin_name(name);
 
         match name {
             // ── Math functions ────────────────────────────────────────────────
@@ -6384,7 +6444,7 @@ impl Interpreter {
                     args.get(2).and_then(|v| v.as_f64()),
                     args.get(3).and_then(|v| v.as_f64()),
                 ) {
-                    let world = self.physics_world.as_ref().unwrap().lock().unwrap();
+                    let _world = self.physics_world.as_ref().unwrap().lock().unwrap();
                     // Placeholder: force integration API is not currently exposed.
                     let _ = (body_id, fx, fy, fz);
                     Ok(Value::Bool(false))
@@ -6633,7 +6693,7 @@ impl Interpreter {
             // ── Input functions ───────────────────────────────────────────────────
             "input::is_key_pressed" => {
                 if let Some(Value::Str(key)) = args.first() {
-                    let input = self.input_state.as_ref().unwrap().lock().unwrap();
+                    let _input = self.input_state.as_ref().unwrap().lock().unwrap();
                     let _ = key;
                     let pressed = false;
                     Ok(Value::Bool(pressed))
@@ -6934,7 +6994,7 @@ impl Interpreter {
         recv: Value,
         method: &str,
         args: Vec<Value>,
-        env: &mut Env,
+        _env: &mut Env,
     ) -> Result<Value, RuntimeError> {
         match (&recv, method) {
             // ── Tensor methods ─────────────────────────────────────────────────
@@ -7587,7 +7647,7 @@ impl Interpreter {
                 let obs = Tensor::zeros(vec![1, 4]);
 
                 // 2. Forward pass through policy network.
-                let action = if let Some(model_name) = &decl.model {
+                let _action = if let Some(model_name) = &decl.model {
                     if let Some(m) = self.models.get(model_name).cloned() {
                         let out = m.lock().unwrap().forward(obs)?;
                         Value::Tensor(Arc::new(RwLock::new(out)))

@@ -9,6 +9,8 @@ use jules::{CompileUnit, Pipeline, PipelineResult};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BenchMode {
+    NativeProbe,
+    NativeJit,
     FullJit,
     FullInterp,
     AotTime,
@@ -22,6 +24,9 @@ fn main() {
         .unwrap_or(2_000_000);
     let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(15);
     let mode = parse_mode(args.get(3).map(String::as_str));
+    if mode == BenchMode::NativeProbe {
+        std::process::exit(run_native_probe());
+    }
     let seed: i64 = args
         .get(4)
         .and_then(|s| s.parse().ok())
@@ -36,7 +41,7 @@ fn bench() -> i32 {{
   let mut s = {seed};
   let mut i = 0;
   while i < {n} {{
-    s = ((s * 1664525 + (i * 1013904223) + 97) % 2147483647);
+    s = s * 1664525 + (i * 1013904223) + 97;
     i = i + 1;
   }}
   s
@@ -56,7 +61,11 @@ fn bench() -> i32 {{
             let mut unit = CompileUnit::new(format!("<bench:{sample}:{i}>"), &jules_src);
             let result = pipeline.run(&mut unit);
             if unit.has_errors() {
-                eprintln!("compile diagnostics: {} => {:?}", unit.diags.len(), unit.diags);
+                eprintln!(
+                    "compile diagnostics: {} => {:?}",
+                    unit.diags.len(),
+                    unit.diags
+                );
                 std::process::exit(1);
             }
             if i + 1 == iters && sample + 1 == samples {
@@ -94,43 +103,24 @@ fn bench() -> i32 {{
 
     // Jules runtime benchmark
     let mut interp = jules::interp::Interpreter::new();
-    let mut using_jit = matches!(mode, BenchMode::FullJit);
+    let mut using_jit = matches!(mode, BenchMode::FullJit | BenchMode::NativeJit);
+    let using_native_jit = matches!(mode, BenchMode::NativeJit) && native_jit_available();
+    if matches!(mode, BenchMode::NativeJit) && !using_native_jit {
+        eprintln!("native JIT probe failed; falling back to VM JIT for this benchmark process.");
+    }
     interp.set_jit_enabled(using_jit);
     interp.set_advance_jit_enabled(using_jit);
+    interp.set_native_jit_enabled(using_native_jit);
     interp.load_program(&program.expect("program should exist"));
     interp.reset_jit_counters();
-    let mut check_jules = match interp.call_fn("bench", vec![]) {
-        Ok(jules::interp::Value::I64(v)) => v,
-        Ok(jules::interp::Value::I32(v)) => v as i64,
-        Ok(jules::interp::Value::Unit) => {
-            i64::MIN
-        }
-        Ok(v) => {
-            eprintln!("unexpected return value from jules kernel: {v:?}");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("runtime error: {}", e.message);
-            std::process::exit(1);
-        }
-    };
+    let mut check_jules = call_bench_i64(&mut interp);
     if check_jules == i64::MIN && using_jit {
         eprintln!("JIT path returned Unit for `bench`; retrying benchmark on interpreter path.");
         using_jit = false;
         interp.set_jit_enabled(false);
         interp.set_advance_jit_enabled(false);
-        check_jules = match interp.call_fn("bench", vec![]) {
-            Ok(jules::interp::Value::I64(v)) => v,
-            Ok(jules::interp::Value::I32(v)) => v as i64,
-            Ok(v) => {
-                eprintln!("unexpected return value from jules kernel: {v:?}");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("runtime error: {}", e.message);
-                std::process::exit(1);
-            }
-        };
+        interp.set_native_jit_enabled(false);
+        check_jules = call_bench_i64(&mut interp);
     }
     let check_rust = rust_kernel(n, seed);
     if check_jules != check_rust {
@@ -145,22 +135,8 @@ fn bench() -> i32 {{
     for _ in 0..samples {
         let run_start = Instant::now();
         for _ in 0..iters {
-            match interp.call_fn("bench", vec![]) {
-                Ok(jules::interp::Value::I64(v)) => {
-                    jules_checksum = jules_checksum.wrapping_add(black_box(v));
-                }
-                Ok(jules::interp::Value::I32(v)) => {
-                    jules_checksum = jules_checksum.wrapping_add(black_box(v as i64));
-                }
-                Ok(v) => {
-                    eprintln!("unexpected return value from jules kernel: {v:?}");
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("runtime error: {}", e.message);
-                    std::process::exit(1);
-                }
-            }
+            let v = call_bench_i64(&mut interp);
+            jules_checksum = jules_checksum.wrapping_add(black_box(v));
         }
         jules_runtime_s += run_start.elapsed().as_secs_f64();
     }
@@ -225,9 +201,7 @@ fn bench() -> i32 {{
     );
     println!(
         "JIT counters: native={} vm={} fallback={}",
-        jit_native_calls,
-        jit_vm_calls,
-        jit_fallback_calls
+        jit_native_calls, jit_vm_calls, jit_fallback_calls
     );
 }
 
@@ -235,8 +209,65 @@ fn parse_mode(raw: Option<&str>) -> BenchMode {
     match raw {
         Some("aot") | Some("aot-time") => BenchMode::AotTime,
         Some("interp") => BenchMode::FullInterp,
+        Some("native-probe") => BenchMode::NativeProbe,
+        Some("native") | Some("native-jit") | Some("jit-native") => BenchMode::NativeJit,
         Some("jit") => BenchMode::FullJit,
-        _ => BenchMode::FullJit,
+        _ => BenchMode::NativeJit,
+    }
+}
+
+fn native_jit_available() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let status = Command::new(exe)
+        .arg("32")
+        .arg("1")
+        .arg("native-probe")
+        .status();
+    matches!(status, Ok(s) if s.success())
+}
+
+fn run_native_probe() -> i32 {
+    let src = r#"
+fn bench() -> i32 {
+  let mut s = 1;
+  let mut i = 0;
+  while i < 32 {
+    s = s * 1664525 + i + 97;
+    i = i + 1;
+  }
+  s
+}
+"#;
+    let pipeline = Pipeline::new();
+    let mut unit = CompileUnit::new("<native-probe>", src);
+    let program = match pipeline.run(&mut unit) {
+        PipelineResult::Ok(p) if !unit.has_errors() => p,
+        _ => return 2,
+    };
+    let mut interp = jules::interp::Interpreter::new();
+    interp.set_jit_enabled(true);
+    interp.set_advance_jit_enabled(true);
+    interp.set_native_jit_enabled(true);
+    interp.load_program(&program);
+    let _ = interp.call_fn("bench", Vec::new());
+    0
+}
+
+fn call_bench_i64(interp: &mut jules::interp::Interpreter) -> i64 {
+    match interp.call_fn("bench", Vec::new()) {
+        Ok(jules::interp::Value::I64(v)) => v,
+        Ok(jules::interp::Value::I32(v)) => v as i64,
+        Ok(jules::interp::Value::Unit) => i64::MIN,
+        Ok(v) => {
+            eprintln!("unexpected return value from jules kernel: {v:?}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("runtime error: {}", e.message);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -247,8 +278,7 @@ fn rust_kernel(n: usize, seed: i64) -> i64 {
         s = black_box(
             s.wrapping_mul(1_664_525)
                 .wrapping_add(i.wrapping_mul(1_013_904_223))
-                .wrapping_add(97)
-                % 2_147_483_647,
+                .wrapping_add(97),
         );
     }
     black_box(s as i64)
@@ -270,7 +300,6 @@ fn kernel(n: usize, seed: i64) -> i64 {{
             s.wrapping_mul(1_664_525)
                 .wrapping_add(i.wrapping_mul(1_013_904_223))
                 .wrapping_add(97)
-                % 2_147_483_647
         );
     }}
     std::hint::black_box(s as i64)
