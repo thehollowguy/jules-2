@@ -57,6 +57,16 @@ fn main() {
             source: build_ml_source(64),
             run_main: false,
         },
+        Sample {
+            name: "compile+run:prime-sieve",
+            source: build_prime_sieve_source(),
+            run_main: true,
+        },
+        Sample {
+            name: "compile+run:prime-check",
+            source: build_prime_check_source(),
+            run_main: true,
+        },
     ];
 
     for sample in &samples {
@@ -173,7 +183,11 @@ fn percentile(sorted: &[Duration], pct: f64) -> Duration {
 fn print_report(sample: &Sample, report: &SampleReport) {
     println!("== {} ==", sample.name);
     print_timing("compile", &report.compile);
-    print_sla("compile", &report.compile);
+    if sample.name.contains("prime") {
+        print_sla_custom("compile", &report.compile, PRIME_SLA);
+    } else {
+        print_sla("compile", &report.compile);
+    }
     if let Some(runtime) = &report.runtime {
         print_timing("runtime", runtime);
     }
@@ -212,6 +226,22 @@ fn print_sla(label: &str, t: &TimingSummary) {
             "{label}-sla: FAIL (p95 {} > {})",
             fmt_duration(t.p95),
             fmt_duration(COMPILE_SLA)
+        );
+    }
+}
+
+fn print_sla_custom(label: &str, t: &TimingSummary, sla: Duration) {
+    if t.p95 <= sla {
+        println!(
+            "{label}-sla: pass (p95 {} <= {})",
+            fmt_duration(t.p95),
+            fmt_duration(sla)
+        );
+    } else {
+        println!(
+            "{label}-sla: FAIL (p95 {} > {})",
+            fmt_duration(t.p95),
+            fmt_duration(sla)
         );
     }
 }
@@ -262,6 +292,54 @@ fn build_ml_source(width: usize) -> String {
         let a = i;
         let b = (i + 3) % width;
         out.push_str(&format!("  let m{i} = x{a} * x{b} + scale;\n"));
+    }
+    out.push_str("}\n");
+    out
+}
+
+const PRIME_SLA: Duration = Duration::from_millis(2000);
+
+fn build_prime_sieve_source() -> String {
+    // Sieve of Eratosthenes to find primes up to 1000
+    let mut out = String::from("fn main() {\n");
+    out.push_str("  let limit = 1000;\n");
+    out.push_str("  let i = 2;\n");
+    // Simple iterative prime checking
+    out.push_str("  while i < limit {\n");
+    out.push_str("    let is_prime = 1;\n");
+    out.push_str("    let j = 2;\n");
+    out.push_str("    while j < i {\n");
+    out.push_str("      let rem = i - (i / j) * j;\n");
+    out.push_str("      if rem == 0 {\n");
+    out.push_str("        let is_prime = 0;\n");
+    out.push_str("      }\n");
+    out.push_str("      let j = j + 1;\n");
+    out.push_str("    }\n");
+    out.push_str("    if is_prime == 1 {\n");
+    out.push_str("      i;\n");
+    out.push_str("    }\n");
+    out.push_str("    let i = i + 1;\n");
+    out.push_str("  }\n");
+    out.push_str("}\n");
+    out
+}
+
+fn build_prime_check_source() -> String {
+    // Check if specific numbers are prime
+    let mut out = String::from("fn main() {\n");
+    let test_numbers = [97, 101, 103, 107, 109, 113, 127, 131, 137, 139];
+    for num in test_numbers.iter() {
+        out.push_str(&format!("  let n = {num};\n"));
+        out.push_str("  let is_prime = 1;\n");
+        out.push_str("  let i = 2;\n");
+        out.push_str("  while i < n {\n");
+        out.push_str("    let rem = n - (n / i) * i;\n");
+        out.push_str("    if rem == 0 {\n");
+        out.push_str("      let is_prime = 0;\n");
+        out.push_str("    }\n");
+        out.push_str("    let i = i + 1;\n");
+        out.push_str("  }\n");
+        out.push_str("  is_prime;\n");
     }
     out.push_str("}\n");
     out

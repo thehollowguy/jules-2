@@ -488,7 +488,22 @@ pub type LexResult<T> = Result<T, LexError>;
 
 /// Map a bare identifier string to its keyword `TokenKind`, or `None` if it is
 /// a user-defined identifier.
+#[inline]
 fn keyword(s: &str) -> Option<TokenKind> {
+    // Fast-path: all keywords are 2-10 chars, skip the match for anything else
+    let len = s.len();
+    if len < 2 || len > 10 {
+        return None;
+    }
+    // Second fast-path: first char must match a keyword's first char
+    // Keywords starting with unusual letters can be skipped
+    match s.as_bytes()[0] {
+        b'a' | b'b' | b'c' | b'd' | b'e' | b'f' | b'g' | b'i' | b'j'
+        | b'k' | b'l' | b'm' | b'n' | b'o' | b'p' | b'q' | b'r' | b's'
+        | b't' | b'u' | b'v' | b'w' | b'z' => {} // possible keyword
+        _ => return None, // no keyword starts with h, x, y
+    }
+    
     Some(match s {
         // Jules core
         "tensor"    => TokenKind::KwTensor,
@@ -690,6 +705,7 @@ impl<'src> Lexer<'src> {
     }
 
     /// Peek at the character *after* the next one (two-char lookahead).
+    #[inline]
     fn peek2(&mut self) -> Option<char> {
         let mut iter = self.chars.clone();
         iter.next();
@@ -1015,15 +1031,21 @@ impl<'src> Lexer<'src> {
     // ── Identifier / Keyword ──────────────────────────────────────────────
 
     fn lex_ident(&mut self, first: char, start: usize, line: u32, col: u32) -> Token {
-        let mut s = String::new();
+        let mut s = String::with_capacity(16);
         s.push(first);
         while matches!(self.peek(), Some(c) if c.is_alphanumeric() || c == '_') {
             s.push(self.advance().unwrap());
         }
         let span = self.span_from(start, line, col);
-        let raw = s.clone();
-        let kind = keyword(&s).unwrap_or(TokenKind::Ident(s));
-        Token::new(kind, span, raw)
+        // Check if it's a keyword first to avoid unnecessary clone
+        if let Some(kw) = keyword(&s) {
+            Token::new(kw, span, s)  // keyword: move s into raw
+        } else {
+            // Identifier: the string moves into Ident, raw is a clone
+            let raw = s.clone();
+            let kind = TokenKind::Ident(s);
+            Token::new(kind, span, raw)
+        }
     }
 
     // ── Device Attributes (@gpu, @cpu, @tpu, @grad) ───────────────────────

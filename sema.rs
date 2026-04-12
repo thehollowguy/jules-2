@@ -73,7 +73,7 @@
 //   ComponentGraph — per-system read/write sets used for the aliasing check.
 // =============================================================================
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ast::{
     AccessMode, AgentDecl, Attribute, BehaviorRule, Block, ComponentDecl, EntityQuery, Expr,
@@ -207,12 +207,12 @@ impl Binding {
 /// with `use_count == 0` (unless the name starts with `_`).
 #[derive(Debug, Default)]
 struct ScopeStack {
-    scopes: Vec<HashMap<String, Binding>>,
+    scopes: Vec<FxHashMap<String, Binding>>,
 }
 
 impl ScopeStack {
     fn push(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(FxHashMap::default());
     }
 
     /// Pop the innermost scope and return any bindings that were never used.
@@ -369,7 +369,7 @@ enum DeclKind {
 
 #[derive(Debug, Default)]
 struct DeclRegistry {
-    records: HashMap<String, DeclRecord>,
+    records: FxHashMap<String, DeclRecord>,
 }
 
 impl DeclRegistry {
@@ -422,8 +422,8 @@ impl DeclRegistry {
 /// The read / write set for one entity-loop or system.
 #[derive(Debug, Default, Clone)]
 struct ComponentSet {
-    reads: HashSet<String>,
-    writes: HashSet<String>,
+    reads: FxHashSet<String>,
+    writes: FxHashSet<String>,
 }
 
 impl ComponentSet {
@@ -471,11 +471,11 @@ pub struct SemaCtx {
     cf: CfStack,
     decls: DeclRegistry,
     /// All component names declared in the program.
-    components: HashSet<String>,
+    components: FxHashSet<String>,
     /// Per-system component access sets (for aliasing analysis).
     system_sets: Vec<(String, Span, ComponentSet)>,
     /// All agent names that appear in `train` blocks (to warn on unused learning).
-    trained_agents: HashSet<String>,
+    trained_agents: FxHashSet<String>,
     /// Whether to emit shadowing warnings (controlled by a lint flag).
     warn_shadow: bool,
 }
@@ -487,9 +487,9 @@ impl SemaCtx {
             scopes: ScopeStack::default(),
             cf: CfStack::default(),
             decls: DeclRegistry::default(),
-            components: HashSet::new(),
+            components: FxHashSet::default(),
             system_sets: Vec::new(),
-            trained_agents: HashSet::new(),
+            trained_agents: FxHashSet::default(),
             warn_shadow: true,
         }
     }
@@ -758,8 +758,8 @@ impl SemaCtx {
         }
 
         // Duplicate component names within a query are always a mistake.
-        let mut seen_with: HashSet<&str> = HashSet::new();
-        let mut seen_without: HashSet<&str> = HashSet::new();
+        let mut seen_with: FxHashSet<&str> = FxHashSet::default();
+        let mut seen_without: FxHashSet<&str> = FxHashSet::default();
 
         for comp in &q.with {
             if !seen_with.insert(comp.as_str()) {
@@ -834,7 +834,7 @@ impl SemaCtx {
 
     fn analyse_component(&mut self, c: &ComponentDecl) {
         // Field names must be unique within the component.
-        let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen: FxHashSet<&str> = FxHashSet::default();
         for field in &c.fields {
             if !seen.insert(field.name.as_str()) {
                 self.err(
@@ -869,7 +869,7 @@ impl SemaCtx {
 
         // §4b  Behaviour priorities must be unique.
         {
-            let mut seen_prio: HashMap<u32, &str> = HashMap::new();
+            let mut seen_prio: FxHashMap<u32, &str> = FxHashMap::default();
             for rule in &a.behaviors {
                 let prio = rule.priority.0;
                 if let Some(prev) = seen_prio.insert(prio, rule.name.as_str()) {
@@ -1111,7 +1111,7 @@ impl SemaCtx {
 
         // §5f  Reward / penalty signal names must be unique.
         {
-            let mut seen: HashSet<&str> = HashSet::new();
+            let mut seen: FxHashSet<&str> = FxHashSet::default();
             for sig in &t.signals {
                 if !seen.insert(sig.name.as_str()) {
                     self.err(
@@ -1153,7 +1153,7 @@ impl SemaCtx {
 
         // §5i  Hyper-parameter keys must be unique.
         {
-            let mut seen: HashSet<&str> = HashSet::new();
+            let mut seen: FxHashSet<&str> = FxHashSet::default();
             for (key, expr) in &t.hyper {
                 if !seen.insert(key.as_str()) {
                     self.err(

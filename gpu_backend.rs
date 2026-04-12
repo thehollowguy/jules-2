@@ -177,8 +177,8 @@ impl GpuBackendImpl for CpuBackend {
         out: &GpuBufferHandle,
     ) -> Result<(), String> {
         let mut buffers = self.buffers.lock().unwrap();
-        let buf_a = buffers.get(&a.id).cloned().ok_or("Buffer A not found")?;
-        let buf_b = buffers.get(&b.id).cloned().ok_or("Buffer B not found")?;
+        let buf_a = buffers.get(&a.id).ok_or("Buffer A not found")?;
+        let buf_b = buffers.get(&b.id).ok_or("Buffer B not found")?;
 
         let (out_data, out_shape) = batched_matmul(
             &buf_a.data,
@@ -202,11 +202,16 @@ impl GpuBackendImpl for CpuBackend {
         out: &GpuBufferHandle,
     ) -> Result<(), String> {
         let mut buffers = self.buffers.lock().unwrap();
-        let a_buf = buffers.get(&a.id).cloned().ok_or("Buffer A not found")?;
-        let b_buf = buffers.get(&b.id).cloned().ok_or("Buffer B not found")?;
-        if a_buf.data.len() != b_buf.data.len() {
-            return Err("Elementwise op requires equal-sized tensors".into());
-        }
+        let (a_len, a_shape) = {
+            let a_buf = buffers.get(&a.id).ok_or("Buffer A not found")?;
+            let b_buf = buffers.get(&b.id).ok_or("Buffer B not found")?;
+            if a_buf.data.len() != b_buf.data.len() {
+                return Err("Elementwise op requires equal-sized tensors".into());
+            }
+            (a_buf.data.len(), a_buf.shape.clone())
+        };
+        let a_buf = buffers.get(&a.id).unwrap();
+        let b_buf = buffers.get(&b.id).unwrap();
         let out_data: Vec<f32> = a_buf
             .data
             .iter()
@@ -227,7 +232,8 @@ impl GpuBackendImpl for CpuBackend {
             .collect();
         let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
         out_buf.data = out_data;
-        out_buf.shape = a_buf.shape;
+        out_buf.shape.clone_from(&a_shape);
+        let _ = a_len;
         Ok(())
     }
 
@@ -242,11 +248,9 @@ impl GpuBackendImpl for CpuBackend {
         let mut buffers = self.buffers.lock().unwrap();
         let inp = buffers
             .get(&input.id)
-            .cloned()
             .ok_or("Input buffer not found")?;
         let ker = buffers
             .get(&kernel.id)
-            .cloned()
             .ok_or("Kernel buffer not found")?;
         if inp.shape.len() != 2 || ker.shape.len() != 2 {
             return Err("conv2d expects [H,W] input and [KH,KW] kernel".into());
@@ -291,7 +295,6 @@ impl GpuBackendImpl for CpuBackend {
         let mut buffers = self.buffers.lock().unwrap();
         let inp = buffers
             .get(&input.id)
-            .cloned()
             .ok_or("Input buffer not found")?;
         if inp.shape.len() != 2 {
             return Err("pool expects [H,W] input".into());
@@ -336,7 +339,6 @@ impl GpuBackendImpl for CpuBackend {
         let mut buffers = self.buffers.lock().unwrap();
         let inp = buffers
             .get(&input.id)
-            .cloned()
             .ok_or("Input buffer not found")?;
         let mut out_data = inp.data.clone();
         match activation {
@@ -370,9 +372,11 @@ impl GpuBackendImpl for CpuBackend {
             }
             other => return Err(format!("unsupported activation `{other}`")),
         }
+        let inp_shape = inp.shape.clone();
+        let _ = inp; // keep reference alive until end of scope
         let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
         out_buf.data = out_data;
-        out_buf.shape = inp.shape;
+        out_buf.shape.clone_from(&inp_shape);
         Ok(())
     }
 
@@ -658,8 +662,8 @@ impl GpuBackendImpl for WgpuBackend {
         out: &GpuBufferHandle,
     ) -> Result<(), String> {
         let mut buffers = self.buffers.lock().unwrap();
-        let a_buf = buffers.get(&a.id).cloned().ok_or("Buffer A not found")?;
-        let b_buf = buffers.get(&b.id).cloned().ok_or("Buffer B not found")?;
+        let a_buf = buffers.get(&a.id).ok_or("Buffer A not found")?;
+        let b_buf = buffers.get(&b.id).ok_or("Buffer B not found")?;
         let (out_data, out_shape) = batched_matmul(
             &a_buf.data,
             &a_buf.shape,
@@ -680,11 +684,16 @@ impl GpuBackendImpl for WgpuBackend {
         out: &GpuBufferHandle,
     ) -> Result<(), String> {
         let mut buffers = self.buffers.lock().unwrap();
-        let a_buf = buffers.get(&a.id).cloned().ok_or("Buffer A not found")?;
-        let b_buf = buffers.get(&b.id).cloned().ok_or("Buffer B not found")?;
-        if a_buf.data.len() != b_buf.data.len() {
-            return Err("Elementwise op requires equal-sized tensors".into());
-        }
+        let (a_len, a_shape) = {
+            let a_buf = buffers.get(&a.id).ok_or("Buffer A not found")?;
+            let b_buf = buffers.get(&b.id).ok_or("Buffer B not found")?;
+            if a_buf.data.len() != b_buf.data.len() {
+                return Err("Elementwise op requires equal-sized tensors".into());
+            }
+            (a_buf.data.len(), a_buf.shape.clone())
+        };
+        let a_buf = buffers.get(&a.id).unwrap();
+        let b_buf = buffers.get(&b.id).unwrap();
         let out_data: Vec<f32> = a_buf
             .data
             .iter()
@@ -705,7 +714,8 @@ impl GpuBackendImpl for WgpuBackend {
             .collect();
         let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
         out_buf.data = out_data;
-        out_buf.shape = a_buf.shape;
+        out_buf.shape.clone_from(&a_shape);
+        let _ = a_len;
         Ok(())
     }
 
@@ -720,11 +730,9 @@ impl GpuBackendImpl for WgpuBackend {
         let mut buffers = self.buffers.lock().unwrap();
         let inp = buffers
             .get(&input.id)
-            .cloned()
             .ok_or("Input buffer not found")?;
         let ker = buffers
             .get(&kernel.id)
-            .cloned()
             .ok_or("Kernel buffer not found")?;
         if inp.shape.len() != 2 || ker.shape.len() != 2 {
             return Err("conv2d expects [H,W] input and [KH,KW] kernel".into());
@@ -769,7 +777,6 @@ impl GpuBackendImpl for WgpuBackend {
         let mut buffers = self.buffers.lock().unwrap();
         let inp = buffers
             .get(&input.id)
-            .cloned()
             .ok_or("Input buffer not found")?;
         if inp.shape.len() != 2 {
             return Err("pool expects [H,W] input".into());
@@ -814,7 +821,6 @@ impl GpuBackendImpl for WgpuBackend {
         let mut buffers = self.buffers.lock().unwrap();
         let inp = buffers
             .get(&input.id)
-            .cloned()
             .ok_or("Input buffer not found")?;
         let mut out_data = inp.data.clone();
         match activation {
@@ -848,9 +854,11 @@ impl GpuBackendImpl for WgpuBackend {
             }
             other => return Err(format!("unsupported activation `{other}`")),
         }
+        let inp_shape = inp.shape.clone();
+        let _ = inp; // keep reference alive until end of scope
         let out_buf = buffers.get_mut(&out.id).ok_or("Output buffer not found")?;
         out_buf.data = out_data;
-        out_buf.shape = inp.shape;
+        out_buf.shape.clone_from(&inp_shape);
         Ok(())
     }
 

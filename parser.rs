@@ -83,19 +83,23 @@ impl Parser {
 
     // ── Token access ──────────────────────────────────────────────────────────
 
+    #[inline(always)]
     fn peek(&self) -> &Token {
         &self.tokens[self.pos.min(self.tokens.len() - 1)]
     }
 
+    #[inline(always)]
     fn peek2(&self) -> &Token {
         let idx = (self.pos + 1).min(self.tokens.len() - 1);
         &self.tokens[idx]
     }
 
+    #[inline(always)]
     fn current_span(&self) -> Span {
         self.peek().span
     }
 
+    #[inline(always)]
     fn advance(&mut self) -> &Token {
         let tok = &self.tokens[self.pos.min(self.tokens.len() - 1)];
         if !matches!(tok.kind, TokenKind::Eof) {
@@ -104,20 +108,24 @@ impl Parser {
         tok
     }
 
+    #[inline(always)]
     fn at_eof(&self) -> bool {
         matches!(self.peek().kind, TokenKind::Eof)
     }
 
+    #[inline(always)]
     fn check(&self, kind: &TokenKind) -> bool {
         std::mem::discriminant(&self.peek().kind) == std::mem::discriminant(kind)
     }
 
     /// True when the current token matches `kind` exactly (including payload
     /// for keyword tokens, which carry no payload anyway).
+    #[inline(always)]
     fn is(&self, kind: &TokenKind) -> bool {
         &self.peek().kind == kind
     }
 
+    #[inline(always)]
     fn eat(&mut self, kind: &TokenKind) -> bool {
         if self.is(kind) {
             self.advance();

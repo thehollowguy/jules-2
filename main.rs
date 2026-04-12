@@ -1,7 +1,13 @@
 // Module declarations for the Jules compiler/interpreter.
 // In this repository layout the source files live in the crate root.
+#[allow(dead_code)]
+#[allow(unused_variables)]
+#[allow(unused_macros)]
+#[allow(clippy::drop_ref)]
+mod advanced_optimizer;
 mod ast;
 mod borrowck;
+mod bytecode_vm;
 mod ffi;
 mod game_systems;
 mod gpu_backend;
@@ -27,6 +33,10 @@ pub mod networking;
 pub mod profiling_tools;
 pub mod scene_editor;
 pub mod shader_tooling;
+
+// Standard library — game dev, ML, simulation.
+#[allow(clippy::manual_retain)]
+mod jules_std;
 
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write as FmtWrite;
@@ -488,6 +498,8 @@ pub struct Pipeline {
     pub quiet: bool,
     pub emit_ir: bool,
     pub profile: bool,
+    pub opt_level: u8, // 0=none, 1=fast_compile, 2=balanced, 3=maximum
+    pub print_opt_stats: bool,
 }
 
 impl Pipeline {
@@ -497,6 +509,8 @@ impl Pipeline {
             quiet: false,
             emit_ir: false,
             profile: false,
+            opt_level: 2, // balanced by default
+            print_opt_stats: false,
         }
     }
 
@@ -520,7 +534,7 @@ impl Pipeline {
 
         // ── Pass 2: Parse ─────────────────────────────────────────────────────
         let mut parser = crate::parser::Parser::new(tokens);
-        let program = parser.parse_program();
+        let mut program = parser.parse_program();
 
         for e in parser.errors {
             unit.diags.push(parse_error_to_diag(e));
@@ -557,6 +571,27 @@ impl Pipeline {
         }
         if unit.has_errors() {
             return PipelineResult::HaltedAt(PassName::BorrowCheck);
+        }
+
+        // ── Pass 6: Superoptimizer ──────────────────────────────────────────
+        // Runs the full AST-level superoptimizer: constant folding, SCCP,
+        // algebraic simplification (50+ rules), strength reduction, CSE,
+        // dead code elimination, dead store elimination, peephole, loop
+        // invariant code motion, function inlining, branch optimization.
+        if self.opt_level >= 1 {
+            let config = match self.opt_level {
+                1 => crate::advanced_optimizer::SuperoptimizerConfig::fast_compile(),
+                2 => crate::advanced_optimizer::SuperoptimizerConfig::balanced(),
+                _ => crate::advanced_optimizer::SuperoptimizerConfig::maximum(),
+            };
+            let mut superopt = crate::advanced_optimizer::Superoptimizer::new(config);
+            superopt.optimize_program(&mut program);
+            if self.print_opt_stats && self.opt_level >= 2 {
+                eprintln!("[opt] const_folds={} cse={} dce={} inline={} unroll={} dead_fn={} licm={}",
+                    superopt.constant_folds, superopt.cse_eliminations, superopt.dead_code_eliminated,
+                    superopt.inlinings, superopt.loop_unrollings, superopt.dead_functions_eliminated,
+                    superopt.licm_hoists);
+            }
         }
 
         // ── Promote warnings to errors if requested ───────────────────────────
@@ -753,6 +788,8 @@ pub struct CliArgs {
     pub emit_tokens: bool,
     pub warn_as_error: bool,
     pub quiet: bool,
+    pub opt_level: u8,
+    pub print_opt_stats: bool,
     pub tab_width: usize,
     pub entry: String, // --entry <fn>  for jules run
     pub train: bool,   // jules train
@@ -792,6 +829,7 @@ impl CliArgs {
             color: std::env::var("NO_COLOR").is_err(), // respect NO_COLOR
             tab_width: 4,
             entry: "main".into(),
+            opt_level: 2, // balanced optimization by default
             estimate_params: 1_000_000,
             estimate_batch: 64,
             estimate_episodes: 100_000,
@@ -960,6 +998,21 @@ impl CliArgs {
                     if out.ml_backend != "jules" && out.ml_backend != "jax" {
                         return Err("--ml-backend must be `jules` or `jax`".into());
                     }
+                }
+                "-O0" | "--opt=0" => {
+                    out.opt_level = 0;
+                }
+                "-O1" | "--opt=1" => {
+                    out.opt_level = 1;
+                }
+                "-O2" | "--opt=2" => {
+                    out.opt_level = 2;
+                }
+                "-O3" | "-O" | "--opt=3" | "--opt=maximum" => {
+                    out.opt_level = 3;
+                }
+                "--stats" | "--print-opt-stats" => {
+                    out.print_opt_stats = true;
                 }
                 "--jax-ir" => {
                     out.jax_ir = Some(PathBuf::from(it.next().ok_or("--jax-ir requires a path")?));
@@ -1586,6 +1639,8 @@ fn cmd_fix(args: &CliArgs) -> i32 {
     let filename = path.to_string_lossy();
     let mut unit = CompileUnit::new(filename.as_ref(), &source);
     let mut pipeline = Pipeline::new();
+    pipeline.opt_level = args.opt_level;
+    pipeline.print_opt_stats = args.print_opt_stats;
     pipeline.quiet = true;
     let _ = pipeline.run(&mut unit);
 
@@ -1657,6 +1712,8 @@ fn cmd_check(args: &CliArgs) -> i32 {
     let mut unit = CompileUnit::new(filename.as_ref(), &source);
 
     let mut pipeline = Pipeline::new();
+    pipeline.opt_level = args.opt_level;
+    pipeline.print_opt_stats = args.print_opt_stats;
     pipeline.warn_as_error = args.warn_as_error;
     pipeline.quiet = args.quiet;
     pipeline.run(&mut unit);
@@ -1748,6 +1805,8 @@ fn cmd_run(args: &CliArgs) -> i32 {
     let mut unit = CompileUnit::new(filename.as_ref(), &source);
 
     let mut pipeline = Pipeline::new();
+    pipeline.opt_level = args.opt_level;
+    pipeline.print_opt_stats = args.print_opt_stats;
     pipeline.warn_as_error = args.warn_as_error;
     pipeline.quiet = args.quiet;
 
@@ -2020,6 +2079,8 @@ fn cmd_train(args: &CliArgs) -> i32 {
     let mut unit = CompileUnit::new(filename.as_ref(), &source);
 
     let mut pipeline = Pipeline::new();
+    pipeline.opt_level = args.opt_level;
+    pipeline.print_opt_stats = args.print_opt_stats;
     pipeline.warn_as_error = args.warn_as_error;
     pipeline.quiet = args.quiet;
     let result = pipeline.run(&mut unit);

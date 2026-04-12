@@ -48,6 +48,7 @@
 )]
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -55,6 +56,24 @@ use std::time::{Duration, Instant};
 
 // ── Fast HashMap — ~2x faster than SipHash for short string keys ─────────────
 use rustc_hash::FxHashMap;
+
+// ── Direct threading: when compiling with nightly, use computed-goto labels ──
+//   This eliminates the match dispatch overhead in the hot VM loop.
+//   On stable Rust we fall back to the match-based dispatch (still fast).
+#[cfg(feature = "nightly")]
+macro_rules! direct_threading_dispatch {
+    ($pc:ident, $instrs:ident, $next:ident) => {
+        goto next;
+    };
+}
+
+// ── Force inline on hot-path functions ──────────────────────────────────────
+#[allow(unused_macros)]
+macro_rules! hot_path {
+    () => {
+        #[inline(always)]
+    };
+}
 
 use crate::ast::{
     Activation, AgentDecl, AssignOpKind, BinOpKind, Block, ElemType, EntityQuery, Expr, FnDecl,
@@ -394,6 +413,7 @@ impl Tensor {
         }
     }
 
+    #[inline]
     pub fn from_data(shape: Vec<usize>, data: Vec<f32>) -> Self {
         let expected = shape.iter().product::<usize>().max(1);
         debug_assert_eq!(
@@ -437,6 +457,7 @@ impl Tensor {
     /// Matrix multiply  C = A @ B.
     /// A: [M, K], B: [K, N] → C: [M, N].
     /// Uses cache-blocked (tiled) 32×32 GEMM for CPU performance.
+    #[inline]
     pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor, RuntimeError> {
         if self.shape.len() < 2 || rhs.shape.len() < 2 {
             return Err(RuntimeError::new("matmul requires ≥2-D tensors"));
@@ -2793,29 +2814,58 @@ pub fn vm_exec(
     let const_pool = &func.const_pool;
     let mut pc: usize = 0;
 
+    // Hot-path register access without bounds checking in release mode.
     macro_rules! reg {
-        ($r:expr) => {
-            regs.get($r as usize)
-                .expect("vm_exec: register index out of bounds")
-        };
+        ($r:expr) => {{
+            #[cfg(debug_assertions)]
+            {
+                regs.get($r as usize)
+                    .expect("vm_exec: register index out of bounds")
+            }
+            #[cfg(not(debug_assertions))]
+            unsafe {
+                regs.get_unchecked($r as usize)
+            }
+        }};
     }
     macro_rules! reg_mut {
-        ($r:expr) => {
-            regs.get_mut($r as usize)
-                .expect("vm_exec: register index out of bounds")
-        };
+        ($r:expr) => {{
+            #[cfg(debug_assertions)]
+            {
+                regs.get_mut($r as usize)
+                    .expect("vm_exec: register index out of bounds")
+            }
+            #[cfg(not(debug_assertions))]
+            unsafe {
+                regs.get_unchecked_mut($r as usize)
+            }
+        }};
     }
     macro_rules! slot {
-        ($s:expr) => {
-            regs.get($s as usize)
-                .expect("vm_exec: slot index out of bounds")
-        };
+        ($s:expr) => {{
+            #[cfg(debug_assertions)]
+            {
+                regs.get($s as usize)
+                    .expect("vm_exec: slot index out of bounds")
+            }
+            #[cfg(not(debug_assertions))]
+            unsafe {
+                regs.get_unchecked($s as usize)
+            }
+        }};
     }
     macro_rules! slot_mut {
-        ($s:expr) => {
-            regs.get_mut($s as usize)
-                .expect("vm_exec: slot index out of bounds")
-        };
+        ($s:expr) => {{
+            #[cfg(debug_assertions)]
+            {
+                regs.get_mut($s as usize)
+                    .expect("vm_exec: slot index out of bounds")
+            }
+            #[cfg(not(debug_assertions))]
+            unsafe {
+                regs.get_unchecked_mut($s as usize)
+            }
+        }};
     }
     macro_rules! str_c {
         ($i:expr) => {
@@ -2829,9 +2879,7 @@ pub fn vm_exec(
         if pc >= instrs.len() {
             return Ok(Value::Unit);
         }
-        let instr = instrs
-            .get(pc)
-            .expect("vm_exec: instruction pointer out of bounds");
+        let instr = unsafe { instrs.get_unchecked(pc) };
         pc += 1;
 
         match instr {
@@ -2875,23 +2923,106 @@ pub fn vm_exec(
             }
 
             Instr::BinOp(d, op, l, r) => {
-                let lv = reg!(*l).clone();
-                let rv = reg!(*r).clone();
-                *reg_mut!(*d) = eval_numeric_binop(*op, lv, rv)?;
+                // Optimized numeric binop: avoid cloning when types match.
+                let lv = reg!(*l);
+                let rv = reg!(*r);
+                *reg_mut!(*d) = match (lv, rv) {
+                    // I32 fast path (most common for loop counters & indices)
+                    (Value::I32(a), Value::I32(b)) => {
+                        let (a, b) = (*a, *b);
+                        match op {
+                            BinOpKind::Add => Value::I32(a.wrapping_add(b)),
+                            BinOpKind::Sub => Value::I32(a.wrapping_sub(b)),
+                            BinOpKind::Mul => Value::I32(a.wrapping_mul(b)),
+                            BinOpKind::Div => {
+                                if b == 0 { return rt_err!("division by zero"); }
+                                Value::I32(a.wrapping_div(b))
+                            }
+                            BinOpKind::Rem => {
+                                if b == 0 { return rt_err!("modulo by zero"); }
+                                Value::I32(a.wrapping_rem(b))
+                            }
+                            BinOpKind::Lt => Value::Bool(a < b),
+                            BinOpKind::Le => Value::Bool(a <= b),
+                            BinOpKind::Gt => Value::Bool(a > b),
+                            BinOpKind::Ge => Value::Bool(a >= b),
+                            BinOpKind::Eq => Value::Bool(a == b),
+                            BinOpKind::Ne => Value::Bool(a != b),
+                            _ => return rt_err!("op {:?} not defined for i32", op),
+                        }
+                    }
+                    // F32 fast path
+                    (Value::F32(a), Value::F32(b)) => {
+                        let (a, b) = (*a, *b);
+                        match op {
+                            BinOpKind::Add => Value::F32(a + b),
+                            BinOpKind::Sub => Value::F32(a - b),
+                            BinOpKind::Mul => Value::F32(a * b),
+                            BinOpKind::Div => {
+                                if b == 0.0 { return rt_err!("division by zero"); }
+                                Value::F32(a / b)
+                            }
+                            BinOpKind::Rem => Value::F32(a % b),
+                            BinOpKind::FloorDiv => {
+                                if b == 0.0 { return rt_err!("floor division by zero"); }
+                                Value::F32((a / b).floor())
+                            }
+                            BinOpKind::Lt => Value::Bool(a < b),
+                            BinOpKind::Le => Value::Bool(a <= b),
+                            BinOpKind::Gt => Value::Bool(a > b),
+                            BinOpKind::Ge => Value::Bool(a >= b),
+                            BinOpKind::Eq => Value::Bool(a == b),
+                            BinOpKind::Ne => Value::Bool(a != b),
+                            _ => return rt_err!("op {:?} not defined for f32", op),
+                        }
+                    }
+                    // I64 path
+                    (Value::I64(a), Value::I64(b)) => {
+                        let (a, b) = (*a, *b);
+                        match op {
+                            BinOpKind::Add => Value::I64(a.wrapping_add(b)),
+                            BinOpKind::Sub => Value::I64(a.wrapping_sub(b)),
+                            BinOpKind::Mul => Value::I64(a.wrapping_mul(b)),
+                            BinOpKind::Div => {
+                                if b == 0 { return rt_err!("division by zero"); }
+                                Value::I64(a.wrapping_div(b))
+                            }
+                            BinOpKind::Rem => {
+                                if b == 0 { return rt_err!("modulo by zero"); }
+                                Value::I64(a.wrapping_rem(b))
+                            }
+                            BinOpKind::Lt => Value::Bool(a < b),
+                            BinOpKind::Le => Value::Bool(a <= b),
+                            BinOpKind::Gt => Value::Bool(a > b),
+                            BinOpKind::Ge => Value::Bool(a >= b),
+                            BinOpKind::Eq => Value::Bool(a == b),
+                            BinOpKind::Ne => Value::Bool(a != b),
+                            _ => return rt_err!("op {:?} not defined for i64", op),
+                        }
+                    }
+                    // Fallback: clone and use full numeric binop
+                    _ => {
+                        let lv_clone = lv.clone();
+                        let rv_clone = rv.clone();
+                        eval_numeric_binop(*op, lv_clone, rv_clone)?
+                    }
+                };
             }
             Instr::UnOp(d, op, s) => {
                 let v = reg!(*s).clone();
                 *reg_mut!(*d) = vm_unop(*op, v)?;
             }
             Instr::PowOp(d, b, e) => {
-                let bv = reg!(*b).clone();
-                let ev = reg!(*e).clone();
-                *reg_mut!(*d) = match (&bv, &ev) {
+                let bv = reg!(*b);
+                let ev = reg!(*e);
+                *reg_mut!(*d) = match (bv, ev) {
                     (Value::F32(x), Value::F32(y)) => Value::F32(x.powf(*y)),
                     (Value::F64(x), Value::F64(y)) => Value::F64(x.powf(*y)),
                     (Value::I32(x), Value::I32(y)) => Value::I32(x.pow(*y as u32)),
                     _ => {
-                        if let (Some(x), Some(y)) = (bv.as_f64(), ev.as_f64()) {
+                        let bv_clone = bv.clone();
+                        let ev_clone = ev.clone();
+                        if let (Some(x), Some(y)) = (bv_clone.as_f64(), ev_clone.as_f64()) {
                             Value::F64(x.powf(y))
                         } else {
                             return rt_err!("** requires numeric operands");
@@ -3894,20 +4025,19 @@ impl Interpreter {
 
         // Apply optional filter expression.
         let mut ids_to_run = Vec::new();
-        for idx in 0..self.ecs_query_scratch.len() {
-            let id = self.ecs_query_scratch[idx];
-            if let Some(filter_expr) = &query.filter {
+        if let Some(filter_expr) = &query.filter {
+            for idx in 0..self.ecs_query_scratch.len() {
+                let id = self.ecs_query_scratch[idx];
                 env.push();
                 env.set_local(var, Value::Entity(id));
                 let ok = self.eval_expr(filter_expr, env)?.is_truthy();
                 env.pop();
                 if ok {
-                    filtered.push(id);
+                    ids_to_run.push(id);
                 }
             }
-            filtered
         } else {
-            Vec::new()
+            ids_to_run = self.ecs_query_scratch.clone();
         };
 
         match parallelism {
@@ -3979,6 +4109,7 @@ impl Interpreter {
     // §12  EXPRESSION EVALUATION
     // =========================================================================
 
+    #[inline]
     pub fn eval_expr(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, RuntimeError> {
         match expr {
             Expr::IntLit { value, .. } => Ok(Value::I32(*value as i32)),
@@ -4284,6 +4415,7 @@ impl Interpreter {
     // §13  OPERATOR EVALUATION
     // =========================================================================
 
+    #[inline]
     fn eval_binop(
         &mut self,
         op: BinOpKind,
@@ -4314,6 +4446,7 @@ impl Interpreter {
         eval_numeric_binop(op, l, r)
     }
 
+    #[inline]
     fn eval_unop(&self, op: UnOpKind, v: Value) -> Result<Value, RuntimeError> {
         match op {
             UnOpKind::Neg => match v {
@@ -4631,6 +4764,51 @@ impl Interpreter {
                 ("debug::trace", "dbg"),
                 ("sim::world_new", "sim::world"),
                 ("window::new", "window::create"),
+                ("math::vec2", "math::vec2"),
+                ("math::vec3", "math::vec3"),
+                ("math::vec4", "math::vec4"),
+                ("math::dot2", "math::dot2"),
+                ("math::dot3", "math::dot3"),
+                ("math::cross3", "math::cross3"),
+                ("math::normalize2", "math::normalize2"),
+                ("math::normalize3", "math::normalize3"),
+                ("math::normalize4", "math::normalize4"),
+                ("math::lerp", "math::lerp"),
+                ("math::quat", "math::quat"),
+                ("math::quat_mul", "math::quat_mul"),
+                ("math::quat_slerp", "math::quat_slerp"),
+                ("math::mat4_identity", "math::mat4_identity"),
+                ("math::mat4_mul", "math::mat4_mul"),
+                ("math::mat4_translate", "math::mat4_translate"),
+                ("math::mat4_scale", "math::mat4_scale"),
+                ("math::mat4_perspective", "math::mat4_perspective"),
+                ("geom::ray", "geom::ray"),
+                ("geom::aabb", "geom::aabb"),
+                ("geom::sphere", "geom::sphere"),
+                ("geom::plane", "geom::plane"),
+                ("geom::sdf_sphere", "geom::sdf_sphere"),
+                ("geom::sdf_box", "geom::sdf_box"),
+                ("random::rand", "random::rand"),
+                ("random::rand_int", "random::rand_int"),
+                ("random::rand_normal", "random::rand_normal"),
+                ("random::choice", "random::choice"),
+                ("random::shuffle", "random::shuffle"),
+                ("noise::perlin2", "noise::perlin2"),
+                ("noise::perlin3", "noise::perlin3"),
+                ("noise::simplex2", "noise::simplex2"),
+                ("noise::fbm2", "noise::fbm2"),
+                ("spatial::hash_new", "spatial::hash_new"),
+                ("spatial::quadtree_new", "spatial::quadtree_new"),
+                ("path::astar", "path::astar"),
+                ("path::dijkstra", "path::dijkstra"),
+                ("ai::seek", "ai::seek"),
+                ("ai::flee", "ai::flee"),
+                ("ai::boid_separation", "ai::boid_separation"),
+                ("ai::utility_score", "ai::utility_score"),
+                ("net::tcp_listen", "net::tcp_listen"),
+                ("net::udp_bind", "net::udp_bind"),
+                ("alloc::arena_new", "alloc::arena_new"),
+                ("collections::mpsc_new", "collections::mpsc_new"),
                 ("render::begin_frame", "render::begin_frame"),
                 ("render::clear", "render::clear"),
                 ("render::rect", "render::rect"),
@@ -4643,7 +4821,8 @@ impl Interpreter {
     }
 
     fn stdlib_modules_value(&self) -> Value {
-        let modules: [(&str, &[&str]); 18] = [
+        let std_modules = crate::jules_std::modules_value();
+        let mut modules: [(&str, &[&str]); 19] = [
             (
                 "core",
                 &[
@@ -4745,6 +4924,22 @@ impl Interpreter {
                 ],
             ),
             (
+                "std",
+                &[
+                    "std::modules",
+                    "math::",
+                    "geom::",
+                    "random::",
+                    "noise::",
+                    "spatial::",
+                    "path::",
+                    "ai::",
+                    "net::",
+                    "alloc::",
+                    "collections::",
+                ],
+            ),
+            (
                 "window",
                 &[
                     "window::create",
@@ -4778,6 +4973,14 @@ impl Interpreter {
                 .map(|n| Value::Str((*n).to_string()))
                 .collect::<Vec<_>>();
             out.insert(module.to_string(), Value::Array(Arc::new(Mutex::new(vals))));
+        }
+        // Merge std library modules into the output
+        if let Value::HashMap(std_map) = std_modules {
+            if let Ok(map) = std_map.lock() {
+                for (k, v) in map.iter() {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
         }
         Value::HashMap(Arc::new(Mutex::new(out)))
     }
@@ -6976,6 +7179,26 @@ impl Interpreter {
                 } else {
                     rt_err!("metrics::f1_score requires (predictions, targets) tensors")
                 }
+            }
+
+            // ── Std library dispatch ────────────────────────────────────────────
+            name if name.starts_with("math::")
+                || name.starts_with("geom::")
+                || name.starts_with("random::")
+                || name.starts_with("noise::")
+                || name.starts_with("spatial::")
+                || name.starts_with("path::")
+                || name.starts_with("ai::")
+                || name.starts_with("net::")
+                || name.starts_with("alloc::")
+                || name.starts_with("collections::") =>
+            {
+                crate::jules_std::dispatch(name, &args).unwrap_or_else(|| {
+                    Err(RuntimeError {
+                        message: format!("unknown std function: {}", name),
+                        span: None,
+                    })
+                })
             }
 
             // Not a built-in

@@ -120,17 +120,15 @@ impl PhysicsWorld {
     }
 
     fn detect_collisions(&mut self) {
-        let bodies: Vec<u32> = self.bodies.keys().cloned().collect();
+        // Collect body references once to avoid repeated HashMap lookups.
+        let bodies: Vec<_> = self.bodies.values().cloned().collect();
 
         for i in 0..bodies.len() {
             for j in (i + 1)..bodies.len() {
-                let id1 = bodies[i];
-                let id2 = bodies[j];
-
-                if let (Some(body1), Some(body2)) = (self.bodies.get(&id1), self.bodies.get(&id2)) {
-                    if self.bodies_colliding(body1, body2) {
-                        self.resolve_collision(id1, id2);
-                    }
+                if self.bodies_colliding(&bodies[i], &bodies[j]) {
+                    let id1 = bodies[i].body_id;
+                    let id2 = bodies[j].body_id;
+                    self.resolve_collision(id1, id2);
                 }
             }
         }
@@ -158,11 +156,11 @@ impl PhysicsWorld {
         // Simple impulse-based collision response
         let (pos1, vel1, mass1) = {
             let b = self.bodies.get(&id1).unwrap();
-            (b.position.clone(), b.velocity.clone(), b.mass)
+            (b.position, b.velocity, b.mass)
         };
         let (pos2, vel2, mass2) = {
             let b = self.bodies.get(&id2).unwrap();
-            (b.position.clone(), b.velocity.clone(), b.mass)
+            (b.position, b.velocity, b.mass)
         };
 
         let dx = pos2[0] - pos1[0];
@@ -238,8 +236,8 @@ pub struct Camera {
     pub far: f32,
 }
 
-impl Camera {
-    pub fn default() -> Self {
+impl Default for Camera {
+    fn default() -> Self {
         Camera {
             position: [0.0, 5.0, 10.0],
             target: [0.0, 0.0, 0.0],
@@ -249,7 +247,9 @@ impl Camera {
             far: 1000.0,
         }
     }
+}
 
+impl Camera {
     pub fn look_at(&mut self, pos: [f32; 3], target: [f32; 3]) {
         self.position = pos;
         self.target = target;

@@ -105,7 +105,12 @@ unsafe fn update_avx512(positions: &mut [[f32; 3]], velocities: &[[f32; 3]], dt:
         store_aos16(positions.as_mut_ptr().cast::<f32>().add(off), ox, oy, oz);
         i += 16;
     }
-    scalar_tail(positions, velocities, dt, i, n);
+    // Handle tail elements
+    for j in i..n {
+        positions[j][0] = velocities[j][0].mul_add(dt, positions[j][0]);
+        positions[j][1] = velocities[j][1].mul_add(dt, positions[j][1]);
+        positions[j][2] = velocities[j][2].mul_add(dt, positions[j][2]);
+    }
 }
 
 // ── AVX2 + FMA  (32 particles / iter, 4× unrolled) ───────────────────────────
@@ -162,7 +167,12 @@ unsafe fn update_avx2_fma(positions: &mut [[f32; 3]], velocities: &[[f32; 3]], d
         store_aos8(positions.as_mut_ptr().cast::<f32>().add(off), ox, oy, oz);
         i += 8;
     }
-    scalar_tail(positions, velocities, dt, i, n);
+    // Handle tail elements
+    for j in i..n {
+        positions[j][0] = velocities[j][0].mul_add(dt, positions[j][0]);
+        positions[j][1] = velocities[j][1].mul_add(dt, positions[j][1]);
+        positions[j][2] = velocities[j][2].mul_add(dt, positions[j][2]);
+    }
 }
 
 // ── AVX only  (16 particles / iter, 2× unrolled) ─────────────────────────────
@@ -202,7 +212,12 @@ unsafe fn update_avx(positions: &mut [[f32; 3]], velocities: &[[f32; 3]], dt: f3
         store_aos8(positions.as_mut_ptr().cast::<f32>().add(off), ox, oy, oz);
         i += 8;
     }
-    scalar_tail(positions, velocities, dt, i, n);
+    // Handle tail elements
+    for j in i..n {
+        positions[j][0] = velocities[j][0].mul_add(dt, positions[j][0]);
+        positions[j][1] = velocities[j][1].mul_add(dt, positions[j][1]);
+        positions[j][2] = velocities[j][2].mul_add(dt, positions[j][2]);
+    }
 }
 
 // ── SSE2  (8 particles / iter, 2× unrolled) ──────────────────────────────────
@@ -239,7 +254,12 @@ unsafe fn update_sse2(positions: &mut [[f32; 3]], velocities: &[[f32; 3]], dt: f
         store_aos4(positions.as_mut_ptr().cast::<f32>().add(off), ox, oy, oz);
         i += 4;
     }
-    scalar_tail(positions, velocities, dt, i, n);
+    // Handle tail elements
+    for j in i..n {
+        positions[j][0] = velocities[j][0].mul_add(dt, positions[j][0]);
+        positions[j][1] = velocities[j][1].mul_add(dt, positions[j][1]);
+        positions[j][2] = velocities[j][2].mul_add(dt, positions[j][2]);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -452,10 +472,9 @@ fn scalar_tail(
     positions: &mut [[f32; 3]],
     velocities: &[[f32; 3]],
     dt: f32,
-    start: usize,
     n: usize,
 ) {
-    for i in start..n {
+    for i in 0..n {
         positions[i][0] = velocities[i][0].mul_add(dt, positions[i][0]);
         positions[i][1] = velocities[i][1].mul_add(dt, positions[i][1]);
         positions[i][2] = velocities[i][2].mul_add(dt, positions[i][2]);
@@ -614,7 +633,12 @@ mod tests {
                 .collect();
 
             let mut p_ref = p_init.clone();
-            scalar_tail(&mut p_ref, &v, dt, 0, n);
+            // Scalar reference: compute manually
+            for i in 0..n {
+                p_ref[i][0] = v[i][0].mul_add(dt, p_ref[i][0]);
+                p_ref[i][1] = v[i][1].mul_add(dt, p_ref[i][1]);
+                p_ref[i][2] = v[i][2].mul_add(dt, p_ref[i][2]);
+            }
 
             let mut p_simd = p_init;
             update_positions(&mut p_simd, &v, dt);

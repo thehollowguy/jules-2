@@ -44,20 +44,34 @@ serde_json = "1.0"
 clap = { version = "4", features = ["derive"] }
 colored = "2"
 rustyline = "12"
-rustc-hash = "1"
+rustc-hash = "2"
 rayon = "1"
+bumpalo = "3.14"
+smallvec = { version = "1", features = ["union", "const_generics"] }
+ahash = "0.8"
+memmap2 = "0.9"
+cranelift-codegen = { version = "0.110", optional = true }
+cranelift-module = { version = "0.110", optional = true }
+cranelift-jit = { version = "0.110", optional = true }
+region = "3.0"
 
 [features]
 default = ["ffi-c", "phase1", "phase2", "phase3-jit"]
 python = ["pyo3", "numpy"]
 ffi-c = []
+nightly = []
 phase1 = []
 phase2 = []
-phase3-jit = []
+phase3-jit = ["cranelift-codegen", "cranelift-module", "cranelift-jit"]
 phase4-llvm = []
 phase5-cow = []
 phase6-simd = []
+ultra-fast = ["phase3-jit", "phase6-simd"]
 full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "phase4-llvm", "phase5-cow", "phase6-simd"]
+
+# =============================================================================
+# MAXIMUM PERFORMANCE BUILD CONFIGURATION
+# =============================================================================
 
 [profile.release]
 opt-level = 3
@@ -66,6 +80,48 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 incremental = false
+debug = false
+overflow-checks = false
 
 [profile.bench]
 inherits = "release"
+
+[profile.max-perf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = "debuginfo"
+debug = false
+overflow-checks = false
+
+[profile.release.build-override]
+opt-level = 3
+
+[profile.max-perf.build-override]
+opt-level = 3
+
+# =============================================================================
+# NATIVE CPU OPTIMIZATIONS - Unlocks ALL instruction sets on build machine
+# =============================================================================
+[build]
+rustflags = [
+    "-C", "target-cpu=native",
+    # Enable ALL detected CPU features for maximum performance
+    "-C", "target-feature=+avx2,+fma,+bmi2,+lzcnt,+popcnt,+avx,+sse4.2,+sse4.1,+ssse3",
+    # Aggressive LLVM optimizations
+    "-C", "llvm-args=-unroll-threshold=512",
+    "-C", "llvm-args=-unroll-count=8",
+    "-C", "llvm-args=-vectorize-slp=true",
+    "-C", "llvm-args=-loop-vectorize=true",
+    "-C", "llvm-args=-force-vector-width=32",
+    # Link-time optimization hints
+    "-C", "link-arg=-Wl,-z,nostart-stop-gc",
+    # Remove frame pointers for perf
+    "-C", "force-frame-pointers=no",
+    # Merge similar functions
+    "-C", "merge-functions=on",
+    # Enable profile-guided optimization when available
+    "-C", "prefer-dynamic=no",
+]

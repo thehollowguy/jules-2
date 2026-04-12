@@ -5,7 +5,7 @@
 //! - rejects writes while borrowed
 //! - tracks simple moves (`let y = x`, `y = x`) and use-after-move
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::ast::{AssignOpKind, Block, Expr, Item, Pattern, Program, Stmt, UnOpKind};
 use crate::lexer::Span;
@@ -65,9 +65,9 @@ struct VarState {
 #[derive(Debug)]
 struct BorrowChecker {
     diag: Diagnostics,
-    loans_by_target: HashMap<String, LoanState>,
-    ref_binding_to_target: HashMap<String, (String, bool)>, // ref_var -> (target, mut?)
-    var_state: HashMap<String, VarState>,
+    loans_by_target: FxHashMap<String, LoanState>,
+    ref_binding_to_target: FxHashMap<String, (String, bool)>, // ref_var -> (target, mut?)
+    var_state: FxHashMap<String, VarState>,
     scope_bindings: Vec<Vec<String>>, // variable names declared in lexical scopes
     /// Depth counter for parallel constructs (ParallelFor, Spawn).
     /// Any value > 0 means we are inside a concurrent body where moves and
@@ -79,9 +79,9 @@ impl Default for BorrowChecker {
     fn default() -> Self {
         Self {
             diag: Diagnostics::default(),
-            loans_by_target: HashMap::new(),
-            ref_binding_to_target: HashMap::new(),
-            var_state: HashMap::new(),
+            loans_by_target: FxHashMap::default(),
+            ref_binding_to_target: FxHashMap::default(),
+            var_state: FxHashMap::default(),
             scope_bindings: vec![],
             parallel_depth: 0,
         }

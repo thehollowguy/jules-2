@@ -131,7 +131,29 @@ impl ExecArena {
         let aligned = (bytes + 15) & !15;
         let next = self.cursor.checked_add(aligned)?;
         if next > self.len {
-            return None;
+            // Grow exponentially: double the arena size, capped at 128 MiB.
+            let new_len = (self.len * 2).min(128 * 1024 * 1024);
+            let new_ptr = unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    new_len,
+                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                    MAP_PRIVATE | MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if new_ptr.is_null() || new_ptr == libc::MAP_FAILED {
+                return None;
+            }
+            // Copy existing code to the new arena.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.base.as_ptr(), new_ptr.cast::<u8>(), self.cursor);
+            }
+            // Unmap the old arena.
+            unsafe { munmap(self.base.as_ptr().cast(), self.len) };
+            self.base = NonNull::new(new_ptr.cast::<u8>())?;
+            self.len = new_len;
         }
         let out = unsafe { self.base.as_ptr().add(self.cursor) };
         self.cursor = next;
@@ -213,7 +235,7 @@ struct Emitter {
 impl Emitter {
     fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(4096),
+            buf: Vec::with_capacity(16384),
         }
     }
 
@@ -250,6 +272,20 @@ impl Emitter {
     #[inline(always)]
     fn q(&mut self, v: i64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Emit a REX prefix byte
+    #[inline(always)]
+    fn emit_rex(&mut self, w: bool, r: bool, x: bool, b: bool) {
+        let rex = 0x40 | ((w as u8) << 3) | ((r as u8) << 2) | ((x as u8) << 1) | (b as u8);
+        self.b(rex);
+    }
+
+    /// Emit a ModRM byte
+    #[inline(always)]
+    fn emit_modrm(&mut self, mode: u8, reg: u8, rm: u8) {
+        let modrm = (mode << 6) | ((reg & 0x7) << 3) | (rm & 0x7);
+        self.b(modrm);
     }
 
     // ── Immediate loads ──────────────────────────────────────────────────────
@@ -476,6 +512,152 @@ impl Emitter {
         self.b(0xC3);
     }
 
+    // ── XMM (SSE2) floating-point instructions ─────────────────────────────
+    //
+    // XMM registers: xmm0-xmm15. We use xmm0-xmm7 for f32/f64 arithmetic.
+    // The JIT maps f32/f64 slots to XMM registers when possible, falling back
+    // to memory (the rdi slot array) for spills.
+
+    /// movsd xmm0, [rdi + disp32]  — load f64 from slot
+    fn load_xmm0_mem(&mut self, disp: i32) {
+        // F2 prefix (SIMD scalar double): REX.W=0x48 + F2 0F 10 /r
+        self.emit4(0xF2, 0x48, 0x0F, 0x10);
+        // ModRM: mod=10 (disp32), reg=000 (xmm0), rm=111 (rdi)
+        self.b(0x87);
+        self.d(disp);
+    }
+
+    /// movss xmm0, [rdi + disp32]  — load f32 from slot
+    fn load_xmm0_mem_f32(&mut self, disp: i32) {
+        // F3 prefix (SIMD scalar single): F3 0F 10 /r
+        self.emit3(0xF3, 0x0F, 0x10);
+        // ModRM: mod=10, reg=000, rm=111
+        self.b(0x87);
+        self.d(disp);
+    }
+
+    /// movsd [rdi + disp32], xmm0  — store f64 to slot
+    fn store_mem_xmm0(&mut self, disp: i32) {
+        self.emit4(0xF2, 0x48, 0x0F, 0x11);
+        self.b(0x87);
+        self.d(disp);
+    }
+
+    /// movss [rdi + disp32], xmm0  — store f32 to slot
+    fn store_mem_xmm0_f32(&mut self, disp: i32) {
+        self.emit3(0xF3, 0x0F, 0x11);
+        self.b(0x87);
+        self.d(disp);
+    }
+
+    /// addsd xmm0, xmm1  — f64 add
+    fn add_xmm0_xmm1_f64(&mut self) {
+        self.emit4(0xF2, 0x48, 0x0F, 0x58);
+        self.b(0xC1); // mod=11, reg=xmm0, rm=xmm1
+    }
+
+    /// addss xmm0, xmm1  — f32 add
+    fn add_xmm0_xmm1_f32(&mut self) {
+        self.emit3(0xF3, 0x0F, 0x58);
+        self.b(0xC1);
+    }
+
+    /// subsd xmm0, xmm1  — f64 sub
+    fn sub_xmm0_xmm1_f64(&mut self) {
+        self.emit4(0xF2, 0x48, 0x0F, 0x5C);
+        self.b(0xC1);
+    }
+
+    /// subss xmm0, xmm1  — f32 sub
+    fn sub_xmm0_xmm1_f32(&mut self) {
+        self.emit3(0xF3, 0x0F, 0x5C);
+        self.b(0xC1);
+    }
+
+    /// mulsd xmm0, xmm1  — f64 mul
+    fn mul_xmm0_xmm1_f64(&mut self) {
+        self.emit4(0xF2, 0x48, 0x0F, 0x59);
+        self.b(0xC1);
+    }
+
+    /// mulss xmm0, xmm1  — f32 mul
+    fn mul_xmm0_xmm1_f32(&mut self) {
+        self.emit3(0xF3, 0x0F, 0x59);
+        self.b(0xC1);
+    }
+
+    /// divsd xmm0, xmm1  — f64 div
+    fn div_xmm0_xmm1_f64(&mut self) {
+        self.emit4(0xF2, 0x48, 0x0F, 0x5E);
+        self.b(0xC1);
+    }
+
+    /// divss xmm0, xmm1  — f32 div
+    fn div_xmm0_xmm1_f32(&mut self) {
+        self.emit3(0xF3, 0x0F, 0x5E);
+        self.b(0xC1);
+    }
+
+    /// movq xmm1, rax  — move integer → XMM (for mixed int/float ops)
+    fn movq_xmm1_rax(&mut self) {
+        self.emit4(0x66, 0x48, 0x0F, 0x6E);
+        self.b(0xC8); // mod=11, reg=xmm1, rm=rax
+    }
+
+    /// ucomisd xmm0, xmm1  — f64 compare, sets EFLAGS
+    fn ucomisd_xmm0_xmm1(&mut self) {
+        self.emit3(0x66, 0x0F, 0x2E);
+        self.b(0xC1);
+    }
+
+    /// ucomiss xmm0, xmm1  — f32 compare
+    fn ucomiss_xmm0_xmm1(&mut self) {
+        self.emit3(0x0F, 0x2E, 0xC1);
+    }
+
+    /// cvttsd2si eax, xmm0  — f64 → i32 (truncating)
+    fn cvttsd2si_eax_xmm0(&mut self) {
+        self.emit2(0xF2, 0x48);
+        self.emit_rex(false, true, false, false);
+        self.emit_modrm(0xC0, 0, 0);
+        self.b(0x2C);
+        self.b(0xC0);
+    }
+
+    /// cvttss2si eax, xmm0  — f32 → i32 (truncating)
+    fn cvttss2si_eax_xmm0(&mut self) {
+        self.emit3(0xF3, 0x0F, 0x2C);
+        self.b(0xC0);
+    }
+
+    /// cvtsi2sd xmm0, rax  — i64 → f64
+    fn cvtsi2sd_xmm0_rax(&mut self) {
+        self.emit4(0xF2, 0x48, 0x0F, 0x2A);
+        self.b(0xC0);
+    }
+
+    /// cvtsi2ss xmm0, rax  — i64 → f32
+    fn cvtsi2ss_xmm0_rax(&mut self) {
+        self.emit4(0xF3, 0x48, 0x0F, 0x2A);
+        self.b(0xC0);
+    }
+
+    /// Load immediate f64 into xmm0: move bits into rax, then movq xmm0, rax
+    fn mov_xmm0_imm64(&mut self, bits: u64) {
+        self.emit2(0x48, 0xB8); // MOV RAX, imm64
+        self.q(bits as i64);
+        self.emit4(0x66, 0x48, 0x0F, 0x6E); // MOVQ XMM0, RAX
+        self.b(0xC0);
+    }
+
+    /// Load immediate f32 into xmm0: zero-extend to 64-bit, then movq
+    fn mov_xmm0_imm32_bits(&mut self, bits: u32) {
+        self.b(0xB8); // MOV EAX, imm32 (zero-extends)
+        self.d(bits as i32);
+        self.emit4(0x66, 0x48, 0x0F, 0x6E); // MOVQ XMM0, RAX
+        self.b(0xC0);
+    }
+
     // ── Callee-saved save/restore ────────────────────────────────────────────
     //
     // Short-form PUSH/POP r64: 0x50+rd  (rd = reg & 7)
@@ -626,21 +808,17 @@ fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterv
 // ── Linear-scan allocator ─────────────────────────────────────────────────────
 
 fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
+    // Pre-allocate slots to slot_count + 1 with default spill locations.
+    // This eliminates all resizing during allocation.
     let cap = slot_count + 1;
     let mut slots: Vec<RegLoc> = (0..cap).map(|s| RegLoc::Spill((s as i32) * 8)).collect();
-
-    let ensure_slot = |slots: &mut Vec<RegLoc>, slot: u16| {
-        let idx = slot as usize;
-        if idx >= slots.len() {
-            slots.resize(idx + 1, RegLoc::Spill((idx as i32) * 8));
-        }
-    };
 
     // Free list: iterate ALLOC_POOL in reverse so pop() gives caller-saved first.
     let mut free: Vec<u8> = ALLOC_POOL.iter().rev().copied().collect();
     // Active set sorted by interval end (ascending).
-    let mut active: Vec<(usize, u16, u8)> = Vec::new(); // (end, slot, reg)
-    let mut used_callee_saved: Vec<u8> = Vec::new();
+    // Pre-allocate to avoid reallocations.
+    let mut active: Vec<(usize, u16, u8)> = Vec::with_capacity(intervals.len().min(free.len()));
+    let mut used_callee_saved: Vec<u8> = Vec::with_capacity(ALLOC_POOL.len());
     // Bitmask to avoid O(n) contains() on used_callee_saved (regs 0-15 fit in u16).
     let mut callee_saved_mask: u16 = 0;
 
@@ -668,24 +846,20 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
 
         if let Some(reg) = free.pop() {
             track_callee(reg);
-            ensure_slot(&mut slots, iv.slot);
             slots[iv.slot as usize] = RegLoc::Reg(reg);
             let pos = active.partition_point(|(e, _, _)| *e <= iv.last);
             active.insert(pos, (iv.last, iv.slot, reg));
         } else {
             match active.last().copied() {
                 Some((end, spill_slot, reg)) if end > iv.last => {
-                    ensure_slot(&mut slots, spill_slot);
                     slots[spill_slot as usize] = RegLoc::Spill((spill_slot as i32) * 8);
                     active.pop();
                     track_callee(reg);
-                    ensure_slot(&mut slots, iv.slot);
                     slots[iv.slot as usize] = RegLoc::Reg(reg);
                     let pos = active.partition_point(|(e, _, _)| *e <= iv.last);
                     active.insert(pos, (iv.last, iv.slot, reg));
                 }
                 _ => {
-                    ensure_slot(&mut slots, iv.slot);
                     // Already pre-filled with Spill; nothing to do.
                 }
             }
@@ -883,6 +1057,7 @@ fn is_supported_binop(op: BinOpKind) -> bool {
 }
 
 /// Emit the arithmetic/comparison body: lhs already in rax, rhs in rcx.
+#[inline(always)]
 fn emit_binop_rax_rcx(em: &mut Emitter, op: BinOpKind) -> bool {
     match op {
         BinOpKind::Add => em.add_rax_rcx(),
@@ -933,6 +1108,7 @@ fn emit_binop_rax_rcx(em: &mut Emitter, op: BinOpKind) -> bool {
 }
 
 /// Emit immediate-rhs form: lhs already in rax.
+#[inline(always)]
 fn emit_binop_rax_imm(em: &mut Emitter, op: BinOpKind, imm: i32) {
     match op {
         BinOpKind::Add => {
@@ -1077,6 +1253,105 @@ fn patch_fixups(buf: &mut Vec<u8>, fixups: &[Fixup], pc_to_off: &[usize]) -> Opt
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Peephole optimizer pass
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Runs after liveness analysis, before code emission.  Eliminates redundant
+// instruction patterns in the bytecode to shrink the hot loop.
+
+fn peephole_optimize(instrs: &mut Vec<Instr>) {
+    // Fixed 3-pass approach instead of `while changed` to avoid quadratic behaviour.
+    // Each pass scans the instruction stream once, applying all applicable rewrites.
+    const MAX_PASSES: usize = 3;
+    for _pass in 0..MAX_PASSES {
+        let mut i = 0;
+        while i + 1 < instrs.len() {
+            // Pattern 1: Load(x) + Store(x) → eliminate both (dead store)
+            if let (Instr::Load(d1, s), Instr::Store(d2, s2)) =
+                (&instrs[i], &instrs[i + 1])
+            {
+                if *d1 == *s2 && *s == *d2 {
+                    // Load into tmp then immediately store back to same slot = no-op
+                    instrs.remove(i + 1);
+                    instrs.remove(i);
+                    // Don't advance i; re-check at same position.
+                    continue;
+                }
+            }
+
+            // Pattern 2: Move(d, s) + Load(x, d) → Move(d, s) + Load(x, s) (forward prop)
+            if let (Instr::Move(d, s), Instr::Load(d2, s2)) = (&instrs[i], &instrs[i + 1]) {
+                if *s2 == *d {
+                    instrs[i + 1] = Instr::Load(*d2, *s);
+                }
+            }
+
+            // Pattern 3: Store(slot, x) + Load(d, slot) → Store(slot, x) + Move(d, x)
+            if let (Instr::Store(slot, s), Instr::Load(d2, s2)) = (&instrs[i], &instrs[i + 1]) {
+                if *s2 == *slot {
+                    instrs[i + 1] = Instr::Move(*d2, *s);
+                }
+            }
+
+            // Pattern 4: Jump(0) → eliminate (no-op jump)
+            if let Instr::Jump(0) = &instrs[i] {
+                instrs.remove(i);
+                continue;
+            }
+
+            // Pattern 5: LoadI*(d, v) + Move(d2, d) → LoadI*(d2, v) + (eliminate Move)
+            if let (Instr::Move(d, s), _) = (&instrs[i], &instrs[i + 1]) {
+                // Look backwards for LoadI into s
+                if i > 0 {
+                    let prev_idx = i - 1;
+                    match &instrs[prev_idx] {
+                        Instr::LoadI32(src, v) if *src == *s => {
+                            instrs[prev_idx] = Instr::LoadI32(*d, *v);
+                            instrs.remove(i);
+                            continue;
+                        }
+                        Instr::LoadI64(src, v) if *src == *s => {
+                            instrs[prev_idx] = Instr::LoadI64(*d, *v);
+                            instrs.remove(i);
+                            continue;
+                        }
+                        Instr::LoadBool(src, v) if *src == *s => {
+                            instrs[prev_idx] = Instr::LoadBool(*d, *v);
+                            instrs.remove(i);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Pattern 6: Move(d, s) + Move(d2, d) → Move(d, s) + Move(d2, s) (chain forwarding)
+            if let (Instr::Move(d, s), Instr::Move(d2, s2)) = (&instrs[i], &instrs[i + 1]) {
+                if *s2 == *d {
+                    instrs[i + 1] = Instr::Move(*d2, *s);
+                }
+            }
+
+            // Pattern 7: LoadI*(d, 0) + Move(d2, d) → LoadI*(d2, 0) + eliminate Move
+            if let (Instr::Move(d, s), _) = (&instrs[i], &instrs[i + 1]) {
+                if i > 0 {
+                    let prev_idx = i - 1;
+                    if let Instr::LoadI64(src, v) = &instrs[prev_idx] {
+                        if *src == *s && *v == 0 {
+                            instrs[prev_idx] = Instr::LoadI64(*d, 0);
+                            instrs.remove(i);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            i += 1;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1100,6 +1375,8 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             | Instr::LoadI64(..)
             | Instr::LoadBool(..)
             | Instr::LoadUnit(..)
+            | Instr::LoadF32(..)
+            | Instr::LoadF64(..)
             | Instr::Move(..)
             | Instr::Load(..)
             | Instr::Store(..)
@@ -1113,6 +1390,11 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             _ => return None,
         }
     }
+
+    // ── Pass 0: Peephole optimization ──────────────────────────────────
+    let mut opt_instrs = instrs.clone();
+    peephole_optimize(&mut opt_instrs);
+    let instrs = &opt_instrs;
 
     // ── Pass 1: liveness + linear-scan register allocation ───────────────
     let intervals = compute_live_intervals(instrs, slot_count);
@@ -1505,6 +1787,30 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     None => const_at.remove(*d),
                 }
             }
+            Instr::LoadF32(d, v) => {
+                // Load f32 constant as bits into XMM0, then store to slot.
+                let bits = v.to_bits();
+                em.mov_xmm0_imm32_bits(bits as u32);
+                if !is_straight_line_dead_def(instrs, pc, *d) {
+                    let off = match ra.location(*d) {
+                        RegLoc::Reg(_) => (d * 8) as i32, // slots are 8-byte aligned
+                        RegLoc::Spill(off) => off,
+                    };
+                    em.store_mem_xmm0_f32(off);
+                }
+                // Don't track float constants in int const_at table.
+            }
+            Instr::LoadF64(d, v) => {
+                let bits = v.to_bits();
+                em.mov_xmm0_imm64(bits);
+                if !is_straight_line_dead_def(instrs, pc, *d) {
+                    let off = match ra.location(*d) {
+                        RegLoc::Reg(_) => (d * 8) as i32,
+                        RegLoc::Spill(off) => off,
+                    };
+                    em.store_mem_xmm0(off);
+                }
+            }
             Instr::Jump(off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
                 if target > instrs.len() {
@@ -1579,15 +1885,17 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
 pub fn execute(native: &NativeCode, args: &[Value]) -> Result<Value, RuntimeError> {
     thread_local! {
-        static EXEC_REGS: RefCell<Vec<i64>> = RefCell::new(Vec::new());
+        static EXEC_REGS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
     }
     let needed = native.slot_count as usize + 32;
     EXEC_REGS.with(|cell| -> Result<Value, RuntimeError> {
         let mut regs = cell.borrow_mut();
         if regs.len() < needed {
             regs.resize(needed, 0);
-        } else {
-            regs[..needed].fill(0);
+        }
+        // Only zero the portion we'll use.
+        for r in &mut regs[..needed] {
+            *r = 0;
         }
         for (i, arg) in args.iter().enumerate() {
             if i >= needed {

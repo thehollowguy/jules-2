@@ -25,7 +25,10 @@ impl Debugger {
         let snap = world.snapshot();
         self.history.push(snap);
         if self.history.len() > self.max_history {
-            self.history.remove(0);
+            // Remove oldest entry efficiently by rotating and truncating
+            // instead of O(n) remove(0) shift.
+            let excess = self.history.len() - self.max_history;
+            self.history.drain(0..excess);
         }
     }
 

@@ -5,8 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use lazy_static::lazy_static;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AssetEntry {
     original: String,
     stored: String,
@@ -14,7 +16,7 @@ struct AssetEntry {
     mtime: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Manifest {
     entries: Vec<AssetEntry>,
 }
@@ -22,8 +24,38 @@ struct Manifest {
 const ASSET_DIR: &str = "assets";
 const MANIFEST_FILE: &str = "assets/manifest.json";
 
+// Cache the manifest in memory to avoid repeated I/O.
+lazy_static! {
+    static ref MANIFEST_CACHE: Mutex<Option<Manifest>> = Mutex::new(None);
+}
+
 pub fn available() -> bool {
     true
+}
+
+fn load_manifest() -> Manifest {
+    let mut cache = MANIFEST_CACHE.lock().unwrap();
+    if let Some(ref m) = *cache {
+        return m.clone();
+    }
+    let manifest = if Path::new(MANIFEST_FILE).exists() {
+        fs::read_to_string(MANIFEST_FILE)
+            .ok()
+            .and_then(|txt| serde_json::from_str(&txt).ok())
+            .unwrap_or_default()
+    } else {
+        Manifest::default()
+    };
+    *cache = Some(manifest.clone());
+    manifest
+}
+
+fn save_manifest(manifest: &Manifest) -> Result<(), String> {
+    let txt = serde_json::to_string_pretty(manifest).map_err(|e| e.to_string())?;
+    fs::write(MANIFEST_FILE, txt).map_err(|e| e.to_string())?;
+    let mut cache = MANIFEST_CACHE.lock().unwrap();
+    *cache = Some(manifest.clone());
+    Ok(())
 }
 
 pub fn import_asset(path: &str) -> Result<String, String> {
@@ -48,16 +80,10 @@ pub fn import_asset(path: &str) -> Result<String, String> {
         size: meta.len(),
         mtime,
     };
-    // update manifest
-    let mut manifest = if Path::new(MANIFEST_FILE).exists() {
-        let txt = fs::read_to_string(MANIFEST_FILE).map_err(|e| e.to_string())?;
-        serde_json::from_str(&txt).unwrap_or_default()
-    } else {
-        Manifest::default()
-    };
+    // Update in-memory manifest, then persist.
+    let mut manifest = load_manifest();
     manifest.entries.push(entry);
-    let txt = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
-    fs::write(MANIFEST_FILE, txt).map_err(|e| e.to_string())?;
+    save_manifest(&manifest)?;
     Ok(dest.to_string_lossy().to_string())
 }
 

@@ -46,7 +46,7 @@
 //                        the parser's `ast::Type`).
 // =============================================================================
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::ast::{
     AgentDecl, BinOpKind, Block, ComponentDecl, DimExpr, ElemType, Expr, FnDecl, GenericParam,
@@ -317,7 +317,7 @@ impl Diagnostics {
 pub struct InferCtx {
     next_var: u32,
     /// Substitution map: inference-var ID → resolved type.
-    subst: HashMap<u32, Ty>,
+    subst: FxHashMap<u32, Ty>,
 }
 
 impl InferCtx {
@@ -393,18 +393,18 @@ impl InferCtx {
 #[derive(Debug, Default)]
 pub struct TyEnv {
     /// Stack of scopes; the last entry is the innermost.
-    scopes: Vec<HashMap<String, Ty>>,
+    scopes: Vec<FxHashMap<String, Ty>>,
 }
 
 impl TyEnv {
     pub fn new() -> Self {
         TyEnv {
-            scopes: vec![HashMap::new()],
+            scopes: vec![FxHashMap::default()],
         }
     }
 
     pub fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(FxHashMap::default());
     }
 
     pub fn pop_scope(&mut self) {
@@ -464,10 +464,10 @@ pub struct FnInfo {
 /// The program-level symbol table populated during the first pass over items.
 #[derive(Debug, Default)]
 pub struct SymbolTable {
-    pub structs: HashMap<String, StructInfo>,
-    pub fns: HashMap<String, FnInfo>,
-    pub agents: HashMap<String, AgentDecl>,
-    pub models: HashMap<String, ModelDecl>,
+    pub structs: FxHashMap<String, StructInfo>,
+    pub fns: FxHashMap<String, FnInfo>,
+    pub agents: FxHashMap<String, AgentDecl>,
+    pub models: FxHashMap<String, ModelDecl>,
 }
 
 impl SymbolTable {
