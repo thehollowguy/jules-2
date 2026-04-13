@@ -17,6 +17,7 @@ mod ml_engine;
 mod optimizer;
 mod parser;
 mod sema;
+mod tiered_compilation;
 mod typeck;
 // Optional, phase-gated modules (added per performance phase protocol)
 #[cfg(feature = "phase3-jit")]
@@ -807,6 +808,10 @@ pub struct CliArgs {
     pub jax_dataset: Option<PathBuf>,
     pub jax_out: PathBuf,
     pub jax_script: PathBuf,
+    // Tiered compilation flags
+    pub tiered: bool,               // Enable tiered compilation
+    pub tier_policy: String,        // "fast-startup", "balanced", "max-performance"
+    pub print_tier_stats: bool,     // Print tier compilation statistics
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1014,6 +1019,18 @@ impl CliArgs {
                 "--stats" | "--print-opt-stats" => {
                     out.print_opt_stats = true;
                 }
+                "--tiered" => {
+                    out.tiered = true;
+                }
+                "--tier-policy" => {
+                    out.tier_policy = it.next().ok_or("--tier-policy requires a value")?.clone();
+                    if !matches!(out.tier_policy.as_str(), "fast-startup" | "balanced" | "max-performance") {
+                        return Err("--tier-policy must be `fast-startup`, `balanced`, or `max-performance`".into());
+                    }
+                }
+                "--tier-stats" => {
+                    out.print_tier_stats = true;
+                }
                 "--jax-ir" => {
                     out.jax_ir = Some(PathBuf::from(it.next().ok_or("--jax-ir requires a path")?));
                 }
@@ -1102,8 +1119,14 @@ fn cmd_help() {
     println!("    --jax-dataset <file.npz>  (train+jax) dataset with x_train/y_train");
     println!("    --jax-out <dir>           (train+jax) output dir (default artifacts/jax)");
     println!("    --jax-script <path.py>    (train+jax) backend script path");
+    println!("\nTIERED COMPILATION:");
+    println!("    --tiered           Enable tiered compilation (start fast, optimize hot code)");
+    println!("    --tier-policy <P>  fast-startup | balanced | max-performance");
+    println!("    --tier-stats       Print tier compilation statistics after execution");
     println!("\nEXAMPLES:");
     println!("    jules run examples/physics.jules");
+    println!("    jules run examples/warden.jules --tiered --tier-stats");
+    println!("    jules run examples/warden.jules --tiered --tier-policy max-performance");
     println!("    jules check src/agent.jules -W");
     println!("    jules fix broken.jules");
     println!("    jules train examples/warden.jules");
@@ -1832,18 +1855,50 @@ fn cmd_run(args: &CliArgs) -> i32 {
 
     // Run the interpreter.
     if let PipelineResult::Ok(program) = result {
-        let mut interp = crate::interp::Interpreter::new();
-        interp.load_program(&program);
-        match interp.call_fn(&args.entry, vec![]) {
-            Ok(val) => {
-                if !matches!(val, crate::interp::Value::Unit) {
-                    println!("{val}");
+        if args.tiered {
+            // Use tiered compilation for progressive optimization
+            let policy = match args.tier_policy.as_str() {
+                "fast-startup" => crate::tiered_compilation::PromotionPolicy::fast_startup(),
+                "balanced" => crate::tiered_compilation::PromotionPolicy::balanced(),
+                "max-performance" => crate::tiered_compilation::PromotionPolicy::max_performance(),
+                _ => crate::tiered_compilation::PromotionPolicy::balanced(),
+            };
+            
+            let mut tiered_mgr = crate::tiered_compilation::TieredExecutionManager::new(policy);
+            tiered_mgr.load_program(&program);
+            tiered_mgr.enabled = true;
+            
+            match tiered_mgr.call_function(&args.entry, vec![]) {
+                Ok(val) => {
+                    if !matches!(val, crate::interp::Value::Unit) {
+                        println!("{val}");
+                    }
+                }
+                Err(e) => {
+                    let diag = adapt_runtime_error(e);
+                    emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
+                    return 1;
                 }
             }
-            Err(e) => {
-                let diag = adapt_runtime_error(e);
-                emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
-                return 1;
+            
+            if args.print_tier_stats {
+                eprintln!("{}", tiered_mgr.tier_stats_summary());
+            }
+        } else {
+            // Use plain interpreter (existing behavior)
+            let mut interp = crate::interp::Interpreter::new();
+            interp.load_program(&program);
+            match interp.call_fn(&args.entry, vec![]) {
+                Ok(val) => {
+                    if !matches!(val, crate::interp::Value::Unit) {
+                        println!("{val}");
+                    }
+                }
+                Err(e) => {
+                    let diag = adapt_runtime_error(e);
+                    emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
+                    return 1;
+                }
             }
         }
     }

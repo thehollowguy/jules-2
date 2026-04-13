@@ -1398,7 +1398,14 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
     // ── Pass 1: liveness + linear-scan register allocation ───────────────
     let intervals = compute_live_intervals(instrs, slot_count);
-    let ra = linear_scan(&intervals, slot_count);
+    // Use actual max slot from intervals (may exceed declared slot_count
+    // due to temporaries created during expression compilation).
+    let actual_max_slot = intervals
+        .iter()
+        .map(|i| i.slot as usize)
+        .max()
+        .unwrap_or(slot_count);
+    let ra = linear_scan(&intervals, actual_max_slot);
 
     // ── Emission ──────────────────────────────────────────────────────────
     let mut em = Emitter::new();

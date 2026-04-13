@@ -32,6 +32,10 @@ path = "tools/bench_chess_ml.rs"
 name = "bench-interp-vs-rust"
 path = "tools/bench_interp_vs_rust.rs"
 
+[[bin]]
+name = "bench-prime-race"
+path = "tools/bench_prime_race.rs"
+
 [dependencies]
 pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 numpy = { version = "0.21", optional = true }
