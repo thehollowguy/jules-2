@@ -17,6 +17,7 @@ mod ml_engine;
 mod optimizer;
 mod parser;
 mod sema;
+mod string_intern;
 mod tiered_compilation;
 mod typeck;
 // Optional, phase-gated modules (added per performance phase protocol)

@@ -74,26 +74,39 @@ ultra-fast = ["phase3-jit", "phase6-simd"]
 full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "phase4-llvm", "phase5-cow", "phase6-simd"]
 
 # =============================================================================
-# MAXIMUM PERFORMANCE BUILD CONFIGURATION
+# PERFORMANCE PROFILES
 # =============================================================================
 
+# Fast compile for development (default: `cargo build`)
+[profile.dev]
+opt-level = 1              # Basic optimizations for speed
+codegen-units = 16         # Parallel codegen for fast builds
+incremental = true         # Incremental compilation
+debug = "line-tables-only" # Minimal debug info
+panic = "unwind"
+overflow-checks = true
+
+# Production release: balanced speed/compile time
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = "thin"               # Thin LTO (much faster than fat LTO)
+codegen-units = 4          # Parallel codegen (4 units for speed)
 panic = "abort"
 strip = "symbols"
 incremental = false
 debug = false
 overflow-checks = false
+rpath = false
 
+# Benchmarks: same as release
 [profile.bench]
 inherits = "release"
 
+# MAXIMUM PERFORMANCE: use only for final builds (slow compile!)
 [profile.max-perf]
 inherits = "release"
-lto = "fat"
-codegen-units = 1
+lto = "fat"                # Full LTO (slow but best performance)
+codegen-units = 1          # Single unit for maximum inlining
 opt-level = 3
 panic = "abort"
 strip = "debuginfo"
@@ -105,27 +118,3 @@ opt-level = 3
 
 [profile.max-perf.build-override]
 opt-level = 3
-
-# =============================================================================
-# NATIVE CPU OPTIMIZATIONS - Unlocks ALL instruction sets on build machine
-# =============================================================================
-[build]
-rustflags = [
-    "-C", "target-cpu=native",
-    # Enable ALL detected CPU features for maximum performance
-    "-C", "target-feature=+avx2,+fma,+bmi2,+lzcnt,+popcnt,+avx,+sse4.2,+sse4.1,+ssse3",
-    # Aggressive LLVM optimizations
-    "-C", "llvm-args=-unroll-threshold=512",
-    "-C", "llvm-args=-unroll-count=8",
-    "-C", "llvm-args=-vectorize-slp=true",
-    "-C", "llvm-args=-loop-vectorize=true",
-    "-C", "llvm-args=-force-vector-width=32",
-    # Link-time optimization hints
-    "-C", "link-arg=-Wl,-z,nostart-stop-gc",
-    # Remove frame pointers for perf
-    "-C", "force-frame-pointers=no",
-    # Merge similar functions
-    "-C", "merge-functions=on",
-    # Enable profile-guided optimization when available
-    "-C", "prefer-dynamic=no",
-]

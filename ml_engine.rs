@@ -4,14 +4,14 @@
 // =========================================================================
 
 use crate::gpu_backend::GpuMemoryManager;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::thread;
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct ComputationGraph {
     /// Each node represents an operation
-    pub nodes: HashMap<u64, ComputeNode>,
+    pub nodes: FxHashMap<u64, ComputeNode>,
     /// Node ID counter
     pub next_id: u64,
 }
@@ -1122,7 +1122,7 @@ fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
 impl ComputationGraph {
     pub fn new() -> Self {
         ComputationGraph {
-            nodes: HashMap::new(),
+            nodes: FxHashMap::default(),
             next_id: 1,
         }
     }
@@ -1337,9 +1337,9 @@ mod tests {
 
 #[derive(Debug, Clone)]
 pub struct OptimizerState {
-    pub momentum: HashMap<u64, Vec<f32>>, // For momentum-based optimizers
-    pub velocity_m: HashMap<u64, Vec<f32>>, // First moment (Adam)
-    pub velocity_v: HashMap<u64, Vec<f32>>, // Second moment (Adam)
+    pub momentum: FxHashMap<u64, Vec<f32>>, // For momentum-based optimizers
+    pub velocity_m: FxHashMap<u64, Vec<f32>>, // First moment (Adam)
+    pub velocity_v: FxHashMap<u64, Vec<f32>>, // Second moment (Adam)
     pub step_count: u64,
     pub beta1_pow: f32,
     pub beta2_pow: f32,
@@ -1348,9 +1348,9 @@ pub struct OptimizerState {
 impl OptimizerState {
     pub fn new() -> Self {
         OptimizerState {
-            momentum: HashMap::new(),
-            velocity_m: HashMap::new(),
-            velocity_v: HashMap::new(),
+            momentum: FxHashMap::default(),
+            velocity_m: FxHashMap::default(),
+            velocity_v: FxHashMap::default(),
             step_count: 0,
             beta1_pow: 1.0,
             beta2_pow: 1.0,

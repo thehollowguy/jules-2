@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+use rustc_hash::FxHashMap;
+
 mod math;
 mod geometry;
 mod random;
@@ -38,7 +40,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
 
 /// List all available stdlib modules and functions (for introspection).
 pub fn modules_value() -> Value {
-    let mut out = std::collections::HashMap::new();
+    let mut out = FxHashMap::default();
 
     let math_fns = vec![
         "vec2","vec3","vec4","dot2","dot3","dot4","cross3","length2","length3","length4",

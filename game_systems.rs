@@ -3,7 +3,8 @@
 // Provides Rapier physics simulation with ECS integration
 // =========================================================================
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+
 
 // Physics component that can be attached to entities
 #[derive(Debug, Clone)]
@@ -36,8 +37,8 @@ pub struct PhysicsCollider {
 
 #[derive(Debug)]
 pub struct PhysicsWorld {
-    bodies: HashMap<u32, PhysicsBody>,
-    colliders: HashMap<u32, PhysicsCollider>,
+    bodies: FxHashMap<u32, PhysicsBody>,
+    colliders: FxHashMap<u32, PhysicsCollider>,
     next_id: u32,
     gravity: [f32; 3],
     damping: f32,
@@ -46,8 +47,8 @@ pub struct PhysicsWorld {
 impl PhysicsWorld {
     pub fn new() -> Self {
         PhysicsWorld {
-            bodies: HashMap::new(),
-            colliders: HashMap::new(),
+            bodies: FxHashMap::default(),
+            colliders: FxHashMap::default(),
             next_id: 1,
             gravity: [0.0, -9.81, 0.0],
             damping: 0.99,
@@ -320,18 +321,18 @@ pub struct ChunkedGridMap {
     pub width: usize,
     pub height: usize,
     pub chunk_size: usize,
-    pub chunks: HashMap<(i32, i32), Vec<u32>>,
+    pub chunks: FxHashMap<(i32, i32), Vec<u32>>,
 }
 
 pub struct RenderState {
     pub camera: Camera,
-    pub meshes: HashMap<u32, Mesh>,
-    pub materials: HashMap<u32, Material>,
-    pub sprites: HashMap<u32, Sprite>,
-    pub models: HashMap<u32, Model>,
-    pub objects: HashMap<u32, SceneObject>,
-    pub maps: HashMap<u32, GridMap>,
-    pub chunked_maps: HashMap<u32, ChunkedGridMap>,
+    pub meshes: FxHashMap<u32, Mesh>,
+    pub materials: FxHashMap<u32, Material>,
+    pub sprites: FxHashMap<u32, Sprite>,
+    pub models: FxHashMap<u32, Model>,
+    pub objects: FxHashMap<u32, SceneObject>,
+    pub maps: FxHashMap<u32, GridMap>,
+    pub chunked_maps: FxHashMap<u32, ChunkedGridMap>,
     pub next_id: u32,
     // 8K rendering support
     pub width: u32,
@@ -343,13 +344,13 @@ impl RenderState {
     pub fn new() -> Self {
         RenderState {
             camera: Camera::default(),
-            meshes: HashMap::new(),
-            materials: HashMap::new(),
-            sprites: HashMap::new(),
-            models: HashMap::new(),
-            objects: HashMap::new(),
-            maps: HashMap::new(),
-            chunked_maps: HashMap::new(),
+            meshes: FxHashMap::default(),
+            materials: FxHashMap::default(),
+            sprites: FxHashMap::default(),
+            models: FxHashMap::default(),
+            objects: FxHashMap::default(),
+            maps: FxHashMap::default(),
+            chunked_maps: FxHashMap::default(),
             next_id: 1,
             width: 1920,
             height: 1080,
@@ -578,7 +579,7 @@ impl RenderState {
                 width,
                 height,
                 chunk_size: chunk_size.max(1),
-                chunks: HashMap::new(),
+                chunks: FxHashMap::default(),
             },
         );
         id

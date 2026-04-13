@@ -1,22 +1,15 @@
-# Maximum performance configuration for Jules compiler
-#
-# These flags unlock CPU-specific optimizations (AVX2/FMA/SIMD).
-# If you get "illegal instruction" errors on a different machine,
-# comment out the target-feature line.
+# =============================================================================
+# CARGO CONFIGURATION
+# =============================================================================
 
 [build]
-# Enable native CPU features for maximum performance
+# Use all available CPU cores for parallel compilation
+jobs = 8
+
+# Default rustflags: enable native CPU features for ALL builds
+# These affect runtime performance, NOT compile time
+[target.'cfg(target_arch = "x86_64")']
 rustflags = [
     "-C", "target-cpu=native",
-    # Enable common high-performance features on modern x86_64:
-    "-C", "target-feature=+avx,+avx2,+fma,+bmi1,+bmi2,+lzcnt",
-    # Enable AES-NI for any crypto operations
-    "-C", "target-feature=+aes",
-    # Enable popcnt for bit counting
-    "-C", "target-feature=+popcnt",
-    # Enable faster string operations
-    "-C", "target-feature=+movbe",
+    "-C", "target-feature=+avx2,+fma,+bmi2,+lzcnt,+popcnt,+avx,+sse4.2,+sse4.1,+ssse3",
 ]
-
-[target.x86_64-unknown-linux-gnu]
-linker = "cc"
