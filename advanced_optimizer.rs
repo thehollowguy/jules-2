@@ -35,6 +35,7 @@
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::ast::*;
@@ -1241,19 +1242,170 @@ impl DeadCodeEliminator {
     }
 
     fn eliminate_block(&mut self, block: &mut Block) {
+        // ── Pass 1: Trim unreachable statements after a terminator ────────────
         let mut reachable = true;
+        let before = block.stmts.len();
         block.stmts.retain(|stmt| {
-            if !reachable {
-                return false;
+            if !reachable { return false; }
+            if matches!(stmt, Stmt::Return { .. } | Stmt::Break { .. }) {
+                reachable = false;
             }
-            match stmt {
-                Stmt::Return { .. } | Stmt::Break { .. } => {
-                    reachable = false;
-                    true
-                }
-                _ => true,
-            }
+            true
         });
+        self.eliminated += (before - block.stmts.len()) as u64;
+
+        // ── Pass 2: Liveness-based dead variable elimination ─────────────────
+        // Walk stmts backwards to compute the live-out set. A `let x = e`
+        // binding where `x` is never read afterwards is dead and can be dropped
+        // (provided the initialiser is pure — i.e. it cannot panic or mutate
+        // state). We conservatively keep any init that contains a call or
+        // assignment, but drop simple pure computations.
+
+        // Forward pass: collect all variables that are *read* in any position.
+        let mut ever_read: std::collections::HashSet<String> =
+            std::collections::HashSet::default();
+        for stmt in &block.stmts {
+            Self::collect_reads_stmt(stmt, &mut ever_read);
+        }
+        if let Some(tail) = &block.tail {
+            Self::collect_reads_expr(tail, &mut ever_read);
+        }
+
+        // Drop `let x = pure_expr` when `x` is never read.
+        let before2 = block.stmts.len();
+        block.stmts.retain(|stmt| {
+            if let Stmt::Let { pattern, init: Some(init), .. } = stmt {
+                if let Pattern::Ident { name, .. } = pattern {
+                    if !ever_read.contains(name) && Self::is_pure_expr(init) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+        self.eliminated += (before2 - block.stmts.len()) as u64;
+
+        // ── Pass 3: Recurse into nested blocks ────────────────────────────────
+        for stmt in &mut block.stmts {
+            match stmt {
+                Stmt::ForIn { body, .. }
+                | Stmt::While { body, .. }
+                | Stmt::EntityFor { body, .. } => {
+                    self.eliminate_block(body);
+                }
+                Stmt::If { then, else_, .. } => {
+                    self.eliminate_block(then);
+                    if let Some(else_box) = else_ {
+                        if let IfOrBlock::Block(b) = &mut **else_box {
+                            self.eliminate_block(b);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Collect every identifier that is *read* (not written) in `stmt`.
+    fn collect_reads_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<String>) {
+        match stmt {
+            Stmt::Let { init: Some(e), .. } => Self::collect_reads_expr(e, out),
+            Stmt::Expr { expr, .. } => Self::collect_reads_expr(expr, out),
+            Stmt::Return { value: Some(e), .. } => Self::collect_reads_expr(e, out),
+            Stmt::If { cond, then, else_, .. } => {
+                Self::collect_reads_expr(cond, out);
+                for s in &then.stmts { Self::collect_reads_stmt(s, out); }
+                if let Some(t) = &then.tail { Self::collect_reads_expr(t, out); }
+                if let Some(eb) = else_ {
+                    if let IfOrBlock::Block(b) = eb.as_ref() {
+                        for s in &b.stmts { Self::collect_reads_stmt(s, out); }
+                        if let Some(t) = &b.tail { Self::collect_reads_expr(t, out); }
+                    }
+                }
+            }
+            Stmt::ForIn { iter, body, .. } => {
+                Self::collect_reads_expr(iter, out);
+                for s in &body.stmts { Self::collect_reads_stmt(s, out); }
+                if let Some(t) = &body.tail { Self::collect_reads_expr(t, out); }
+            }
+            Stmt::While { cond, body, .. } => {
+                Self::collect_reads_expr(cond, out);
+                for s in &body.stmts { Self::collect_reads_stmt(s, out); }
+            }
+            Stmt::Match { expr, arms, .. } => {
+                Self::collect_reads_expr(expr, out);
+                for arm in arms { Self::collect_reads_expr(&arm.body, out); }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_reads_expr(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+        match expr {
+            Expr::Ident { name, .. } => { out.insert(name.clone()); }
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::collect_reads_expr(lhs, out);
+                Self::collect_reads_expr(rhs, out);
+            }
+            Expr::UnOp { expr, .. } => Self::collect_reads_expr(expr, out),
+            Expr::Call { func, args, .. } => {
+                Self::collect_reads_expr(func, out);
+                for a in args { Self::collect_reads_expr(a, out); }
+            }
+            Expr::Field { object, .. } => Self::collect_reads_expr(object, out),
+            Expr::Index { object, indices, .. } => {
+                Self::collect_reads_expr(object, out);
+                for i in indices { Self::collect_reads_expr(i, out); }
+            }
+            Expr::Tuple { elems, .. } => {
+                for e in elems { Self::collect_reads_expr(e, out); }
+            }
+            Expr::IfExpr { cond, then, else_, .. } => {
+                Self::collect_reads_expr(cond, out);
+                for s in &then.stmts { Self::collect_reads_stmt(s, out); }
+                if let Some(t) = &then.tail { Self::collect_reads_expr(t, out); }
+                if let Some(eb) = else_ {
+                    for s in &eb.stmts { Self::collect_reads_stmt(s, out); }
+                    if let Some(t) = &eb.tail { Self::collect_reads_expr(t, out); }
+                }
+            }
+            Expr::Block(b) => {
+                for s in &b.stmts { Self::collect_reads_stmt(s, out); }
+                if let Some(t) = &b.tail { Self::collect_reads_expr(t, out); }
+            }
+            Expr::Assign { target, value, .. } => {
+                // The target is written — only recurse into value and index expressions
+                Self::collect_reads_expr(value, out);
+                if let Expr::Index { object, indices, .. } = target.as_ref() {
+                    Self::collect_reads_expr(object, out);
+                    for i in indices { Self::collect_reads_expr(i, out); }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns true iff `expr` has no observable side-effects (no calls,
+    /// no assignments, no panicking operations that we can't prove safe).
+    fn is_pure_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::IntLit { .. }
+            | Expr::FloatLit { .. }
+            | Expr::BoolLit { .. }
+            | Expr::StrLit { .. }
+            | Expr::Ident { .. } => true,
+            Expr::BinOp { op, lhs, rhs, .. } => {
+                // Division/remainder can panic on zero — treat as impure
+                if matches!(op, BinOpKind::Div | BinOpKind::Rem | BinOpKind::FloorDiv) {
+                    return false;
+                }
+                Self::is_pure_expr(lhs) && Self::is_pure_expr(rhs)
+            }
+            Expr::UnOp { expr, .. } => Self::is_pure_expr(expr),
+            Expr::Tuple { elems, .. } => elems.iter().all(Self::is_pure_expr),
+            // Calls, assignments, indexing, etc. → impure
+            _ => false,
+        }
     }
 }
 
@@ -1271,35 +1423,118 @@ impl DeadStoreEliminator {
     }
 
     fn eliminate_block(&mut self, block: &mut Block) {
-        // Track which variables are written and later overwritten without being read
-        let mut writes: FxHashMap<String, usize> = FxHashMap::default();
-        let mut reads: FxHashMap<String, bool> = FxHashMap::default();
+        // ── Step 1: Build a read-set for everything AFTER each write ─────────
+        // Walk forwards: for each `let x = …` or `x = …` assignment, record the
+        // index.  Then walk the remainder to see whether `x` is ever read before
+        // it is overwritten again.  If not, the initialiser/store is dead.
 
-        for (i, stmt) in block.stmts.iter().enumerate() {
-            match stmt {
-                Stmt::Let { pattern, init, .. } => {
+        // Collect indices of statements that are dead stores we can safely drop.
+        let n = block.stmts.len();
+        let mut dead: Vec<bool> = vec![false; n];
+
+        for i in 0..n {
+            let written_name: Option<String> = match &block.stmts[i] {
+                Stmt::Let { pattern, init: Some(init), .. } => {
                     if let Pattern::Ident { name, .. } = pattern {
-                        if init.is_some() {
-                            writes.insert(name.clone(), i);
-                            reads.entry(name.clone()).or_insert(false);
-                        }
-                    }
+                        // Only consider pure initialisers — impure ones (calls, etc.)
+                        // must be kept for their side-effects even when the result is unused.
+                        if Self::is_pure_init(init) { Some(name.clone()) } else { None }
+                    } else { None }
                 }
-                Stmt::Expr { expr, .. } => {
-                    if let Expr::Assign { target, .. } = expr {
-                        if let Expr::Ident { name, .. } = target.as_ref() {
-                            if let Some(&prev_idx) = writes.get(name) {
-                                if !reads.get(name).copied().unwrap_or(false) {
-                                    self.eliminated += 1;
-                                    let _ = prev_idx;
-                                }
-                            }
-                            writes.insert(name.clone(), i);
+                Stmt::Expr { expr: Expr::Assign { target, value, .. }, .. } => {
+                    if let Expr::Ident { name, .. } = target.as_ref() {
+                        if Self::is_pure_init(value) { Some(name.clone()) } else { None }
+                    } else { None }
+                }
+                _ => None,
+            };
+
+            let name = match written_name { Some(n) => n, None => continue };
+
+            // Scan stmts after i: is `name` read before it is written again?
+            let mut read_before_next_write = false;
+            'outer: for j in (i + 1)..n {
+                // Check for reads first
+                let mut reads: std::collections::HashSet<String> = std::collections::HashSet::default();
+                DeadCodeEliminator::collect_reads_stmt(&block.stmts[j], &mut reads);
+                if reads.contains(&name) {
+                    read_before_next_write = true;
+                    break 'outer;
+                }
+                // Check whether j writes `name` (making i a dead store)
+                let overwrites = match &block.stmts[j] {
+                    Stmt::Let { pattern, .. } => {
+                        matches!(pattern, Pattern::Ident { name: n, .. } if n == &name)
+                    }
+                    Stmt::Expr { expr: Expr::Assign { target, .. }, .. } => {
+                        matches!(target.as_ref(), Expr::Ident { name: n, .. } if n == &name)
+                    }
+                    _ => false,
+                };
+                if overwrites { break 'outer; }
+            }
+
+            // Also check the tail expression
+            if !read_before_next_write {
+                if let Some(tail) = &block.tail {
+                    let mut reads: std::collections::HashSet<String> = std::collections::HashSet::default();
+                    DeadCodeEliminator::collect_reads_expr(tail, &mut reads);
+                    if reads.contains(&name) { read_before_next_write = true; }
+                }
+            }
+
+            if !read_before_next_write {
+                dead[i] = true;
+            }
+        }
+
+        // ── Step 2: Remove dead stores ────────────────────────────────────────
+        let mut idx = 0;
+        block.stmts.retain(|_| {
+            let keep = !dead[idx];
+            if !keep { self.eliminated += 1; }
+            idx += 1;
+            keep
+        });
+
+        // ── Step 3: Recurse into nested blocks ────────────────────────────────
+        for stmt in &mut block.stmts {
+            match stmt {
+                Stmt::ForIn { body, .. }
+                | Stmt::While { body, .. }
+                | Stmt::EntityFor { body, .. } => {
+                    self.eliminate_block(body);
+                }
+                Stmt::If { then, else_, .. } => {
+                    self.eliminate_block(then);
+                    if let Some(eb) = else_ {
+                        if let IfOrBlock::Block(b) = &mut **eb {
+                            self.eliminate_block(b);
                         }
                     }
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Pure in the DSE sense: no side-effects, safe to drop.
+    fn is_pure_init(expr: &Expr) -> bool {
+        match expr {
+            Expr::IntLit { .. }
+            | Expr::FloatLit { .. }
+            | Expr::BoolLit { .. }
+            | Expr::StrLit { .. }
+            | Expr::Ident { .. } => true,
+            Expr::BinOp { op, lhs, rhs, .. } => {
+                if matches!(op, BinOpKind::Div | BinOpKind::Rem | BinOpKind::FloorDiv) {
+                    return false; // potential panic
+                }
+                Self::is_pure_init(lhs) && Self::is_pure_init(rhs)
+            }
+            Expr::UnOp { expr, .. } => Self::is_pure_init(expr),
+            Expr::Tuple { elems, .. } => elems.iter().all(Self::is_pure_init),
+            _ => false,
         }
     }
 }
@@ -1318,15 +1553,37 @@ impl PeepholeOptimizer {
     }
 
     fn optimize_block(&mut self, block: &mut Block) {
-        // Pattern: let x = expr; return x; → return expr;
+        // ── Recurse first (bottom-up) ─────────────────────────────────────────
+        for stmt in &mut block.stmts {
+            match stmt {
+                Stmt::ForIn { body, .. }
+                | Stmt::While { body, .. }
+                | Stmt::EntityFor { body, .. } => {
+                    self.optimize_block(body);
+                }
+                Stmt::If { then, else_, .. } => {
+                    self.optimize_block(then);
+                    if let Some(eb) = else_ {
+                        if let IfOrBlock::Block(b) = &mut **eb {
+                            self.optimize_block(b);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // ── Pattern 1: `let x = e; return x;`  →  `return e;` ───────────────
         let mut i = 0;
         while i + 1 < block.stmts.len() {
-            if let Stmt::Let { pattern, init: Some(init_expr), span: _s1, .. } = &block.stmts[i] {
+            if let Stmt::Let { pattern, init: Some(init_expr), .. } = &block.stmts[i] {
                 if let Stmt::Return { value: Some(ret_expr), span: s2 } = &block.stmts[i + 1] {
                     if let Pattern::Ident { name, .. } = pattern {
                         if let Expr::Ident { name: ret_name, .. } = ret_expr {
                             if name == ret_name {
-                                block.stmts[i] = Stmt::Return { span: *s2, value: Some(init_expr.clone()) };
+                                let new_init = init_expr.clone();
+                                let span = *s2;
+                                block.stmts[i] = Stmt::Return { span, value: Some(new_init) };
                                 block.stmts.remove(i + 1);
                                 self.optimizations += 1;
                                 continue;
@@ -1336,6 +1593,105 @@ impl PeepholeOptimizer {
                 }
             }
             i += 1;
+        }
+
+        // ── Pattern 2: `let x = e;` as tail-only block → hoist e to tail ─────
+        // If the block has exactly one stmt `let x = e` and no tail, and that
+        // binding is the last statement before an implicit unit return, we can
+        // promote the init to the tail expression (useful in expression position).
+        if block.stmts.len() == 1 && block.tail.is_none() {
+            if let Stmt::Let { pattern: Pattern::Ident { .. }, init: Some(init_expr), .. } =
+                &block.stmts[0]
+            {
+                let init_clone = init_expr.clone();
+                block.tail = Some(Box::new(init_clone));
+                block.stmts.clear();
+                self.optimizations += 1;
+            }
+        }
+
+        // ── Pattern 3: consecutive redundant `let x = y; let z = x;` ─────────
+        // `let x = e; let y = x;`  →  `let y = e;`  when x is used only by y.
+        let mut i = 0;
+        while i + 1 < block.stmts.len() {
+            // Check that stmt[i] is `let x = <expr>` and stmt[i+1] is `let y = x`
+            let alias: Option<(String, Expr)> = {
+                if let Stmt::Let { pattern: Pattern::Ident { name: x_name, .. }, init: Some(x_init), .. } =
+                    &block.stmts[i]
+                {
+                    if let Stmt::Let { pattern: Pattern::Ident { name: y_name, .. }, init: Some(y_init), .. } =
+                        &block.stmts[i + 1]
+                    {
+                        if let Expr::Ident { name: ref_name, .. } = y_init {
+                            if ref_name == x_name {
+                                // Make sure x isn't used anywhere else after i+1
+                                let x_name_clone = x_name.clone();
+                                let y_name_clone = y_name.clone();
+                                let x_init_clone = x_init.clone();
+                                // Quick scan: if x appears in stmts[i+2..] or tail, keep it
+                                let used_later = {
+                                    let mut reads: std::collections::HashSet<String> = std::collections::HashSet::default();
+                                    for j in (i + 2)..block.stmts.len() {
+                                        DeadCodeEliminator::collect_reads_stmt(&block.stmts[j], &mut reads);
+                                    }
+                                    if let Some(tail) = &block.tail {
+                                        DeadCodeEliminator::collect_reads_expr(tail, &mut reads);
+                                    }
+                                    reads.contains(&x_name_clone)
+                                };
+                                if !used_later {
+                                    Some((y_name_clone, x_init_clone))
+                                } else { None }
+                            } else { None }
+                        } else { None }
+                    } else { None }
+                } else { None }
+            };
+
+            if let Some((y_name, x_init)) = alias {
+                // Replace stmt[i+1] with `let y_name = x_init`, remove stmt[i]
+                if let Stmt::Let { pattern: Pattern::Ident { name, .. }, init, .. } = &mut block.stmts[i + 1] {
+                    *name = y_name;
+                    *init = Some(x_init);
+                }
+                block.stmts.remove(i);
+                self.optimizations += 1;
+                // don't advance i — re-check this position
+                continue;
+            }
+            i += 1;
+        }
+
+        // ── Pattern 4: empty if-else cleanup ──────────────────────────────────
+        // `if cond {}` (empty then, no else) → drop the whole statement when
+        // cond is a pure expression with no side effects.
+        block.stmts.retain(|stmt| {
+            if let Stmt::If { cond, then, else_: None, .. } = stmt {
+                if then.stmts.is_empty() && then.tail.is_none() && DeadCodeEliminator::is_pure_expr(cond) {
+                    self.optimizations += 1;
+                    return false;
+                }
+            }
+            true
+        });
+
+        // ── Pattern 5: `let x = e; (x never used again)` at block tail ───────
+        // Already handled by DCE, but catch the case where the last let binding
+        // has a non-None init and the tail is `x` → replace tail with init directly.
+        if let Some(tail) = &block.tail {
+            if let Expr::Ident { name: tail_name, span } = tail.as_ref() {
+                if let Some(last) = block.stmts.last() {
+                    if let Stmt::Let { pattern: Pattern::Ident { name: let_name, .. }, init: Some(let_init), .. } = last {
+                        if let_name == tail_name {
+                            let new_tail = let_init.clone();
+                            let _span = *span;
+                            block.tail = Some(Box::new(new_tail));
+                            block.stmts.pop();
+                            self.optimizations += 1;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1366,20 +1722,108 @@ impl LoopOptimizer {
     }
 
     fn licm_block(&mut self, block: &mut Block) {
-        for stmt in &mut block.stmts {
-            match stmt {
-                Stmt::ForIn { body, .. } | Stmt::While { body, .. } | Stmt::EntityFor { body, .. } => {
-                    let invariants = self.collect_invariants(body);
-                    if !invariants.is_empty() {
-                        self.licm_hoists += invariants.len() as u64;
+        // For each loop in this block, hoist loop-invariant `let x = pure_expr`
+        // statements to just before the loop. We define "invariant" as: the
+        // initialiser is a pure expression whose free variables are all defined
+        // *outside* the loop body (i.e. not written inside the body).
+
+        let mut hoisted_prefix: Vec<Stmt> = Vec::new();
+        let mut insert_before: Vec<(usize, Vec<Stmt>)> = Vec::new(); // (loop_idx, hoisted_stmts)
+
+        for (loop_idx, stmt) in block.stmts.iter_mut().enumerate() {
+            let body = match stmt {
+                Stmt::ForIn { body, .. }
+                | Stmt::While { body, .. }
+                | Stmt::EntityFor { body, .. } => body,
+                _ => continue,
+            };
+
+            // Collect variables written anywhere in the loop body
+            let mut written_in_loop: std::collections::HashSet<String> =
+                std::collections::HashSet::default();
+            Self::collect_writes_block(body, &mut written_in_loop);
+
+            // Find invariant stmts inside the body
+            let mut to_hoist: Vec<usize> = Vec::new();
+            for (i, s) in body.stmts.iter().enumerate() {
+                if let Stmt::Let { pattern: Pattern::Ident { name, .. }, init: Some(init), .. } = s {
+                    // The binding itself must not conflict with the written set
+                    // (another stmt could write the same name)
+                    let mut free_vars: std::collections::HashSet<String> =
+                        std::collections::HashSet::default();
+                    DeadCodeEliminator::collect_reads_expr(init, &mut free_vars);
+
+                    let is_invariant = DeadCodeEliminator::is_pure_expr(init)
+                        && !written_in_loop.contains(name)
+                        && free_vars.iter().all(|v| !written_in_loop.contains(v));
+
+                    if is_invariant {
+                        to_hoist.push(i);
                     }
                 }
-                _ => {}
             }
+
+            if to_hoist.is_empty() { continue; }
+
+            // Extract invariant stmts (walk backwards to keep indices valid)
+            let mut hoisted: Vec<Stmt> = Vec::new();
+            for &i in to_hoist.iter().rev() {
+                hoisted.push(body.stmts.remove(i));
+                self.licm_hoists += 1;
+            }
+            hoisted.reverse(); // restore original order
+
+            insert_before.push((loop_idx, hoisted));
+        }
+
+        // Splice hoisted stmts before their respective loops (work backwards)
+        insert_before.reverse();
+        for (loop_idx, hoisted) in insert_before {
+            for (offset, s) in hoisted.into_iter().enumerate() {
+                block.stmts.insert(loop_idx + offset, s);
+            }
+        }
+
+        let _ = hoisted_prefix; // suppress warning
+    }
+
+    /// Collect all variable names that are assigned/bound inside `block`
+    /// (recursively, including nested loops).
+    fn collect_writes_block(block: &Block, out: &mut std::collections::HashSet<String>) {
+        for stmt in &block.stmts {
+            Self::collect_writes_stmt(stmt, out);
+        }
+    }
+
+    fn collect_writes_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<String>) {
+        match stmt {
+            Stmt::Let { pattern: Pattern::Ident { name, .. }, .. } => {
+                out.insert(name.clone());
+            }
+            Stmt::Expr { expr: Expr::Assign { target, .. }, .. } => {
+                if let Expr::Ident { name, .. } = target.as_ref() {
+                    out.insert(name.clone());
+                }
+            }
+            Stmt::ForIn { body, .. }
+            | Stmt::While { body, .. }
+            | Stmt::EntityFor { body, .. } => {
+                Self::collect_writes_block(body, out);
+            }
+            Stmt::If { then, else_, .. } => {
+                Self::collect_writes_block(then, out);
+                if let Some(eb) = else_ {
+                    if let IfOrBlock::Block(b) = eb.as_ref() {
+                        Self::collect_writes_block(b, out);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
     fn collect_invariants(&self, _body: &Block) -> Vec<Expr> {
+        // Kept for API compatibility; real logic is in licm_block.
         Vec::new()
     }
 }
@@ -1530,6 +1974,43 @@ impl BranchOptimizer {
     }
 
     fn optimize_block_mut(&mut self, block: &mut Block) {
+        // ── Pass 1: Fold constant-condition if-statements ─────────────────────
+        // `if true { A } else { B }` → `A`
+        // `if false { A } else { B }` → `B`
+        let mut new_stmts: Vec<Stmt> = Vec::with_capacity(block.stmts.len());
+        for stmt in std::mem::take(&mut block.stmts) {
+            match &stmt {
+                Stmt::If { cond, then, else_, span } => {
+                    match cond {
+                        Expr::BoolLit { value: true, .. } => {
+                            // Keep the `then` block's statements
+                            for s in then.stmts.clone() { new_stmts.push(s); }
+                            if let Some(tail) = &then.tail {
+                                new_stmts.push(Stmt::Expr { span: *span, expr: *tail.clone() });
+                            }
+                            self.optimizations += 1;
+                        }
+                        Expr::BoolLit { value: false, .. } => {
+                            // Keep the `else` branch if it exists
+                            if let Some(else_box) = else_ {
+                                if let IfOrBlock::Block(b) = else_box.as_ref() {
+                                    for s in b.stmts.clone() { new_stmts.push(s); }
+                                    if let Some(tail) = &b.tail {
+                                        new_stmts.push(Stmt::Expr { span: *span, expr: *tail.clone() });
+                                    }
+                                }
+                            }
+                            self.optimizations += 1;
+                        }
+                        _ => new_stmts.push(stmt),
+                    }
+                }
+                _ => new_stmts.push(stmt),
+            }
+        }
+        block.stmts = new_stmts;
+
+        // ── Pass 2: Simplify condition expressions in remaining ifs ───────────
         for stmt in &mut block.stmts {
             if let Stmt::If { cond, then, else_, .. } = stmt {
                 self.optimize_if_cond(cond);
@@ -1541,32 +2022,74 @@ impl BranchOptimizer {
                 }
             }
         }
+
+        // ── Pass 3: Merge identical then/else branches ────────────────────────
+        // `if cond { A } else { A }` → `A`  (when pure condition)
+        for stmt in &mut block.stmts {
+            if let Stmt::If { cond, then, else_: Some(else_box), .. } = stmt {
+                if let IfOrBlock::Block(else_b) = else_box.as_ref() {
+                    if then.stmts == else_b.stmts && then.tail == else_b.tail {
+                        // Condition must be pure to drop it
+                        if DeadCodeEliminator::is_pure_expr(cond) {
+                            // Replace entire if with just then-block contents
+                            // We can't fully drop it here without restructuring;
+                            // instead, set cond to `true` so the next pass removes it.
+                            *cond = Expr::BoolLit { span: cond.span(), value: true };
+                            self.optimizations += 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn optimize_if_cond(&mut self, cond: &mut Expr) {
-        // if (true == x) → if x
-        // if (false == x) → if !x
+        // ── Rule 1: `true == x`  →  `x`,  `false == x`  →  `!x` ─────────────
         if let Expr::BinOp { op: BinOpKind::Eq, lhs, rhs, span } = cond {
-            let lhs_is_true = matches!(lhs.as_ref(), Expr::BoolLit { value: true, .. });
-            let lhs_is_false = matches!(lhs.as_ref(), Expr::BoolLit { value: false, .. });
-            let rhs_is_true = matches!(rhs.as_ref(), Expr::BoolLit { value: true, .. });
-            let rhs_is_false = matches!(rhs.as_ref(), Expr::BoolLit { value: false, .. });
+            let lhs_true  = matches!(lhs.as_ref(), Expr::BoolLit { value: true,  .. });
+            let lhs_false = matches!(lhs.as_ref(), Expr::BoolLit { value: false, .. });
+            let rhs_true  = matches!(rhs.as_ref(), Expr::BoolLit { value: true,  .. });
+            let rhs_false = matches!(rhs.as_ref(), Expr::BoolLit { value: false, .. });
 
-            if lhs_is_true {
-                let new_cond = (**rhs).clone();
-                *cond = new_cond;
+            if lhs_true {
+                *cond = (**rhs).clone(); self.optimizations += 1;
+            } else if lhs_false {
+                *cond = Expr::UnOp { span: *span, op: UnOpKind::Not, expr: rhs.clone() };
                 self.optimizations += 1;
-            } else if lhs_is_false {
-                let new_cond = Expr::UnOp { span: *span, op: UnOpKind::Not, expr: rhs.clone() };
-                *cond = new_cond;
+            } else if rhs_true {
+                *cond = (**lhs).clone(); self.optimizations += 1;
+            } else if rhs_false {
+                *cond = Expr::UnOp { span: *span, op: UnOpKind::Not, expr: lhs.clone() };
                 self.optimizations += 1;
-            } else if rhs_is_true {
-                let new_cond = (**lhs).clone();
-                *cond = new_cond;
+            }
+            return;
+        }
+
+        // ── Rule 2: `x != false`  →  `x`,  `x != true`  →  `!x` ─────────────
+        if let Expr::BinOp { op: BinOpKind::Ne, lhs, rhs, span } = cond {
+            let lhs_true  = matches!(lhs.as_ref(), Expr::BoolLit { value: true,  .. });
+            let lhs_false = matches!(lhs.as_ref(), Expr::BoolLit { value: false, .. });
+            let rhs_true  = matches!(rhs.as_ref(), Expr::BoolLit { value: true,  .. });
+            let rhs_false = matches!(rhs.as_ref(), Expr::BoolLit { value: false, .. });
+
+            if lhs_false {
+                *cond = (**rhs).clone(); self.optimizations += 1;
+            } else if lhs_true {
+                *cond = Expr::UnOp { span: *span, op: UnOpKind::Not, expr: rhs.clone() };
                 self.optimizations += 1;
-            } else if rhs_is_false {
-                let new_cond = Expr::UnOp { span: *span, op: UnOpKind::Not, expr: lhs.clone() };
-                *cond = new_cond;
+            } else if rhs_false {
+                *cond = (**lhs).clone(); self.optimizations += 1;
+            } else if rhs_true {
+                *cond = Expr::UnOp { span: *span, op: UnOpKind::Not, expr: lhs.clone() };
+                self.optimizations += 1;
+            }
+            return;
+        }
+
+        // ── Rule 3: `!!x`  →  `x` ───────────────────────────────────────────
+        if let Expr::UnOp { op: UnOpKind::Not, expr: inner, .. } = cond {
+            if let Expr::UnOp { op: UnOpKind::Not, expr: inner2, .. } = inner.as_ref() {
+                *cond = (**inner2).clone();
                 self.optimizations += 1;
             }
         }
