@@ -1384,6 +1384,8 @@ pub struct CrossFunctionRepair {
     fragile_chains: Vec<CallChain>,
     /// Historical failure counts per edge
     edge_failures: FxHashMap<(String, String), u32>,
+    /// Failure counts per failing function (used to trigger chain repair).
+    chain_failures: FxHashMap<String, u32>,
 }
 
 /// A fragile call chain that may need cross-function repair.
@@ -1410,6 +1412,7 @@ impl CrossFunctionRepair {
             reverse_call_graph: FxHashMap::default(),
             fragile_chains: Vec::new(),
             edge_failures: FxHashMap::default(),
+            chain_failures: FxHashMap::default(),
         }
     }
 
@@ -1443,7 +1446,12 @@ impl CrossFunctionRepair {
         let chain = self.find_call_chain(failure_func)?;
 
         let mut chain = chain;
-        chain.failure_count += 1;
+        let count = self
+            .chain_failures
+            .entry(failure_func.to_string())
+            .or_insert(0);
+        *count += 1;
+        chain.failure_count = *count;
 
         if chain.failure_count >= 3 {
             chain.repair_status = ChainRepairStatus::Unrepaired;
@@ -1463,7 +1471,9 @@ impl CrossFunctionRepair {
         visited.insert(current.clone());
 
         loop {
-            let callers = self.reverse_call_graph.get(&current)?;
+            let Some(callers) = self.reverse_call_graph.get(&current) else {
+                break;
+            };
 
             // Pick caller with most failures (or single caller)
             let best_caller = if callers.len() == 1 {
@@ -1486,7 +1496,7 @@ impl CrossFunctionRepair {
                         best = Some(caller.clone());
                     }
                 }
-                best?
+                best.unwrap_or_else(|| callers[0].clone())
             };
 
             if visited.contains(&best_caller) {
@@ -1927,7 +1937,7 @@ impl CliffPredictor {
             }
         }
 
-        let mut predicted_slowdown: f64 = max_slowdown;
+        let predicted_slowdown: f64 = max_slowdown;
 
         if predicted_slowdown > 2.0 {
             self.predictions.push(CliffPrediction {
@@ -2024,7 +2034,7 @@ impl CausalAnalyzer {
     }
 
     /// Analyze root cause of a failure.
-    pub fn analyze_root_cause(&mut self, event: &RepairEvent) -> Vec<Cause> {
+    fn analyze_root_cause(&mut self, event: &RepairEvent) -> Vec<Cause> {
         let causes = self.identify_causes(event);
 
         let key = format!("{}::{}", event.func_name, event.block_id);
