@@ -319,14 +319,18 @@ impl IRFunction {
     pub fn estimate_frequencies(&mut self) {
         // Mark loop headers with high frequency
         let dom = compute_dominators(self);
+        let mut loop_headers = Vec::new();
         for (&bid, block) in &self.blocks {
             for &succ in &block.successors {
                 // Back edge: succ dominates bid → succ is a loop header
                 if dominates(&dom, succ, bid) {
-                    if let Some(b) = self.blocks.get_mut(&succ) {
-                        b.freq = 100.0;
-                    }
+                    loop_headers.push(succ);
                 }
+            }
+        }
+        for succ in loop_headers {
+            if let Some(b) = self.blocks.get_mut(&succ) {
+                b.freq = 100.0;
             }
         }
     }
@@ -418,7 +422,7 @@ impl CallGraph {
     fn scan_expr(e: &Expr, calls: &mut HashMap<String, usize>) {
         match e {
             Expr::Call { func, args, .. } => {
-                if let Expr::Ident { name } = func.as_ref() {
+                if let Expr::Ident { name, .. } = func.as_ref() {
                     *calls.entry(name.clone()).or_insert(0) += 1;
                 }
                 Self::scan_expr(func, calls);
@@ -447,16 +451,16 @@ impl CallGraph {
 // §3  AST → IR LOWERING
 // =============================================================================
 
-struct LowerCtx<'a> {
+struct LowerCtx {
     func:            IRFunction,
-    var_env:         HashMap<&'a str, VarId>,
+    var_env:         HashMap<String, VarId>,
     break_targets:   Vec<BlockId>,
     continue_targets: Vec<BlockId>,
-    cur:             BlockId,  // ← explicit current block (v1 bug fix)
+    cur:             BlockId,
 }
 
-impl<'a> LowerCtx<'a> {
-    fn new(name: &'a str) -> Self {
+impl LowerCtx {
+    fn new(name: &str) -> Self {
         Self {
             func: IRFunction::new(name.to_string()),
             var_env: HashMap::new(),
@@ -483,11 +487,11 @@ impl<'a> LowerCtx<'a> {
     fn switch_to(&mut self, block: BlockId) { self.cur = block; }
 
     // ── Function entry ───────────────────────────────────────────────────
-    fn lower_fn(&mut self, f: &'a FnDecl) {
+    fn lower_fn(&mut self, f: &FnDecl) {
         for p in &f.params {
             let v = self.fresh_var();
             self.func.params.push(v);
-            self.var_env.insert(p.name.as_str(), v);
+            self.var_env.insert(p.name.to_string(), v);
         }
         self.func.ret_ty = f.ret_ty.clone();
 
@@ -512,7 +516,7 @@ impl<'a> LowerCtx<'a> {
                 if let Some(e) = init {
                     let v = self.lower_expr(e);
                     if let Pattern::Ident { name, .. } = pattern {
-                        self.var_env.insert(name.as_str(), v);
+                        self.var_env.insert(name.to_string(), v);
                     }
                 }
             }
@@ -642,7 +646,7 @@ impl<'a> LowerCtx<'a> {
             let loop_var = self.fresh_var();
             self.emit(IRInstr::Move { dst: loop_var, src: start });
             if let Pattern::Ident { name, .. } = pattern {
-                self.var_env.insert(name.as_str(), loop_var);
+                self.var_env.insert(name.to_string(), loop_var);
             }
 
             let header    = self.fresh_block();
@@ -748,7 +752,7 @@ impl<'a> LowerCtx<'a> {
                 d
             }
             Expr::Call { func: func_e, args, .. } => {
-                if let Expr::Ident { name } = func_e.as_ref() {
+                if let Expr::Ident { name, .. } = func_e.as_ref() {
                     let arg_vars: Vec<_> = args.iter()
                         .map(|a| self.lower_expr(a)).collect();
                     let d = self.fresh_var();
@@ -1241,7 +1245,7 @@ pub fn dominates(idom: &HashMap<BlockId, BlockId>, a: BlockId, b: BlockId) -> bo
 
 fn rpo_order(func: &IRFunction) -> Vec<BlockId> {
     let mut visited = HashSet::new();
-    let mut order   = Vec::new();
+    let mut order: Vec<BlockId>   = Vec::new();
     let mut stack   = vec![func.entry_block];
     // Post-order DFS
     let mut post    = Vec::new();
@@ -1448,7 +1452,7 @@ pub fn run_strength_reduction(func: &mut IRFunction, loops: &[NaturalLoop]) {
                             // Replace mul with: dst_accum = base * factor (pre-header)
                             // and dst_accum += step * factor (in increment block)
                             // For simplicity, convert mul by power-of-2 to shl
-                            if factor > 0 && factor.is_power_of_two() {
+                            if factor > 0 && (factor as u64).is_power_of_two() {
                                 let shift_var = func.fresh_var();
                                 let shift     = factor.trailing_zeros() as i64;
                                 new_instrs.push(IRInstr::Const { dst: shift_var, value: shift });
@@ -1554,14 +1558,14 @@ pub fn run_peephole(func: &mut IRFunction) {
                     // ── mul x, 2^n → shl x, n ───────────────────────────
                     IRInstr::Mul { dst, lhs, rhs } => {
                         if let Some(&v) = const_map.get(rhs) {
-                            if v > 0 && v.is_power_of_two() {
+                            if v > 0 && (v as u64).is_power_of_two() {
                                 let sv = func.next_var; func.next_var += 1;
                                 new.push(IRInstr::Const { dst: sv, value: v.trailing_zeros() as i64 });
                                 new.push(IRInstr::Shl { dst: *dst, lhs: *lhs, rhs: sv });
                                 changed = true; did_replace = true;
                             }
                         } else if let Some(&v) = const_map.get(lhs) {
-                            if v > 0 && v.is_power_of_two() {
+                            if v > 0 && (v as u64).is_power_of_two() {
                                 let sv = func.next_var; func.next_var += 1;
                                 new.push(IRInstr::Const { dst: sv, value: v.trailing_zeros() as i64 });
                                 new.push(IRInstr::Shl { dst: *dst, lhs: *rhs, rhs: sv });
@@ -1573,7 +1577,7 @@ pub fn run_peephole(func: &mut IRFunction) {
                     // ── sdiv x, 2^n → sar x, n ──────────────────────────
                     IRInstr::SDiv { dst, lhs, rhs } => {
                         if let Some(&v) = const_map.get(rhs) {
-                            if v > 0 && v.is_power_of_two() {
+                            if v > 0 && (v as u64).is_power_of_two() {
                                 let sv = func.next_var; func.next_var += 1;
                                 new.push(IRInstr::Const { dst: sv, value: v.trailing_zeros() as i64 });
                                 new.push(IRInstr::AShr { dst: *dst, lhs: *lhs, rhs: sv });
@@ -1769,7 +1773,7 @@ fn inline_stmt(s: &mut Stmt, candidates: &HashSet<String>, fn_map: &HashMap<Stri
 
 fn inline_expr(e: &mut Expr, candidates: &HashSet<String>, fn_map: &HashMap<String, FnDecl>) {
     if let Expr::Call { func, args, .. } = e {
-        if let Expr::Ident { name } = func.as_ref() {
+        if let Expr::Ident { name, .. } = func.as_ref() {
             if candidates.contains(name.as_str()) {
                 // Full inlining would require AST alpha-renaming here;
                 // we fall through and let the IR lowering handle it.

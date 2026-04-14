@@ -441,7 +441,7 @@ impl IRPatch {
         instructions.push(PatchInstr::CallRuntime {
             dst: format!("{}_result", variable),
             helper: "generic_index".into(),
-            args: vec![variable.clone(), index],
+            args: vec![variable.clone(), index.clone()],
         });
 
         Self {
@@ -485,7 +485,7 @@ impl IRPatch {
         instructions.push(PatchInstr::CallRuntime {
             dst: format!("{}_wide", dst),
             helper: format!("wide_{}", op),
-            args: vec![lhs, rhs],
+            args: vec![lhs.clone(), rhs.clone()],
         });
 
         Self {
@@ -581,7 +581,7 @@ impl IRPatch {
         let mut lines = Vec::new();
         lines.push(format!("// Self-repair patch in block {} ({:?})", self.target_block, self.metadata.strategy));
         lines.push(format!("// Root cause: {}", self.metadata.root_cause));
-        lines.push("");
+        lines.push(String::new());
 
         for instr in &self.instructions {
             match instr {
@@ -1251,7 +1251,7 @@ impl SelfRepairEngine {
             repair_success_rate: if self.total_failures > 0 {
                 self.total_repairs as f64 / self.total_failures as f64
             } else {
-                0.0,
+                0.0
             },
             deployed_patches: self.deployed_patches.len(),
             unique_failures: self.failure_counts.len(),
