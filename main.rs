@@ -5,6 +5,8 @@
 #[allow(unused_macros)]
 #[allow(clippy::drop_ref)]
 mod advanced_optimizer;
+mod advanced_self_repair;
+mod aot_native;
 mod ast;
 mod borrowck;
 mod bytecode_vm;
@@ -16,6 +18,7 @@ mod lexer;
 mod ml_engine;
 mod optimizer;
 mod parser;
+mod self_repair;
 mod sema;
 mod string_intern;
 mod tiered_compilation;
@@ -783,6 +786,7 @@ fn print_summary(unit: &CompileUnit, cfg: &RenderCfg) {
 pub struct CliArgs {
     pub command: Command,
     pub file: Option<PathBuf>,
+    pub output: Option<PathBuf>, // -o for compile command
     pub rest_args: Vec<String>,
     pub color: bool,
     pub json_diag: bool,
@@ -827,6 +831,7 @@ pub enum Command {
     Train,
     Estimate,
     Version,
+    Compile, // AOT native compilation to ELF binaries
 }
 
 impl CliArgs {
@@ -888,6 +893,10 @@ impl CliArgs {
                 out.command = Command::Version;
                 it.next();
             }
+            Some("compile") | Some("build") => {
+                out.command = Command::Compile;
+                it.next();
+            }
             Some("help") | Some("--help") | Some("-h") | None => {
                 out.command = Command::Help;
                 it.next();
@@ -926,6 +935,13 @@ impl CliArgs {
                 }
                 "--quiet" | "-q" => {
                     out.quiet = true;
+                }
+                "-o" | "--output" => {
+                    let path = it
+                        .next()
+                        .ok_or("-o requires a value")?
+                        .clone();
+                    out.output = Some(PathBuf::from(path));
                 }
                 "--tab-width" => {
                     let n = it
@@ -1089,6 +1105,7 @@ fn cmd_help() {
     println!("    jules <command> [options] [file.jules] [-- args…]\n");
     println!("COMMANDS:");
     println!("    run   <file.jules>    Execute a Jules source file");
+    println!("    compile <file.jules>  Compile to native x86-64 ELF binary (AOT, fastest!)");
     println!("    check <file.jules>    Type-check and lint without running (incremental cache)");
     println!("    fix   <file.jules>    Apply safe syntax autofixes from diagnostics");
     println!("    fmt   <file.jules>    Pretty-print the source (token pass)");
@@ -1105,6 +1122,7 @@ fn cmd_help() {
     println!("    --warn-error / -W  Treat warnings as errors");
     println!("    --quiet  / -q      Suppress warnings and notes");
     println!("    --tab-width <N>    Tab stop width (default: 4)");
+    println!("    -o, --output <PATH> Output path for compile command");
     println!("    --entry <fn>       Entry-point function (default: main)");
     println!("    --dry-run          (fix) show changes without writing");
     println!("    --diff             (fix) print changed lines");
@@ -1126,6 +1144,9 @@ fn cmd_help() {
     println!("    --tier-stats       Print tier compilation statistics after execution");
     println!("\nEXAMPLES:");
     println!("    jules run examples/physics.jules");
+    println!("    jules compile examples/math.jules           # → ./math (native ELF binary)");
+    println!("    jules compile examples/math.jules -o out    # → ./out");
+    println!("    ./math                                       # run the native binary!");
     println!("    jules run examples/warden.jules --tiered --tier-stats");
     println!("    jules run examples/warden.jules --tiered --tier-policy max-performance");
     println!("    jules check src/agent.jules -W");
@@ -2114,6 +2135,101 @@ fn check_jax_backend_env(script: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// =============================================================================
+// AOT NATIVE COMPILATION COMMAND
+// =============================================================================
+
+fn cmd_compile(args: &CliArgs) -> i32 {
+    let path = match &args.file {
+        Some(p) => p,
+        None => {
+            eprintln!("jules compile: no file provided");
+            eprintln!("Usage: jules compile <file.jules> [-o output]");
+            return 2;
+        }
+    };
+
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("jules: cannot read `{}`: {e}", path.display());
+            return 2;
+        }
+    };
+
+    // Determine output path
+    let output_path = args.output.as_ref().map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| {
+            // Default: strip .jules extension and add nothing (native binary)
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            format!("./{}", stem)
+        });
+
+    if !args.quiet {
+        eprintln!("Compiling {} → {} (AOT native x86-64)", path.display(), output_path);
+    }
+
+    // Run full compilation pipeline
+    let path_str = path.to_string_lossy();
+    let mut unit = CompileUnit::new(path_str.as_ref(), &source);
+    let result = Pipeline::new().run(&mut unit);
+
+    if unit.has_errors() {
+        let msgs: Vec<_> = unit
+            .diags
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message.clone())
+            .collect();
+        for msg in msgs {
+            eprintln!("error: {}", msg);
+        }
+        return 1;
+    }
+
+    let program = match result {
+        PipelineResult::Ok(program) => program,
+        _ => {
+            eprintln!("jules compile: pipeline did not produce a program");
+            return 1;
+        }
+    };
+
+    // Apply optimizations
+    if !args.quiet {
+        eprintln!("  Optimizing (level {})...", args.opt_level);
+    }
+
+    // AOT compile to native ELF binary
+    let start = std::time::Instant::now();
+    match crate::aot_native::compile_to_native(&program, &output_path, args.opt_level) {
+        Ok(()) => {
+            let elapsed = start.elapsed();
+            if !args.quiet {
+                eprintln!("✓ Compiled in {:.3}s", elapsed.as_secs_f64());
+                eprintln!("  Output: {}", output_path);
+                
+                // Show file size
+                if let Ok(metadata) = std::fs::metadata(&output_path) {
+                    let size = metadata.len();
+                    if size < 1024 {
+                        eprintln!("  Size: {} bytes", size);
+                    } else if size < 1024 * 1024 {
+                        eprintln!("  Size: {:.1} KB", size as f64 / 1024.0);
+                    } else {
+                        eprintln!("  Size: {:.2} MB", size as f64 / (1024.0 * 1024.0));
+                    }
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("jules compile: {}", e);
+            1
+        }
+    }
+}
+
 fn cmd_train(args: &CliArgs) -> i32 {
     let path = match &args.file {
         Some(p) => p,
@@ -2834,6 +2950,7 @@ pub fn main() {
         Command::Check => cmd_check(&args),
         Command::Fix => cmd_fix(&args),
         Command::Run => cmd_run(&args),
+        Command::Compile => cmd_compile(&args),
         Command::Train => cmd_train(&args),
         Command::Estimate => cmd_estimate(&args),
         Command::Fmt => cmd_fmt(&args),
