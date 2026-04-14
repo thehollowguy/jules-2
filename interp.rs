@@ -55,7 +55,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 // ── Fast HashMap — ~2x faster than SipHash for short string keys ─────────────
-use rustc_hash::{FxHashMap};
+use rustc_hash::FxHashMap;
 
 // ── Direct threading: when compiling with nightly, use computed-goto labels ──
 //   This eliminates the match dispatch overhead in the hot VM loop.
@@ -2939,11 +2939,15 @@ pub fn vm_exec(
                             BinOpKind::Sub => Value::I32(a.wrapping_sub(b)),
                             BinOpKind::Mul => Value::I32(a.wrapping_mul(b)),
                             BinOpKind::Div => {
-                                if b == 0 { return rt_err!("division by zero"); }
+                                if b == 0 {
+                                    return rt_err!("division by zero");
+                                }
                                 Value::I32(a.wrapping_div(b))
                             }
                             BinOpKind::Rem => {
-                                if b == 0 { return rt_err!("modulo by zero"); }
+                                if b == 0 {
+                                    return rt_err!("modulo by zero");
+                                }
                                 Value::I32(a.wrapping_rem(b))
                             }
                             BinOpKind::Lt => Value::Bool(a < b),
@@ -2963,12 +2967,16 @@ pub fn vm_exec(
                             BinOpKind::Sub => Value::F32(a - b),
                             BinOpKind::Mul => Value::F32(a * b),
                             BinOpKind::Div => {
-                                if b == 0.0 { return rt_err!("division by zero"); }
+                                if b == 0.0 {
+                                    return rt_err!("division by zero");
+                                }
                                 Value::F32(a / b)
                             }
                             BinOpKind::Rem => Value::F32(a % b),
                             BinOpKind::FloorDiv => {
-                                if b == 0.0 { return rt_err!("floor division by zero"); }
+                                if b == 0.0 {
+                                    return rt_err!("floor division by zero");
+                                }
                                 Value::F32((a / b).floor())
                             }
                             BinOpKind::Lt => Value::Bool(a < b),
@@ -2988,11 +2996,15 @@ pub fn vm_exec(
                             BinOpKind::Sub => Value::I64(a.wrapping_sub(b)),
                             BinOpKind::Mul => Value::I64(a.wrapping_mul(b)),
                             BinOpKind::Div => {
-                                if b == 0 { return rt_err!("division by zero"); }
+                                if b == 0 {
+                                    return rt_err!("division by zero");
+                                }
                                 Value::I64(a.wrapping_div(b))
                             }
                             BinOpKind::Rem => {
-                                if b == 0 { return rt_err!("modulo by zero"); }
+                                if b == 0 {
+                                    return rt_err!("modulo by zero");
+                                }
                                 Value::I64(a.wrapping_rem(b))
                             }
                             BinOpKind::Lt => Value::Bool(a < b),
@@ -3312,7 +3324,11 @@ pub fn vm_exec_i32(
             Instr::LoadBool(d, b) => *reg_mut!(*d) = if *b { 1 } else { 0 },
             Instr::LoadI32(d, v) => *reg_mut!(*d) = *v,
             Instr::LoadI64(d, v) => *reg_mut!(*d) = *v as i32,
-            Instr::LoadF32(..) | Instr::LoadF64(..) | Instr::LoadStr(..) | Instr::LoadConst(..) | Instr::LoadFn(..) => {
+            Instr::LoadF32(..)
+            | Instr::LoadF64(..)
+            | Instr::LoadStr(..)
+            | Instr::LoadConst(..)
+            | Instr::LoadFn(..) => {
                 return None; // fall back to regular VM
             }
             Instr::Move(d, s) => {
@@ -3335,19 +3351,65 @@ pub fn vm_exec_i32(
                     BinOpKind::Sub => a.wrapping_sub(b),
                     BinOpKind::Mul => a.wrapping_mul(b),
                     BinOpKind::Div => {
-                        if b == 0 { return Some(Err(RuntimeError { message: "division by zero".into(), span: None })); }
+                        if b == 0 {
+                            return Some(Err(RuntimeError {
+                                message: "division by zero".into(),
+                                span: None,
+                            }));
+                        }
                         a.wrapping_div(b)
                     }
                     BinOpKind::Rem => {
-                        if b == 0 { return Some(Err(RuntimeError { message: "modulo by zero".into(), span: None })); }
+                        if b == 0 {
+                            return Some(Err(RuntimeError {
+                                message: "modulo by zero".into(),
+                                span: None,
+                            }));
+                        }
                         a.wrapping_rem(b)
                     }
-                    BinOpKind::Lt => if a < b { 1 } else { 0 },
-                    BinOpKind::Le => if a <= b { 1 } else { 0 },
-                    BinOpKind::Gt => if a > b { 1 } else { 0 },
-                    BinOpKind::Ge => if a >= b { 1 } else { 0 },
-                    BinOpKind::Eq => if a == b { 1 } else { 0 },
-                    BinOpKind::Ne => if a != b { 1 } else { 0 },
+                    BinOpKind::Lt => {
+                        if a < b {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    BinOpKind::Le => {
+                        if a <= b {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    BinOpKind::Gt => {
+                        if a > b {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    BinOpKind::Ge => {
+                        if a >= b {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    BinOpKind::Eq => {
+                        if a == b {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    BinOpKind::Ne => {
+                        if a != b {
+                            1
+                        } else {
+                            0
+                        }
+                    }
                     _ => return None,
                 };
             }
@@ -3355,7 +3417,13 @@ pub fn vm_exec_i32(
                 let v = reg!(*s);
                 *reg_mut!(*d) = match op {
                     UnOpKind::Neg => v.wrapping_neg(),
-                    UnOpKind::Not => if v == 0 { 1 } else { 0 },
+                    UnOpKind::Not => {
+                        if v == 0 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
                     _ => return None,
                 };
             }
@@ -3521,7 +3589,8 @@ impl SimWorldState {
         }
         let cell_size = (max_extent * 2.0).max(0.25);
 
-        let mut grid: FxHashMap<(i32, i32), Vec<i64>> = FxHashMap::with_capacity_and_hasher(self.entities.len(), Default::default());
+        let mut grid: FxHashMap<(i32, i32), Vec<i64>> =
+            FxHashMap::with_capacity_and_hasher(self.entities.len(), Default::default());
         let ids = self.entities.keys().copied().collect::<Vec<_>>();
         for id in &ids {
             if let Some(e) = self.entities.get(id) {
@@ -3857,7 +3926,8 @@ impl Interpreter {
                 } else {
                     self.pgo_call_counts.insert(name.to_owned(), 1);
                 }
-                if !self.pgo_window_done && self.pgo_started_at.elapsed() >= Duration::from_millis(5)
+                if !self.pgo_window_done
+                    && self.pgo_started_at.elapsed() >= Duration::from_millis(5)
                 {
                     self.pgo_window_done = true;
                     if let Some((hot_name, _)) = self
@@ -4997,7 +5067,7 @@ impl Interpreter {
 
     fn stdlib_modules_value(&self) -> Value {
         let std_modules = crate::jules_std::modules_value();
-        let mut modules: [(&str, &[&str]); 19] = [
+        let modules: [(&str, &[&str]); 19] = [
             (
                 "core",
                 &[
@@ -5149,18 +5219,19 @@ impl Interpreter {
                 .collect::<Vec<_>>();
             out.insert(module.to_string(), Value::Array(Arc::new(Mutex::new(vals))));
         }
-        // Merge std library modules into the output
+        // Merge std library modules into the output without overwriting
+        // interpreter-specific catalogs (which intentionally include short names).
         if let Value::HashMap(std_map) = std_modules {
             if let Ok(map) = std_map.lock() {
                 for (k, v) in map.iter() {
-                    out.insert(k.clone(), v.clone());
+                    out.entry(k.clone()).or_insert_with(|| v.clone());
                 }
             }
         }
         Value::HashMap(Arc::new(Mutex::new(out)))
     }
 
-    fn eval_builtin(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    pub fn eval_builtin(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         use std::f64::consts;
         let name = Self::canonical_builtin_name(name);
 

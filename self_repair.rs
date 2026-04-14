@@ -217,18 +217,8 @@ impl RepairEvent {
     pub fn fingerprint(&self) -> u64 {
         let mut hasher = FxHasher::default();
         self.failure_type.hash(&mut hasher);
-        // Hash the types in runtime_context (not values — too volatile)
-        for (key, val) in &self.runtime_context {
-            key.hash(&mut hasher);
-            match val {
-                RuntimeValue::TypeOnly(t) => t.hash(&mut hasher),
-                RuntimeValue::Tensor { elem, shape } => {
-                    elem.hash(&mut hasher);
-                    shape.hash(&mut hasher);
-                }
-                _ => {}
-            }
-        }
+        // Intentionally ignore runtime_context so equivalent failures across
+        // different callsites/functions map to a stable shared fingerprint.
         hasher.finish()
     }
 
@@ -1028,7 +1018,7 @@ impl EGraphSynthesizer {
     fn optimize_patch(&self, mut patch: IRPatch) -> IRPatch {
         // Apply rewrite rules to simplify the patch
         for _iteration in 0..self.max_iterations {
-            let mut changed = false;
+            let changed = false;
             for rule in &self.rewrite_rules {
                 // Simplified: just count instructions as proxy for cost
                 // Full implementation would use proper e-graph matching
