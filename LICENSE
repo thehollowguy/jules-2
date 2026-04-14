@@ -1,72 +1,85 @@
-Open Intelligence Reciprocal License v1.0 (OIRL-1.0 experimental)
+Jules Reciprocal Source License v1.0 (JRSL-1.0 experimental)
+Preamble
+Jules is built on the principle that high-performance infrastructure must remain transparent, auditable, and community-stewarded. This license grants broad freedoms to individuals, researchers, small organizations, and non-commercial users. However, to ensure the long-term sustainability of the commons, Large Commercial Entities are required to contribute their improvements back to the project.
 
-Jules is built on the principle that high-performance infrastructure must remain transparent, auditable, and community-stewarded. This license grants broad freedoms to individuals, researchers, small organizations, and non-commercial users, while requiring large commercial entities to contribute their improvements back to the commons.
+Note: This is not an Open Source Initiative (OSI) approved license. It is a source-available license with reciprocal obligations for qualifying commercial entities.
 
 1. Definitions
+
 1.1 “Software”
 The Jules compiler, runtime, optimization passes, self-repair engine, JIT tiers, AoT system, standard library, tools, and all associated source code and assets released by Open Intelligence under this license.
 
 1.2 “Derivative Work”
-Any modification, extension, fork, or work that is based on the Software and incorporates substantial portions of its source code.
+Any modification, extension, fork, or work that is based on the Software and incorporates substantial portions of its source code. For the avoidance of doubt, separate modules or applications that merely link to or invoke the Software via standard public APIs without incorporating source code from the Software are not considered Derivative Works.
 
 1.3 “Improvement”
-Any change, addition, or bug fix made directly to the licensed source code of the Software (including new files that are added to a fork or derivative and contain code copied or adapted from the original Software).
+Any change, addition, bug fix, or optimization made directly to the source code of the Software or its Derivative Works.
 
 1.4 “Qualifying Organization”
 Any legal entity (including its parent companies, subsidiaries, affiliates, and controlled entities) whose consolidated gross annual revenue exceeded $10,000,000 USD in the preceding 12-month fiscal period, calculated according to standard GAAP/IFRS rules.
 
 1.5 “Upstream Contribution”
-A complete pull request submitted to the official Open Intelligence repository containing the Improvement, properly licensed under OIRL-1.0, with tests and documentation where applicable.
+A complete pull request submitted to the official Open Intelligence repository containing the Improvement, properly licensed under JRSL-1.0, with tests and documentation where applicable.
+
+1.6 “Corresponding Source”
+For a Derivative Work, the Corresponding Source means all the source code needed to generate, install, and run the Derivative Work (excluding system libraries and tools). It does not include source code for independent applications that merely use the Software via standard interfaces.
 
 2. Grant of Rights
-Subject to the terms of this license, Open Intelligence grants you a perpetual, worldwide, non-exclusive, royalty-free, irrevocable (except as provided in Section 6) copyright and patent license to:
-
+Subject to the terms of this license, Open Intelligence grants you a perpetual, worldwide, non-exclusive, royalty-free, irrevocable (except as provided in Section 7) copyright and patent license to:
 Use, copy, modify, and distribute the Software.
 Create and distribute Derivative Works.
 
-Individuals and Non-Qualifying Organizations may exercise these rights without further obligations, including the right to distribute Derivative Works under any license of their choice (including proprietary/closed-source licenses).
+2.1 Rights for Individuals and Non-Qualifying Organizations
+If you are an individual or a Non-Qualifying Organization, you may exercise these rights without further obligations. You may distribute Derivative Works under any license of your choice, including proprietary or closed-source licenses, provided you retain all copyright notices and disclaimers present in the original Software.
 
 3. Obligations for Qualifying Organizations
+If you are a Qualifying Organization, or if you become one, you must comply with the following obligations for any Derivative Work created or used after the date you become a Qualifying Organization.
 
-If you are (or become) a Qualifying Organization, or if any employee, contractor, or agent acting on your behalf creates or uses a Derivative Work in a production or commercial context, you must comply with all of the following:
+3.1 Grandfather Clause
+If you were a Non-Qualifying Organization when you first created or deployed a specific Derivative Work, you may continue to use, modify, and distribute that specific version of the Derivative Work under the terms applicable at the time of its creation, even if you later become a Qualifying Organization. However, any new Derivative Works created or significant new modifications made after becoming a Qualifying Organization must comply with Sections 3.2 and 3.3.
 
-3.1 Public Release Requirement
+3.2 Public Release Requirement
 Within 30 days of the earlier of (a) internal production deployment, (b) external distribution, or (c) offering the Derivative Work as a service, you must:
-
-Publish the complete corresponding source code of the Derivative Work under OIRL-1.0.
+Publish the complete Corresponding Source of the Derivative Work under JRSL-1.0.
 Host it in a publicly accessible Git repository with full history and clear attribution to Open Intelligence.
 
-3.2 Mandatory Upstream Contribution
-Every Improvement must be submitted as an Upstream Contribution within 14 days of its creation or internal adoption (whichever is earlier). The contribution must include:
-
+3.3 Mandatory Upstream Contribution
+Every Improvement made to the Software itself must be submitted as an Upstream Contribution within 14 days of its creation or internal adoption (whichever is earlier). The contribution must include:
 Full source code.
 Relevant tests.
 Documentation of the change.
 
-3.3 Anti-Circumvention
+3.4 Anti-Circumvention
 You may not circumvent these obligations by:
-
-Using shell companies, subsidiaries, or affiliated entities to stay under the $10M revenue threshold (revenue is calculated on a fully consolidated basis).
+Using shell companies, subsidiaries, or affiliated entities to artificially stay under the $10M revenue threshold (revenue is calculated on a fully consolidated basis).
 Having employees or contractors create or use Derivative Works through personal accounts or third-party repositories to avoid the obligations of this section.
-Delaying contribution or public release through internal-only use followed by later external distribution.
 
-4. Compliance & Audit
+4. Compliance & Certification
 
-Qualifying Organizations must maintain a public compliance page listing their Jules-based deployments and Upstream Contributions.
-Open Intelligence may request a compliance audit with 30 days written notice. The audit is limited to verifying the obligations in Section 3 and must respect reasonable confidentiality.
-Failure to respond to an audit request within 45 days constitutes a material breach.
+4.1 Compliance Page
+Qualifying Organizations must maintain a public webpage listing their Jules-based deployments and links to their Upstream Contributions.
+
+4.2 Certification of Compliance
+Upon reasonable written notice from Open Intelligence alleging non-compliance, a Qualifying Organization must provide a written certification signed by an officer of the company stating that they are in compliance with Section 3. Open Intelligence reserves the right to request this certification no more than once per calendar year.
+
+4.3 Dispute Resolution
+If Open Intelligence disputes the certification, the parties agree to attempt good-faith negotiation for 30 days. If unresolved, the matter may be subject to binding arbitration in accordance with the laws specified in Section 9.
 
 5. Patent Retaliation
-If you or any of your affiliates initiate patent litigation against Open Intelligence or any contributor alleging that the Software infringes your patents, all rights granted under this license terminate immediately.
+If you or any of your affiliates initiate patent litigation against Open Intelligence or any contributor alleging that the Software itself infringes your patents, then any patent licenses granted to you under this License for that Software shall terminate immediately. This clause does not apply to patent litigation regarding other products or services unrelated to the Software.
 
 6. Termination
-Rights under this license terminate automatically upon material breach. A 30-day cure period applies for unintentional breaches. Upon termination you must cease all distribution of the Derivative Work and remove public copies, except for copies that were already released in full compliance with Section 3.
+Rights under this license terminate automatically upon material breach.
+Cure Period: For unintentional breaches, you have a 30-day period to cure the breach after receiving notice. If cured, your rights are reinstated retroactively.
+Effect of Termination: Upon termination, you must cease all distribution of the Derivative Work and remove public copies, except for copies that were already released in full compliance with Section 3 prior to termination.
 
 7. Disclaimer of Warranty
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND. OPEN INTELLIGENCE AND CONTRIBUTORS SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM USE OF THE SOFTWARE.
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL OPEN INTELLIGENCE OR CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 8. Governing Law
-This license is governed by the laws of the United States and the State of california 
+This license shall be governed by and construed in accordance with the laws of the United States and the State of California, without regard to its conflict of law principles.
 
 9. License Versioning
-Open Intelligence may release updated versions of this license. You may choose to use any later version that is explicitly marked as compatible with this release.
+Open Intelligence may release updated versions of this license. Each version will be given a distinguishing version number.
+If the Software specifies that a particular version of this License "or any later version" applies to it, you have the option of following the terms and conditions either of that published version or of any later version published by Open Intelligence.
+If the Software does not specify a version number, you may choose any version ever published by Open Intelligence.
