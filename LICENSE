@@ -1,21 +1,70 @@
-MIT License
+Open Intelligence Reciprocal License v1.0 (OIRL-1.0 experimental)
 
-Copyright (c) 2026 thehollowguy
+Jules is built on the principle that high-performance infrastructure must remain transparent, auditable, and community-stewarded. This license grants broad freedoms to individuals, researchers, small organizations, and non-commercial users, while requiring large commercial entities to contribute their improvements back to the commons.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. Definitions
+1.1 “Software”
+The Jules compiler, runtime, optimization passes, self-repair engine, JIT tiers, AoT system, standard library, tools, and all associated source code and assets released by Open Intelligence under this license.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1.2 “Derivative Work”
+Any modification, extension, fork, or work that is based on the Software and incorporates substantial portions of its source code.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+1.3 “Improvement”
+Any change, addition, or bug fix made directly to the licensed source code of the Software (including new files that are added to a fork or derivative and contain code copied or adapted from the original Software).
+
+1.4 “Qualifying Organization”
+Any legal entity (including its parent companies, subsidiaries, affiliates, and controlled entities) whose consolidated gross annual revenue exceeded $10,000,000 USD in the preceding 12-month fiscal period, calculated according to standard GAAP/IFRS rules.
+
+1.5 “Upstream Contribution”
+A complete pull request submitted to the official Open Intelligence repository containing the Improvement, properly licensed under OIRL-1.0, with tests and documentation where applicable.
+
+2. Grant of Rights
+Subject to the terms of this license, Open Intelligence grants you a perpetual, worldwide, non-exclusive, royalty-free, irrevocable (except as provided in Section 6) copyright and patent license to:
+
+Use, copy, modify, and distribute the Software.
+Create and distribute Derivative Works.
+
+Individuals and Non-Qualifying Organizations may exercise these rights without further obligations, including the right to distribute Derivative Works under any license of their choice (including proprietary/closed-source licenses).
+
+3. Obligations for Qualifying Organizations
+
+If you are (or become) a Qualifying Organization, or if any employee, contractor, or agent acting on your behalf creates or uses a Derivative Work in a production or commercial context, you must comply with all of the following:
+
+3.1 Public Release Requirement
+Within 30 days of the earlier of (a) internal production deployment, (b) external distribution, or (c) offering the Derivative Work as a service, you must:
+
+Publish the complete corresponding source code of the Derivative Work under OIRL-1.0.
+Host it in a publicly accessible Git repository with full history and clear attribution to Open Intelligence.
+
+3.2 Mandatory Upstream Contribution
+Every Improvement must be submitted as an Upstream Contribution within 14 days of its creation or internal adoption (whichever is earlier). The contribution must include:
+
+Full source code.
+Relevant tests.
+Documentation of the change.
+
+3.3 Anti-Circumvention
+You may not circumvent these obligations by:
+
+Using shell companies, subsidiaries, or affiliated entities to stay under the $10M revenue threshold (revenue is calculated on a fully consolidated basis).
+Having employees or contractors create or use Derivative Works through personal accounts or third-party repositories to avoid the obligations of this section.
+Delaying contribution or public release through internal-only use followed by later external distribution.
+
+4. Compliance & Audit
+
+Qualifying Organizations must maintain a public compliance page listing their Jules-based deployments and Upstream Contributions.
+Open Intelligence may request a compliance audit with 30 days written notice. The audit is limited to verifying the obligations in Section 3 and must respect reasonable confidentiality.
+Failure to respond to an audit request within 45 days constitutes a material breach.
+
+5. Patent Retaliation
+If you or any of your affiliates initiate patent litigation against Open Intelligence or any contributor alleging that the Software infringes your patents, all rights granted under this license terminate immediately.
+
+6. Termination
+Rights under this license terminate automatically upon material breach. A 30-day cure period applies for unintentional breaches. Upon termination you must cease all distribution of the Derivative Work and remove public copies, except for copies that were already released in full compliance with Section 3.
+
+7. Disclaimer of Warranty
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND. OPEN INTELLIGENCE AND CONTRIBUTORS SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM USE OF THE SOFTWARE.
+8. Governing Law
+This license is governed by the laws of Switzerland. Any disputes shall be resolved by binding arbitration in Zurich under the Swiss Rules of International Arbitration. The prevailing party shall be entitled to recover reasonable legal fees.
+9. License Versioning
+Open Intelligence may release updated versions of this license. You may choose to use any later version that is explicitly marked as compatible with this release.
