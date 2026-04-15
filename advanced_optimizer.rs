@@ -1986,7 +1986,7 @@ impl BranchOptimizer {
                             // Keep the `then` block's statements
                             for s in then.stmts.clone() { new_stmts.push(s); }
                             if let Some(tail) = &then.tail {
-                                new_stmts.push(Stmt::Expr { span: *span, expr: *tail.clone() });
+                                new_stmts.push(Stmt::Expr { span: *span, expr: *tail.clone(), has_semi: true });
                             }
                             self.optimizations += 1;
                         }
@@ -1996,7 +1996,7 @@ impl BranchOptimizer {
                                 if let IfOrBlock::Block(b) = else_box.as_ref() {
                                     for s in b.stmts.clone() { new_stmts.push(s); }
                                     if let Some(tail) = &b.tail {
-                                        new_stmts.push(Stmt::Expr { span: *span, expr: *tail.clone() });
+                                        new_stmts.push(Stmt::Expr { span: *span, expr: *tail.clone(), has_semi: true });
                                     }
                                 }
                             }

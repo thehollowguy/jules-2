@@ -21,6 +21,7 @@ use std::ptr;
 
 use region::Protection;
 
+use crate::ast::{BinOpKind, UnOpKind};
 use crate::interp::{Instr, RuntimeError, Value};
 
 // =============================================================================
@@ -190,15 +191,12 @@ impl Value {
 pub struct NativeCodeGenerator {
     /// Code buffer (executable memory)
     code_buffer: Vec<u8>,
-    /// Compiled traces
-    compiled_traces: HashMap<u32, CompiledTrace>,
 }
 
 impl NativeCodeGenerator {
     pub fn new() -> Self {
         Self {
             code_buffer: Vec::with_capacity(4096),
-            compiled_traces: HashMap::new(),
         }
     }
     
@@ -228,8 +226,6 @@ impl NativeCodeGenerator {
             guard_count: trace.guards.len(),
             instruction_count: trace.instructions.len(),
         };
-        
-        self.compiled_traces.insert(trace.id, compiled.clone());
         
         Ok(compiled)
     }
@@ -266,7 +262,7 @@ impl NativeCodeGenerator {
                 self.emit_i64(*value);
                 self.emit_store_slot(*dst, 0);
             }
-            Instr::Add(dst, lhs, rhs) => {
+            Instr::BinOp(dst, BinOpKind::Add, lhs, rhs) => {
                 // Fast path: integer addition
                 // mov rax, [rdi + lhs*8]
                 self.emit_load_slot(*lhs, 0);
@@ -277,14 +273,14 @@ impl NativeCodeGenerator {
                 // Store result
                 self.emit_store_slot(*dst, 0);
             }
-            Instr::Sub(dst, lhs, rhs) => {
+            Instr::BinOp(dst, BinOpKind::Sub, lhs, rhs) => {
                 self.emit_load_slot(*lhs, 0);
                 self.emit_load_slot(*rhs, 1);
                 // sub rax, rcx
                 self.emit3(0x48, 0x29, 0xC8);
                 self.emit_store_slot(*dst, 0);
             }
-            Instr::Mul(dst, lhs, rhs) => {
+            Instr::BinOp(dst, BinOpKind::Mul, lhs, rhs) => {
                 self.emit_load_slot(*lhs, 0);
                 self.emit_load_slot(*rhs, 1);
                 // imul rax, rcx
@@ -295,9 +291,8 @@ impl NativeCodeGenerator {
                 // Load condition
                 self.emit_load_slot(*cond, 0);
                 // test rax, rax
-                self.emit2(0x48, 0x85, 0xC0);
+                self.emit3(0x48, 0x85, 0xC0);
                 // jz offset
-                let offset_pos = self.code_buffer.len();
                 self.emit2(0x0F, 0x84); // jz rel32
                 self.emit_i32(0); // Placeholder
                 // Will be patched later
@@ -441,7 +436,6 @@ impl Drop for ExecutableMemory {
 // =============================================================================
 
 /// A compiled trace ready for execution
-#[derive(Clone)]
 pub struct CompiledTrace {
     pub trace_id: u32,
     pub entry_point: *mut u8,
@@ -539,8 +533,178 @@ impl TracingJIT {
             }
         }
         
-        // Interpret normally (would call the tree-walker or bytecode VM)
-        // This is handled by the main interpreter loop
-        Err(RuntimeError::new("JIT not implemented yet"))
+        self.execute_fallback(0, slots, instructions)
+    }
+
+    fn execute_fallback(
+        &self,
+        entry_pc: usize,
+        slots: &mut [Value],
+        instructions: &[Instr],
+    ) -> Result<Value, RuntimeError> {
+        let mut regs = vec![Value::Unit; slots.len().max(256)];
+        let mut slot_file = slots.to_vec();
+        for (i, v) in slot_file.iter().enumerate() {
+            if i < regs.len() {
+                regs[i] = v.clone();
+            }
+        }
+        let mut pc = entry_pc;
+        let max_steps = instructions.len().saturating_mul(1_000_000).max(1_000_000);
+        let mut steps = 0usize;
+
+        while pc < instructions.len() {
+            steps += 1;
+            if steps > max_steps {
+                return Err(RuntimeError::new("tracing fallback exceeded step budget"));
+            }
+
+            let instr = instructions[pc].clone();
+            pc += 1;
+
+            let mut ensure_reg = |idx: usize| {
+                if idx >= regs.len() {
+                    regs.resize(idx + 1, Value::Unit);
+                }
+            };
+            let mut ensure_slot = |idx: usize| {
+                if idx >= slot_file.len() {
+                    slot_file.resize(idx + 1, Value::Unit);
+                }
+            };
+
+            match instr {
+                Instr::Nop => {}
+                Instr::LoadUnit(d) => { ensure_reg(d as usize); regs[d as usize] = Value::Unit; }
+                Instr::LoadBool(d, b) => { ensure_reg(d as usize); regs[d as usize] = Value::Bool(b); }
+                Instr::LoadI32(d, v) => { ensure_reg(d as usize); regs[d as usize] = Value::I32(v); }
+                Instr::LoadI64(d, v) => { ensure_reg(d as usize); regs[d as usize] = Value::I64(v); }
+                Instr::LoadF32(d, v) => { ensure_reg(d as usize); regs[d as usize] = Value::F32(v); }
+                Instr::LoadF64(d, v) => { ensure_reg(d as usize); regs[d as usize] = Value::F64(v); }
+                Instr::Move(d, s) => {
+                    ensure_reg(d as usize);
+                    ensure_reg(s as usize);
+                    regs[d as usize] = regs[s as usize].clone();
+                }
+                Instr::Load(d, slot) => {
+                    ensure_reg(d as usize);
+                    ensure_slot(slot as usize);
+                    regs[d as usize] = slot_file[slot as usize].clone();
+                }
+                Instr::Store(slot, s) => {
+                    ensure_slot(slot as usize);
+                    ensure_reg(s as usize);
+                    slot_file[slot as usize] = regs[s as usize].clone();
+                }
+                Instr::BinOp(d, op, l, r) => {
+                    ensure_reg(d as usize); ensure_reg(l as usize); ensure_reg(r as usize);
+                    regs[d as usize] = Self::eval_binop(op, regs[l as usize].clone(), regs[r as usize].clone())?;
+                }
+                Instr::UnOp(d, op, s) => {
+                    ensure_reg(d as usize); ensure_reg(s as usize);
+                    regs[d as usize] = Self::eval_unop(op, regs[s as usize].clone())?;
+                }
+                Instr::Jump(off) => pc = (pc as i32 + off) as usize,
+                Instr::JumpFalse(c, off) => {
+                    ensure_reg(c as usize);
+                    if !regs[c as usize].is_truthy() {
+                        pc = (pc as i32 + off) as usize;
+                    }
+                }
+                Instr::JumpTrue(c, off) => {
+                    ensure_reg(c as usize);
+                    if regs[c as usize].is_truthy() {
+                        pc = (pc as i32 + off) as usize;
+                    }
+                }
+                Instr::Return(r) => {
+                    ensure_reg(r as usize);
+                    for (i, v) in slot_file.iter().enumerate().take(slots.len()) {
+                        slots[i] = v.clone();
+                    }
+                    return Ok(regs[r as usize].clone());
+                }
+                Instr::ReturnUnit => return Ok(Value::Unit),
+                _ => return Err(RuntimeError::new(format!("unsupported tracing fallback instruction: {instr:?}"))),
+            }
+        }
+        Ok(Value::Unit)
+    }
+
+    fn eval_binop(op: BinOpKind, lhs: Value, rhs: Value) -> Result<Value, RuntimeError> {
+        match op {
+            BinOpKind::Add => match (lhs, rhs) {
+                (Value::I32(a), Value::I32(b)) => Ok(Value::I32(a.wrapping_add(b))),
+                (Value::I64(a), Value::I64(b)) => Ok(Value::I64(a.wrapping_add(b))),
+                (a, b) => Ok(Value::F64(a.as_f64().ok_or_else(|| RuntimeError::new("add requires numeric lhs"))? + b.as_f64().ok_or_else(|| RuntimeError::new("add requires numeric rhs"))?)),
+            },
+            BinOpKind::Sub => match (lhs, rhs) {
+                (Value::I32(a), Value::I32(b)) => Ok(Value::I32(a.wrapping_sub(b))),
+                (Value::I64(a), Value::I64(b)) => Ok(Value::I64(a.wrapping_sub(b))),
+                (a, b) => Ok(Value::F64(a.as_f64().ok_or_else(|| RuntimeError::new("sub requires numeric lhs"))? - b.as_f64().ok_or_else(|| RuntimeError::new("sub requires numeric rhs"))?)),
+            },
+            BinOpKind::Mul => match (lhs, rhs) {
+                (Value::I32(a), Value::I32(b)) => Ok(Value::I32(a.wrapping_mul(b))),
+                (Value::I64(a), Value::I64(b)) => Ok(Value::I64(a.wrapping_mul(b))),
+                (a, b) => Ok(Value::F64(a.as_f64().ok_or_else(|| RuntimeError::new("mul requires numeric lhs"))? * b.as_f64().ok_or_else(|| RuntimeError::new("mul requires numeric rhs"))?)),
+            },
+            BinOpKind::Div => {
+                let l = lhs.as_f64().ok_or_else(|| RuntimeError::new("div requires numeric lhs"))?;
+                let r = rhs.as_f64().ok_or_else(|| RuntimeError::new("div requires numeric rhs"))?;
+                if r == 0.0 {
+                    return Err(RuntimeError::new("division by zero"));
+                }
+                Ok(Value::F64(l / r))
+            }
+            BinOpKind::Eq => Ok(Value::Bool(Self::values_equal(&lhs, &rhs))),
+            BinOpKind::Ne => Ok(Value::Bool(!Self::values_equal(&lhs, &rhs))),
+            BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge => {
+                let l = lhs.as_f64().ok_or_else(|| RuntimeError::new("comparison requires numeric lhs"))?;
+                let r = rhs.as_f64().ok_or_else(|| RuntimeError::new("comparison requires numeric rhs"))?;
+                let out = match op {
+                    BinOpKind::Lt => l < r,
+                    BinOpKind::Le => l <= r,
+                    BinOpKind::Gt => l > r,
+                    BinOpKind::Ge => l >= r,
+                    _ => unreachable!(),
+                };
+                Ok(Value::Bool(out))
+            }
+            BinOpKind::And => Ok(Value::Bool(lhs.is_truthy() && rhs.is_truthy())),
+            BinOpKind::Or => Ok(Value::Bool(lhs.is_truthy() || rhs.is_truthy())),
+            _ => Err(RuntimeError::new(format!("unsupported binop in tracing fallback: {op:?}"))),
+        }
+    }
+
+    fn eval_unop(op: UnOpKind, src: Value) -> Result<Value, RuntimeError> {
+        match op {
+            UnOpKind::Neg => {
+                if let Some(v) = src.as_f64() {
+                    Ok(Value::F64(-v))
+                } else {
+                    Err(RuntimeError::new("negation requires numeric operand"))
+                }
+            }
+            UnOpKind::Not => Ok(Value::Bool(!src.is_truthy())),
+            _ => Err(RuntimeError::new(format!("unsupported unop in tracing fallback: {op:?}"))),
+        }
+    }
+
+    fn values_equal(lhs: &Value, rhs: &Value) -> bool {
+        match (lhs, rhs) {
+            (Value::I32(a), Value::I32(b)) => a == b,
+            (Value::I64(a), Value::I64(b)) => a == b,
+            (Value::F32(a), Value::F32(b)) => a == b,
+            (Value::F64(a), Value::F64(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Unit, Value::Unit) => true,
+            _ => {
+                if let (Some(a), Some(b)) = (lhs.as_f64(), rhs.as_f64()) {
+                    (a - b).abs() <= f64::EPSILON
+                } else {
+                    false
+                }
+            }
+        }
     }
 }

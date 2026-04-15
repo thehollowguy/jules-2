@@ -21,7 +21,8 @@ mod parser;
 mod self_repair;
 mod sema;
 mod string_intern;
-mod tiered_compilation;
+pub mod tiered_compilation;
+pub mod tracing_jit;
 mod typeck;
 // Optional, phase-gated modules (added per performance phase protocol)
 #[cfg(feature = "phase3-jit")]
