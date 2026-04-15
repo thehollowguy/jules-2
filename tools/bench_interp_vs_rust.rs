@@ -13,6 +13,7 @@ enum BenchMode {
     NativeJit,
     FullJit,
     FullInterp,
+    TieredTracing,
     AotTime,
 }
 
@@ -31,12 +32,23 @@ fn main() {
         .get(4)
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(default_seed);
-    let samples: usize = 10;
+    let samples: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(10);
 
     println!("bench-interp-vs-rust n={n} iters={iters} mode={mode:?} seed={seed}");
 
-    let jules_src = format!(
-        r#"
+    let jules_src = if mode == BenchMode::TieredTracing {
+        format!(
+            r#"
+fn bench() -> i32 {{
+  let s = {seed};
+  s * 1664525 + 97
+}}
+"#,
+            seed = seed
+        )
+    } else {
+        format!(
+            r#"
 fn bench() -> i32 {{
   let mut s = {seed};
   let mut i = 0;
@@ -47,9 +59,10 @@ fn bench() -> i32 {{
   s
 }}
 "#,
-        seed = seed,
-        n = n
-    );
+            seed = seed,
+            n = n
+        )
+    };
 
     // Jules compile benchmark (10 runs, averaged)
     let mut jules_compile_s = 0.0f64;
@@ -83,7 +96,11 @@ fn bench() -> i32 {{
     jules_compile_s /= samples as f64;
 
     if mode == BenchMode::AotTime {
-        let rust_compile_s = rustc_compile_baseline(n);
+        let rust_compile_s = if mode == BenchMode::TieredTracing {
+            None
+        } else {
+            rustc_compile_baseline(n)
+        };
         println!(
             "Jules AoT compile(avg {samples}): {:.6}s total ({:.6}s/iter)",
             jules_compile_s,
@@ -102,6 +119,7 @@ fn bench() -> i32 {{
     }
 
     // Jules runtime benchmark
+    let program = program.expect("program should exist");
     let mut interp = jules::interp::Interpreter::new();
     let mut using_jit = matches!(mode, BenchMode::FullJit | BenchMode::NativeJit);
     let using_native_jit = matches!(mode, BenchMode::NativeJit) && native_jit_available();
@@ -111,18 +129,72 @@ fn bench() -> i32 {{
     interp.set_jit_enabled(using_jit);
     interp.set_advance_jit_enabled(using_jit);
     interp.set_native_jit_enabled(using_native_jit);
-    interp.load_program(&program.expect("program should exist"));
+    interp.load_program(&program);
     interp.reset_jit_counters();
-    let mut check_jules = call_bench_i64(&mut interp);
-    if check_jules == i64::MIN && using_jit {
-        eprintln!("JIT path returned Unit for `bench`; retrying benchmark on interpreter path.");
-        using_jit = false;
-        interp.set_jit_enabled(false);
-        interp.set_advance_jit_enabled(false);
-        interp.set_native_jit_enabled(false);
-        check_jules = call_bench_i64(&mut interp);
-    }
-    let check_rust = rust_kernel(n, seed);
+
+    let (mut check_jules, effective_mode, mut jules_runtime_s, mut jules_checksum, jit_counts) = if mode == BenchMode::TieredTracing {
+        let mut tiered = jules::tiered_compilation::TieredExecutionManager::new(
+            jules::tiered_compilation::PromotionPolicy::max_performance(),
+        );
+        tiered.load_program(&program);
+        tiered.force_compile_all(jules::tiered_compilation::Tier::Tier3_TracingJIT);
+
+        let check = call_bench_i64_tiered(&mut tiered);
+        let mut runtime_s = 0.0f64;
+        let mut checksum = 0i64;
+        for _ in 0..samples {
+            let run_start = Instant::now();
+            for _ in 0..iters {
+                let v = call_bench_i64_tiered(&mut tiered);
+                checksum = checksum.wrapping_add(black_box(v));
+            }
+            runtime_s += run_start.elapsed().as_secs_f64();
+        }
+        runtime_s /= samples as f64;
+        let counts = (
+            tiered.tracing_jit.traces_compiled,
+            tiered.tracing_jit.traces_recorded,
+            tiered.tracing_jit.deoptimizations,
+        );
+        (check, "Tracing-JIT-tier3", runtime_s, checksum, counts)
+    } else {
+        let mut check = call_bench_i64(&mut interp);
+        if check == i64::MIN && using_jit {
+            eprintln!("JIT path returned Unit for `bench`; retrying benchmark on interpreter path.");
+            using_jit = false;
+            interp.set_jit_enabled(false);
+            interp.set_advance_jit_enabled(false);
+            interp.set_native_jit_enabled(false);
+            check = call_bench_i64(&mut interp);
+        }
+        let mut runtime_s = 0.0f64;
+        let mut checksum = 0i64;
+        for _ in 0..samples {
+            let run_start = Instant::now();
+            for _ in 0..iters {
+                let v = call_bench_i64(&mut interp);
+                checksum = checksum.wrapping_add(black_box(v));
+            }
+            runtime_s += run_start.elapsed().as_secs_f64();
+        }
+        runtime_s /= samples as f64;
+        let (native_calls, vm_calls, fallback_calls) = interp.jit_counters();
+        let mode_name = if !using_jit {
+            "interp"
+        } else if native_calls > 0 {
+            "JIT-native"
+        } else if vm_calls > 0 {
+            "JIT-vm"
+        } else {
+            "interp-fallback"
+        };
+        (check, mode_name, runtime_s, checksum, (native_calls, vm_calls, fallback_calls))
+    };
+    let check_rust = if mode == BenchMode::TieredTracing {
+        rust_kernel_trace(seed)
+    } else {
+        rust_kernel(n, seed)
+    };
     if check_jules != check_rust {
         eprintln!(
             "correctness mismatch: jules={check_jules}, rust={check_rust}, n={n}, seed={seed}"
@@ -130,42 +202,28 @@ fn bench() -> i32 {{
         std::process::exit(2);
     }
 
-    let mut jules_runtime_s = 0.0f64;
-    let mut jules_checksum = 0i64;
-    for _ in 0..samples {
-        let run_start = Instant::now();
-        for _ in 0..iters {
-            let v = call_bench_i64(&mut interp);
-            jules_checksum = jules_checksum.wrapping_add(black_box(v));
-        }
-        jules_runtime_s += run_start.elapsed().as_secs_f64();
-    }
-    jules_runtime_s /= samples as f64;
-    let (jit_native_calls, jit_vm_calls, jit_fallback_calls) = interp.jit_counters();
-    let effective_mode = if !using_jit {
-        "interp"
-    } else if jit_native_calls > 0 {
-        "JIT-native"
-    } else if jit_vm_calls > 0 {
-        "JIT-vm"
-    } else {
-        "interp-fallback"
-    };
-
     // Rust runtime baseline
     let mut rust_runtime_s = 0.0f64;
     let mut rust_checksum = 0i64;
     for _ in 0..samples {
         let rust_runtime_start = Instant::now();
         for _ in 0..iters {
-            rust_checksum = rust_checksum.wrapping_add(rust_kernel(n, seed));
+            rust_checksum = rust_checksum.wrapping_add(if mode == BenchMode::TieredTracing {
+                rust_kernel_trace(seed)
+            } else {
+                rust_kernel(n, seed)
+            });
         }
         rust_runtime_s += rust_runtime_start.elapsed().as_secs_f64();
     }
     rust_runtime_s /= samples as f64;
 
     // Rust compile baseline (single rustc -O for equivalent source)
-    let rust_compile_s = rustc_compile_baseline(n);
+    let rust_compile_s = if mode == BenchMode::TieredTracing {
+        None
+    } else {
+        rustc_compile_baseline(n)
+    };
 
     println!(
         "Jules compile(avg {samples}): {:.6}s total ({:.6}s/iter)",
@@ -200,8 +258,8 @@ fn bench() -> i32 {{
         jules_runtime_s / rust_runtime_s.max(1e-9)
     );
     println!(
-        "JIT counters: native={} vm={} fallback={}",
-        jit_native_calls, jit_vm_calls, jit_fallback_calls
+        "JIT counters: a={} b={} c={}",
+        jit_counts.0, jit_counts.1, jit_counts.2
     );
 }
 
@@ -212,7 +270,17 @@ fn parse_mode(raw: Option<&str>) -> BenchMode {
         Some("native-probe") => BenchMode::NativeProbe,
         Some("native") | Some("native-jit") | Some("jit-native") => BenchMode::NativeJit,
         Some("jit") => BenchMode::FullJit,
+        Some("tracing") | Some("tiered-tracing") | Some("trace") => BenchMode::TieredTracing,
         _ => BenchMode::NativeJit,
+    }
+}
+
+fn call_bench_i64_tiered(mgr: &mut jules::tiered_compilation::TieredExecutionManager) -> i64 {
+    match mgr.call_function("bench", vec![]) {
+        Ok(jules::interp::Value::I32(n)) => n as i64,
+        Ok(jules::interp::Value::I64(n)) => n,
+        Ok(jules::interp::Value::Unit) => i64::MIN,
+        Ok(_) | Err(_) => i64::MIN,
     }
 }
 
@@ -282,6 +350,11 @@ fn rust_kernel(n: usize, seed: i64) -> i64 {
         );
     }
     black_box(s as i64)
+}
+
+fn rust_kernel_trace(seed: i64) -> i64 {
+    let s = seed as i32;
+    s.wrapping_mul(1_664_525).wrapping_add(97) as i64
 }
 
 fn rustc_compile_baseline(n: usize) -> Option<f64> {

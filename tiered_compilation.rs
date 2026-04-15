@@ -23,13 +23,15 @@
 #![allow(non_camel_case_types)]
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use rustc_hash::FxHashMap;
 
 use crate::ast::{FnDecl, Program};
-use crate::interp::{Interpreter, RuntimeError, Value};
+use crate::interp::{compile_fn, CompiledFn, Interpreter, RuntimeError, Value};
+use crate::tracing_jit::TracingJIT;
 
 // =============================================================================
 // §1  TIER DEFINITIONS
@@ -97,6 +99,11 @@ pub struct CompiledCode {
 
 impl FunctionState {
     pub fn new(name: String, size_estimate: usize) -> Self {
+        let mut tracing_jit = TracingJIT::new();
+        // Keep tier-3 in managed tracing mode unless explicitly enabled for
+        // native codegen stability work.
+        tracing_jit.compile_trigger = u64::MAX / 2;
+
         Self {
             name,
             current_tier: Tier::Tier0_Bytecode,
@@ -218,6 +225,12 @@ pub struct TieredExecutionManager {
     pub enabled: bool,
     /// Compilation budget (prevent spending too long on compilation)
     pub compilation_budget_remaining_ms: u64,
+    /// Cached function declarations used for trace compilation.
+    pub function_decls: FxHashMap<String, FnDecl>,
+    /// Per-function bytecode compiled for tracing.
+    pub tracing_bytecode: FxHashMap<String, CompiledFn>,
+    /// Tracing JIT backend.
+    pub tracing_jit: TracingJIT,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -229,6 +242,11 @@ pub struct TierStats {
 
 impl TieredExecutionManager {
     pub fn new(policy: PromotionPolicy) -> Self {
+        let mut tracing_jit = TracingJIT::new();
+        // Keep tier-3 in managed tracing mode unless explicitly enabled for
+        // native codegen stability work.
+        tracing_jit.compile_trigger = u64::MAX / 2;
+
         Self {
             function_states: FxHashMap::default(),
             policy,
@@ -237,6 +255,9 @@ impl TieredExecutionManager {
             tier_stats: HashMap::new(),
             enabled: true,
             compilation_budget_remaining_ms: 1000, // 1 second startup budget
+            function_decls: FxHashMap::default(),
+            tracing_bytecode: FxHashMap::default(),
+            tracing_jit,
         }
     }
 
@@ -246,6 +267,9 @@ impl TieredExecutionManager {
         
         // Initialize interpreter with the program
         let mut interp = Interpreter::new();
+        // Tier manager controls optimization levels externally.
+        interp.set_jit_enabled(false);
+        interp.set_advance_jit_enabled(false);
         interp.load_program(program);
         self.interpreter = Some(interp);
 
@@ -255,6 +279,8 @@ impl TieredExecutionManager {
                 let size = Self::estimate_function_size(fn_decl);
                 let state = FunctionState::new(fn_decl.name.clone(), size);
                 self.function_states.insert(fn_decl.name.clone(), state);
+                self.function_decls
+                    .insert(fn_decl.name.clone(), fn_decl.clone());
             }
         }
     }
@@ -427,12 +453,31 @@ impl TieredExecutionManager {
 
     /// Tier 3: Execute via tracing JIT
     fn execute_tier3(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        let fallback_args = args.clone();
         if let Some(state) = self.function_states.get(name) {
             if !state.compiled_code.contains_key(&Tier::Tier3_TracingJIT) {
                 let _ = self.compile_tracing(name);
             }
         }
-        self.execute_tier0(name, args)
+
+        let entry_pc = Self::trace_entry_for(name);
+        if let Some(compiled_fn) = self.tracing_bytecode.get(name) {
+            let mut slots = vec![Value::Unit; compiled_fn.slot_count as usize + 32];
+            for (i, arg) in args.into_iter().enumerate() {
+                if i < slots.len() {
+                    slots[i] = arg;
+                }
+            }
+
+            match self
+                .tracing_jit
+                .execute_with_jit(entry_pc, &mut slots, &compiled_fn.instrs)
+            {
+                Ok(v) => return Ok(v),
+                Err(_) => {}
+            }
+        }
+        self.execute_tier0(name, fallback_args)
     }
 
     /// Check if function should be promoted and trigger compilation
@@ -554,7 +599,37 @@ impl TieredExecutionManager {
         if let Some(state) = self.function_states.get_mut(name) {
             state.compiled_code.insert(Tier::Tier3_TracingJIT, code);
         }
+
+        // Build bytecode IR once and register trace instructions.
+        if !self.tracing_bytecode.contains_key(name) {
+            let decl = self
+                .function_decls
+                .get(name)
+                .ok_or_else(|| format!("unknown function declaration `{name}`"))?;
+            let compiled = compile_fn(decl);
+            self.tracing_bytecode.insert(name.to_string(), compiled);
+        }
+
+        let entry_pc = Self::trace_entry_for(name);
+        if self.tracing_jit.recorder.find_trace(entry_pc).is_none() {
+            self.tracing_jit.recorder.start_recording(entry_pc);
+            if let Some(func) = self.tracing_bytecode.get(name) {
+                for (pc, instr) in func.instrs.iter().enumerate() {
+                    self.tracing_jit.recorder.record_instruction(instr, pc);
+                }
+            }
+            if let Some(trace_id) = self.tracing_jit.recorder.finish_recording() {
+                self.tracing_jit.traces_recorded += 1;
+                let _ = trace_id;
+            }
+        }
         Ok(())
+    }
+
+    fn trace_entry_for(name: &str) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut hasher);
+        hasher.finish() as usize
     }
 
     /// Force compile all functions at a specific tier

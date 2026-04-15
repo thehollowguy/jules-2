@@ -38,6 +38,7 @@ extern "C" {
     fn munmap(addr: *mut c_void, len: usize) -> i32;
 }
 
+use crate::ast::{BinOpKind, UnOpKind};
 use crate::interp::{Instr, RuntimeError, Value};
 
 // =============================================================================
