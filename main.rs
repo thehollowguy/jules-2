@@ -2465,9 +2465,9 @@ Try now:
   :demo ml
 "#;
 
-const DEMO_GAME: &str = include_str!("small_game.jules");
-const DEMO_ARCADE: &str = include_str!("game_arcade_showcase.jules");
-const DEMO_ML: &str = include_str!("game_nn_demo.jules");
+const DEMO_GAME: &str = include_str!("jules_files/small_game.jules");
+const DEMO_ARCADE: &str = include_str!("jules_files/game_arcade_showcase.jules");
+const DEMO_ML: &str = include_str!("jules_files/game_nn_demo.jules");
 
 fn demo_source(name: &str) -> Option<&'static str> {
     match name {

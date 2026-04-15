@@ -187,7 +187,7 @@ impl Drop for ExecutableMemory {
 // =============================================================================
 // §4  HEAVILY OPTIMIZED NATIVE CODE GENERATOR
 // =============================================================================
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Reg { RAX=0, RCX=1, RDX=2, R8=8, R9=9, R10=10, R11=11 }
 
 #[derive(Debug, Clone, Copy)]
@@ -200,6 +200,7 @@ pub struct NativeCodeGenerator {
     reg_map: HashMap<Reg, RegState>,
     slot_reg: HashMap<u16, Reg>,
     spill_offset: usize,
+    next_label_id: usize,
 }
 
 impl NativeCodeGenerator {
@@ -207,6 +208,7 @@ impl NativeCodeGenerator {
         Self {
             code: Vec::with_capacity(4096), labels: HashMap::new(), patch_sites: Vec::new(),
             reg_map: HashMap::new(), slot_reg: HashMap::new(), spill_offset: 16,
+            next_label_id: 0,
         }
     }
 
@@ -447,13 +449,13 @@ impl NativeCodeGenerator {
 
     // --- x86-64 Encoding (Optimized) ---
     fn emit_prologue(&mut self) {
-        self.b(0x55); self.bb(0x48, 0x89, 0xE5);
+        self.b(0x55); self.bbb(0x48, 0x89, 0xE5);
         self.bb(0x41, 0x54); self.bb(0x41, 0x55); self.bb(0x41, 0x56); self.bb(0x41, 0x57);
         self.bbbb(0x48, 0x83, 0xE4, 0xF0); // and rsp, -16
     }
     fn emit_ret(&mut self) {
         self.bb(0x41, 0x5F); self.bb(0x41, 0x5E); self.bb(0x41, 0x5D); self.bb(0x41, 0x5C);
-        self.bb(0x48, 0x89, 0xEC); self.b(0x5D); self.b(0xC3);
+        self.bbb(0x48, 0x89, 0xEC); self.b(0x5D); self.b(0xC3);
     }
     fn emit_deopt_stub(&mut self) { self.b(0xB8); self.i32(-1); self.b(0xC3); }
 
