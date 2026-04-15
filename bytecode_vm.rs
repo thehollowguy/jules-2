@@ -342,6 +342,8 @@ pub struct BytecodeCompiler {
     current_function: BytecodeFunction,
     functions: FxHashMap<String, usize>, // function name -> index
     next_label: u32,
+    locals: FxHashMap<String, u16>,      // local variable -> slot
+    next_slot: u16,                      // next available local slot
     
     // Constant folding state
     known_constants: FxHashMap<u16, Value>, // slot -> known constant value
@@ -357,6 +359,8 @@ impl BytecodeCompiler {
             current_function: BytecodeFunction::new("<main>".to_string()),
             functions: FxHashMap::default(),
             next_label: 0,
+            locals: FxHashMap::default(),
+            next_slot: 0,
             known_constants: FxHashMap::default(),
             fold_constants: true,
             eliminate_dead_code: true,
@@ -368,6 +372,13 @@ impl BytecodeCompiler {
         let label = self.next_label;
         self.next_label += 1;
         label
+    }
+
+    #[inline]
+    fn alloc_slot(&mut self) -> u16 {
+        let slot = self.next_slot;
+        self.next_slot = self.next_slot.saturating_add(1);
+        slot
     }
     
     /// Emit instruction, applying constant folding if enabled
@@ -420,6 +431,10 @@ impl BytecodeCompiler {
                         let mut fn_compiler = BytecodeCompiler::new();
                         fn_compiler.current_function.name = fn_decl.name.clone();
                         fn_compiler.current_function.num_params = fn_decl.params.len() as u16;
+                        fn_compiler.next_slot = fn_compiler.current_function.num_params;
+                        for (i, p) in fn_decl.params.iter().enumerate() {
+                            fn_compiler.locals.insert(p.name.clone(), i as u16);
+                        }
                         
                         // Compile function body
                         fn_compiler.compile_block(body)?;
@@ -446,11 +461,24 @@ impl BytecodeCompiler {
     
     fn compile_stmt(&mut self, stmt: &crate::ast::Stmt) -> Result<(), String> {
         match stmt {
-            crate::ast::Stmt::Let { init, .. } => {
+            crate::ast::Stmt::Let { pattern, init, .. } => {
+                let dst = match pattern {
+                    crate::ast::Pattern::Ident { name, .. } => {
+                        if let Some(existing) = self.locals.get(name) {
+                            *existing
+                        } else {
+                            let slot = self.alloc_slot();
+                            self.locals.insert(name.clone(), slot);
+                            slot
+                        }
+                    }
+                    crate::ast::Pattern::Wildcard(_) => self.alloc_slot(),
+                    _ => return Err("bytecode compiler only supports identifier/wildcard let bindings".to_string()),
+                };
                 if let Some(expr) = init {
-                    self.compile_expr(expr, 0)?;
+                    self.compile_expr(expr, dst)?;
                 } else {
-                    self.emit(Instr::LoadConstUnit { dst: 0 });
+                    self.emit(Instr::LoadConstUnit { dst });
                 }
             }
             crate::ast::Stmt::Expr { expr, .. } => {
@@ -487,9 +515,13 @@ impl BytecodeCompiler {
             crate::ast::Expr::BoolLit { value, .. } => {
                 self.emit(Instr::LoadConstBool { dst, value: *value });
             }
-            crate::ast::Expr::Ident { name: _, .. } => {
-                // Load from local slot (simplified - real impl needs symbol table)
-                // This is a placeholder
+            crate::ast::Expr::Ident { name, .. } => {
+                let slot = self
+                    .locals
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| format!("unknown local variable `{name}`"))?;
+                self.emit(Instr::Move { dst, src: slot });
             }
             crate::ast::Expr::BinOp { op, lhs, rhs, .. } => {
                 self.compile_expr(lhs, dst)?;
