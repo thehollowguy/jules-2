@@ -1,171 +1,38 @@
-// =============================================================================
 // jules/src/tracing_jit.rs
-//
 // TRACING JIT COMPILER
-// 
-// The MOST AGGRESSIVE optimization technique used by modern languages:
-// - Records actual execution traces (hot paths through the code)
-// - Compiles traces to native machine code
-// - Adds guards for type/speculative optimization
-// - Deoptimizes back to interpreter if guard fails
-// - Used by PyPy, LuaJIT, V8 for 10-100x speedups
-// 
-// This brings Jules to C/Rust speed for hot loops!
-// =============================================================================
 
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::mem;
 use std::ptr;
 
-use region::Protection;
-
 use crate::interp::{Instr, RuntimeError, Value};
 
-// =============================================================================
-// §1  TRACE RECORDER
-// =============================================================================
+// §1  PLATFORM-SPECIFIC MEMORY ALLOCATION 
+#[cfg(target_os = "linux")]
+const MAP_ANONYMOUS: i32 = 0x20;
+#[cfg(target_os = "macos")]
+const MAP_ANONYMOUS: i32 = 0x1000;
 
-/// Records a single execution trace (linear sequence of instructions)
-pub struct TraceRecorder {
-    /// Current trace being recorded
-    current_trace: Option<Trace>,
-    /// Trace ID counter
-    next_trace_id: u32,
-    /// All recorded traces
-    traces: Vec<Trace>,
-    /// Trace selection tree (simplified - real impl uses prefix tree)
-    trace_selection: HashMap<u64, u32>, // entry_point -> trace_id
+const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
+const PROT_EXEC: i32 = 4;
+const MAP_PRIVATE: i32 = 0x02;
+
+#[cfg(unix)]
+extern "C" {
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
+    fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+    fn munmap(addr: *mut c_void, len: usize) -> i32;
 }
 
-impl TraceRecorder {
-    pub fn new() -> Self {
-        Self {
-            current_trace: None,
-            next_trace_id: 0,
-            traces: Vec::new(),
-            trace_selection: HashMap::new(),
-        }
-    }
-    
-    /// Start recording a trace from this instruction
-    pub fn start_recording(&mut self, entry_pc: usize) {
-        let trace_id = self.next_trace_id;
-        self.next_trace_id += 1;
-        
-        self.current_trace = Some(Trace {
-            id: trace_id,
-            entry_pc,
-            instructions: Vec::with_capacity(256),
-            guards: Vec::with_capacity(64),
-            loop_header: false,
-            execution_count: 0,
-        });
-    }
-    
-    /// Record an instruction in the current trace
-    pub fn record_instruction(&mut self, instr: &Instr, pc: usize) {
-        if let Some(ref mut trace) = self.current_trace {
-            trace.instructions.push(TraceInstruction {
-                original_pc: pc,
-                instruction: instr.clone(),
-                guard: None,
-            });
-        }
-    }
-    
-    /// Record a type guard (speculative optimization)
-    pub fn record_guard(&mut self, slot: u16, expected_type: ValueType) {
-        if let Some(ref mut trace) = self.current_trace {
-            trace.guards.push(Guard {
-                slot,
-                expected_type,
-            });
-            
-            // Add guard to last instruction
-            if let Some(last_instr) = trace.instructions.last_mut() {
-                last_instr.guard = Some(Guard {
-                    slot,
-                    expected_type,
-                });
-            }
-        }
-    }
-    
-    /// Finish recording and compile to native code
-    pub fn finish_recording(&mut self) -> Option<u32> {
-        if let Some(trace) = self.current_trace.take() {
-            let trace_id = trace.id;
-            let entry_pc = trace.entry_pc;
-            
-            // Store trace
-            self.traces.push(trace);
-            
-            // Update trace selection
-            self.trace_selection.insert(entry_pc as u64, trace_id);
-            
-            Some(trace_id)
-        } else {
-            None
-        }
-    }
-    
-    /// Find a trace for this entry point
-    pub fn find_trace(&self, entry_pc: usize) -> Option<u32> {
-        self.trace_selection.get(&(entry_pc as u64)).copied()
-    }
-    
-    /// Get trace by ID
-    pub fn get_trace(&self, trace_id: u32) -> Option<&Trace> {
-        self.traces.get(trace_id as usize)
-    }
-    
-    /// Get mutable trace by ID
-    pub fn get_trace_mut(&mut self, trace_id: u32) -> Option<&mut Trace> {
-        self.traces.get_mut(trace_id as usize)
-    }
-}
-
-// =============================================================================
 // §2  TRACE DATA STRUCTURES
-// =============================================================================
-
-/// A recorded trace (hot path through the code)
-#[derive(Debug, Clone)]
-pub struct Trace {
-    pub id: u32,
-    pub entry_pc: usize,
-    pub instructions: Vec<TraceInstruction>,
-    pub guards: Vec<Guard>,
-    pub loop_header: bool,
-    pub execution_count: u64,
-}
-
-/// A single instruction in a trace
-#[derive(Debug, Clone)]
-pub struct TraceInstruction {
-    pub original_pc: usize,
-    pub instruction: Instr,
-    pub guard: Option<Guard>,
-}
-
-/// A runtime guard (speculative check)
-#[derive(Debug, Clone, Copy)]
-pub struct Guard {
-    pub slot: u16,
-    pub expected_type: ValueType,
-}
-
-/// Simplified value type for guards
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum ValueType {
-    I64,
-    F64,
-    Bool,
-    Unit,
-    Tensor,
-    Unknown,
+    I64 = 0, F64 = 1, Bool = 2, Unit = 3, Tensor = 4, Unknown = 255,
 }
 
 impl Value {
@@ -182,265 +49,383 @@ impl Value {
     }
 }
 
-// =============================================================================
-// §3  NATIVE CODE GENERATOR (x86-64)
-// =============================================================================
-
-/// Compiles traces to native x86-64 machine code
-pub struct NativeCodeGenerator {
-    /// Code buffer (executable memory)
-    code_buffer: Vec<u8>,
-    /// Compiled traces
-    compiled_traces: HashMap<u32, CompiledTrace>,
+#[derive(Debug, Clone, Copy)]
+pub struct Guard {
+    pub slot: u16,
+    pub expected_type: ValueType,
 }
 
-impl NativeCodeGenerator {
+#[derive(Debug, Clone)]
+pub struct TraceInstruction {
+    pub original_pc: usize,
+    pub instruction: Instr,
+    pub guard: Option<Guard>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SideExit {
+    pub buffer_offset: usize, // Byte offset in JIT code where guard/branch diverges
+    pub fallback_pc: usize,   // Interpreter PC to resume on failure
+    pub is_loop_exit: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PatchSite {
+    pub buffer_offset: usize, // Where rel32 displacement starts
+    pub target_label: usize,  // Logical label ID
+}
+
+#[derive(Debug, Clone)]
+pub struct Trace {
+    pub id: u32,
+    pub entry_pc: usize,
+    pub instructions: Vec<TraceInstruction>,
+    pub guards: Vec<Guard>,
+    pub side_exits: Vec<SideExit>,
+    pub execution_count: u64,
+    pub next_label_id: usize,
+}
+
+// =============================================================================
+// §3  TRACE RECORDER
+// =============================================================================
+pub struct TraceRecorder {
+    current_trace: Option<Trace>,
+    next_trace_id: u32,
+    traces: Vec<Trace>,
+    trace_selection: HashMap<u64, u32>, // entry_pc -> trace_id
+}
+
+impl TraceRecorder {
     pub fn new() -> Self {
         Self {
-            code_buffer: Vec::with_capacity(4096),
-            compiled_traces: HashMap::new(),
+            current_trace: None,
+            next_trace_id: 0,
+            traces: Vec::new(),
+            trace_selection: HashMap::new(),
         }
     }
-    
-    /// Compile a trace to native code
-    pub fn compile_trace(&mut self, trace: &Trace) -> Result<CompiledTrace, String> {
-        self.code_buffer.clear();
-        
-        // Emit prologue with guards
-        self.emit_guards(&trace.guards)?;
-        
-        // Emit native code for each instruction
-        for trace_instr in &trace.instructions {
-            self.emit_instruction(&trace_instr.instruction)?;
-        }
-        
-        // Emit epilogue (return)
-        self.emit_ret();
-        
-        // Allocate executable memory
-        let code = self.code_buffer.clone();
-        let exec_mem = ExecutableMemory::new(&code)?;
-        
-        let compiled = CompiledTrace {
-            trace_id: trace.id,
-            entry_point: exec_mem.entry_point(),
-            memory: exec_mem,
-            guard_count: trace.guards.len(),
-            instruction_count: trace.instructions.len(),
-        };
-        
-        self.compiled_traces.insert(trace.id, compiled.clone());
-        
-        Ok(compiled)
+
+    pub fn start_recording(&mut self, entry_pc: usize) {
+        self.current_trace = Some(Trace {
+            id: self.next_trace_id,
+            entry_pc,
+            instructions: Vec::with_capacity(256),
+            guards: Vec::with_capacity(64),
+            side_exits: Vec::with_capacity(16),
+            execution_count: 0,
+            next_label_id: 1,
+        });
+        self.next_trace_id += 1;
     }
-    
-    /// Emit guard checks at trace entry
-    fn emit_guards(&mut self, guards: &[Guard]) -> Result<(), String> {
-        for guard in guards {
-            // Load slot value
-            // mov rax, [rdi + slot*8]
-            self.emit2(0x48, 0x8B);
-            self.emit_modrm_sib(0, 0, 7); // [rdi]
-            self.emit_i32((guard.slot as i32) * 8);
-            
-            // Check type tag (simplified - assumes tagged pointer or inline type)
-            // This is platform-specific and complex in reality
-            // For now, emit a simple check
+
+    pub fn record_instruction(&mut self, instr: &Instr, pc: usize) {
+        if let Some(ref mut trace) = self.current_trace {
+            trace.instructions.push(TraceInstruction {
+                original_pc: pc,
+                instruction: instr.clone(),
+                guard: None,
+            });
         }
-        Ok(())
     }
-    
-    /// Emit native code for a single instruction
-    fn emit_instruction(&mut self, instr: &Instr) -> Result<(), String> {
-        match instr {
-            Instr::LoadI32(dst, value) => {
-                // mov eax, imm32
-                self.emit1(0xB8);
-                self.emit_i32(*value);
-                // Store to slot
-                self.emit_store_slot(*dst, 0); // rax
-            }
-            Instr::LoadI64(dst, value) => {
-                // mov rax, imm64
-                self.emit2(0x48, 0xB8);
-                self.emit_i64(*value);
-                self.emit_store_slot(*dst, 0);
-            }
-            Instr::Add(dst, lhs, rhs) => {
-                // Fast path: integer addition
-                // mov rax, [rdi + lhs*8]
-                self.emit_load_slot(*lhs, 0);
-                // mov rcx, [rdi + rhs*8]
-                self.emit_load_slot(*rhs, 1);
-                // add rax, rcx
-                self.emit3(0x48, 0x01, 0xC8);
-                // Store result
-                self.emit_store_slot(*dst, 0);
-            }
-            Instr::Sub(dst, lhs, rhs) => {
-                self.emit_load_slot(*lhs, 0);
-                self.emit_load_slot(*rhs, 1);
-                // sub rax, rcx
-                self.emit3(0x48, 0x29, 0xC8);
-                self.emit_store_slot(*dst, 0);
-            }
-            Instr::Mul(dst, lhs, rhs) => {
-                self.emit_load_slot(*lhs, 0);
-                self.emit_load_slot(*rhs, 1);
-                // imul rax, rcx
-                self.emit4(0x48, 0x0F, 0xAF, 0xC1);
-                self.emit_store_slot(*dst, 0);
-            }
-            Instr::JumpFalse(cond, offset) => {
-                // Load condition
-                self.emit_load_slot(*cond, 0);
-                // test rax, rax
-                self.emit2(0x48, 0x85, 0xC0);
-                // jz offset
-                let offset_pos = self.code_buffer.len();
-                self.emit2(0x0F, 0x84); // jz rel32
-                self.emit_i32(0); // Placeholder
-                // Will be patched later
-            }
-            Instr::Return(slot) => {
-                // Load return value
-                self.emit_load_slot(*slot, 0);
-                self.emit_ret();
-            }
-            // Add more instructions...
-            _ => {
-                // Unimplemented - will deopt
-                return Err(format!("Unimplemented instruction: {:?}", instr));
+
+    pub fn record_guard(&mut self, slot: u16, expected_type: ValueType) {
+        if let Some(ref mut trace) = self.current_trace {
+            let guard = Guard { slot, expected_type };
+            trace.guards.push(guard);
+            if let Some(last) = trace.instructions.last_mut() {
+                last.guard = Some(guard);
             }
         }
-        Ok(())
     }
-    
-    /// Emit load from slot to register
-    fn emit_load_slot(&mut self, slot: u16, reg: u8) {
-        // mov reg64, [rdi + slot*8]
-        let rex = 0x48 | ((reg & 8) >> 1);
-        self.emit2(rex, 0x8B);
-        self.emit_modrm_sib(reg & 7, 0, 7); // [rdi + disp32]
-        self.emit_i32((slot as i32) * 8);
+
+    pub fn record_side_exit(&mut self, fallback_pc: usize, is_loop: bool) {
+        if let Some(ref mut trace) = self.current_trace {
+            trace.side_exits.push(SideExit {
+                buffer_offset: 0, // Patched during compilation
+                fallback_pc,
+                is_loop_exit: is_loop,
+            });
+        }
     }
-    
-    /// Emit store from rax to slot
-    fn emit_store_slot(&mut self, slot: u16, _reg: u8) {
-        // mov [rdi + slot*8], rax
-        self.emit3(0x48, 0x89, 0x87);
-        self.emit_i32((slot as i32) * 8);
+
+    pub fn finish_recording(&mut self) -> Option<u32> {
+        if let Some(mut trace) = self.current_trace.take() {
+            let id = trace.id;
+            let pc = trace.entry_pc;
+            self.traces.push(trace);
+            self.trace_selection.insert(pc as u64, id);
+            Some(id)
+        } else { None }
     }
-    
-    /// Emit return instruction
-    fn emit_ret(&mut self) {
-        self.emit1(0xC3);
+
+    pub fn find_trace(&self, entry_pc: usize) -> Option<u32> {
+        self.trace_selection.get(&(entry_pc as u64)).copied()
     }
-    
-    // Code emission helpers
-    fn emit1(&mut self, b0: u8) {
-        self.code_buffer.push(b0);
-    }
-    
-    fn emit2(&mut self, b0: u8, b1: u8) {
-        self.code_buffer.extend_from_slice(&[b0, b1]);
-    }
-    
-    fn emit3(&mut self, b0: u8, b1: u8, b2: u8) {
-        self.code_buffer.extend_from_slice(&[b0, b1, b2]);
-    }
-    
-    fn emit4(&mut self, b0: u8, b1: u8, b2: u8, b3: u8) {
-        self.code_buffer.extend_from_slice(&[b0, b1, b2, b3]);
-    }
-    
-    fn emit_i32(&mut self, v: i32) {
-        self.code_buffer.extend_from_slice(&v.to_le_bytes());
-    }
-    
-    fn emit_i64(&mut self, v: i64) {
-        self.code_buffer.extend_from_slice(&v.to_le_bytes());
-    }
-    
-    fn emit_modrm_sib(&mut self, reg: u8, index: u8, base: u8) {
-        // ModRM byte
-        let modrm = 0x80 | (reg << 3) | 4; // mod=10 (disp32), reg, rm=4 (SIB)
-        self.code_buffer.push(modrm);
-        // SIB byte
-        let sib = (index << 3) | base;
-        self.code_buffer.push(sib);
-    }
+
+    pub fn get_trace(&self, id: u32) -> Option<&Trace> { self.traces.get(id as usize) }
+    pub fn get_trace_mut(&mut self, id: u32) -> Option<&mut Trace> { self.traces.get_mut(id as usize) }
 }
 
-// =============================================================================
-// §4  EXECUTABLE MEMORY
-// =============================================================================
-
-/// Manages executable memory for JIT-compiled code
+// §4  EXECUTABLE MEMORY (Zero Dep)
 pub struct ExecutableMemory {
     ptr: *mut u8,
     len: usize,
 }
 
 impl ExecutableMemory {
+    #[cfg(unix)]
     pub fn new(code: &[u8]) -> Result<Self, String> {
-        use libc::{mmap, mprotect, munmap, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
-        
         let len = code.len().max(1);
-        
-        // Allocate writable memory
         let ptr = unsafe {
-            mmap(
-                ptr::null_mut(),
-                len,
-                PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANON,
-                -1,
-                0,
-            )
+            mmap(ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
         };
-        
-        if ptr.is_null() || ptr == libc::MAP_FAILED {
-            return Err("Failed to allocate memory for JIT code".to_string());
+        if ptr.is_null() || ptr as usize == usize::MAX {
+            return Err("mmap failed".into());
         }
-        
-        // Copy code
-        unsafe {
-            ptr::copy_nonoverlapping(code.as_ptr(), ptr as *mut u8, code.len());
-        }
-        
-        // Make executable
-        let result = unsafe { mprotect(ptr, len, PROT_READ | PROT_EXEC) };
-        if result != 0 {
+
+        unsafe { ptr::copy_nonoverlapping(code.as_ptr(), ptr as *mut u8, code.len()); }
+
+        if unsafe { mprotect(ptr, len, PROT_READ | PROT_EXEC) } != 0 {
             unsafe { munmap(ptr, len) };
-            return Err("Failed to make JIT memory executable".to_string());
+            return Err("mprotect failed".into());
         }
-        
+
         Ok(Self { ptr: ptr as *mut u8, len })
     }
-    
-    pub fn entry_point(&self) -> *mut u8 {
-        self.ptr
-    }
+
+    pub fn entry_point(&self) -> *mut u8 { self.ptr }
 }
 
 impl Drop for ExecutableMemory {
     fn drop(&mut self) {
-        if !self.ptr.is_null() && self.len > 0 {
-            unsafe {
-                // Make writable before freeing
-                libc::mprotect(self.ptr as *mut _, self.len, libc::PROT_READ | libc::PROT_WRITE);
-                libc::munmap(self.ptr as *mut _, self.len);
-            }
+        #[cfg(unix)]
+        unsafe {
+            mprotect(self.ptr as *mut _, self.len, PROT_READ | PROT_WRITE);
+            munmap(self.ptr as *mut _, self.len);
         }
     }
 }
 
-// =============================================================================
-// §5  COMPILED TRACE
-// =============================================================================
+// §5  NATIVE CODE GENERATOR (x86-64)
+#[derive(Debug, Clone, Copy)]
+enum Reg { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI }
 
-/// A compiled trace ready for execution
+pub struct NativeCodeGenerator {
+    code: Vec<u8>,
+    labels: HashMap<usize, usize>, // label_id -> buffer_offset
+    patch_sites: Vec<PatchSite>,
+    deopt_stub_offset: usize,
+}
+
+impl NativeCodeGenerator {
+    pub fn new() -> Self {
+        Self { code: Vec::with_capacity(4096), labels: HashMap::new(), patch_sites: Vec::new(), deopt_stub_offset: 0 }
+    }
+
+    pub fn compile_trace(&mut self, trace: &Trace, deopt_trampoline: usize) -> Result<CompiledTrace, String> {
+        self.code.clear();
+        self.labels.clear();
+        self.patch_sites.clear();
+
+        // 1. ABI-Compliant Prologue
+        self.push_rbp();
+        self.mov_rbp_rsp();
+        self.and_rsp_16_aligned();
+        self.push_callee_saved();
+
+        // 2. Emit Guards (enforced in machine code)
+        self.deopt_stub_offset = self.code.len();
+        self.emit_guard_checks(&trace.guards, deopt_trampoline)?;
+
+        // 3. Emit Instructions
+        for instr in &trace.instructions {
+            self.emit_instruction(&instr.instruction)?;
+        }
+
+        // 4. Emit Epilogue & Deopt Stub
+        let exit_label = self.next_label();
+        self.emit_ret();
+        self.labels.insert(exit_label, self.code.len());
+        self.emit_deopt_stub(deopt_trampoline)?;
+
+        // 5. Backpatch Jumps
+        self.backpatch_jumps()?;
+
+        // 6. Allocate & Return
+        let exec_mem = ExecutableMemory::new(&self.code)?;
+        Ok(CompiledTrace {
+            trace_id: trace.id,
+            entry_point: exec_mem.entry_point(),
+            memory: exec_mem,
+            guard_count: trace.guards.len(),
+            instruction_count: trace.instructions.len(),
+            side_exit_table: trace.side_exits.iter().map(|se| (se.buffer_offset, se.fallback_pc)).collect(),
+        })
+    }
+
+    // --- Guard Emission ---
+    fn emit_guard_checks(&mut self, guards: &[Guard], deopt_addr: usize) -> Result<(), String> {
+        for guard in guards {
+            // rsi points to type_tags array
+            self.movzx_al_rsi_off(guard.slot);
+            self.cmp_al_imm8(guard.expected_type as u8);
+            
+            // jne deopt_trampoline
+            let deopt_label = self.next_label();
+            self.jne_label(deopt_label);
+            self.labels.insert(deopt_label, deopt_addr); // Patch to trampoline address
+        }
+        Ok(())
+    }
+
+    // --- Instruction Emission ---
+    fn emit_instruction(&mut self, instr: &Instr) -> Result<(), String> {
+        match instr {
+            Instr::LoadI32(dst, val) => {
+                self.mov_eax_imm32(*val as i32);
+                self.store_rax_to_slot(*dst);
+            }
+            Instr::LoadI64(dst, val) => {
+                self.mov_rax_imm64(*val);
+                self.store_rax_to_slot(*dst);
+            }
+            Instr::Add(dst, lhs, rhs) => {
+                self.load_slot_to_reg(*lhs, Reg::RAX);
+                self.load_slot_to_reg(*rhs, Reg::RCX);
+                self.add_rax_rcx();
+                self.store_rax_to_slot(*dst);
+            }
+            Instr::Sub(dst, lhs, rhs) => {
+                self.load_slot_to_reg(*lhs, Reg::RAX);
+                self.load_slot_to_reg(*rhs, Reg::RCX);
+                self.sub_rax_rcx();
+                self.store_rax_to_slot(*dst);
+            }
+            Instr::Mul(dst, lhs, rhs) => {
+                self.load_slot_to_reg(*lhs, Reg::RAX);
+                self.load_slot_to_reg(*rhs, Reg::RCX);
+                self.imul_rax_rcx();
+                self.store_rax_to_slot(*dst);
+            }
+            Instr::JumpFalse(cond, target_pc) => {
+                self.load_slot_to_reg(*cond, Reg::RAX);
+                self.test_rax_rax();
+                
+                let jump_label = self.next_label();
+                self.jz_label(jump_label);
+                
+                // Record patch site for later resolution
+                self.patch_sites.push(PatchSite {
+                    buffer_offset: self.code.len() - 4,
+                    target_label: jump_label,
+                });
+                // Store side-exit mapping
+                if let Some(trace) = self.trace_context.as_ref() {
+                    if let Some(last_exit) = trace.side_exits.last() {
+                        // In a real compiler, target_pc maps to a label or side-exit stub
+                        self.labels.insert(jump_label, target_pc); // Simplified mapping
+                    }
+                }
+            }
+            Instr::Return(slot) => {
+                self.load_slot_to_reg(*slot, Reg::RAX);
+                // Fall through to epilogue
+            }
+            _ => return Err(format!("Unsupported instruction: {:?}", instr)),
+        }
+        Ok(())
+    }
+
+    // --- x86-64 Encoding Primitives ---
+    fn push_rbp(&mut self) { self.b(0x55); }
+    fn mov_rbp_rsp(&mut self) { self.bb(0x48, 0x89, 0xE5); }
+    fn and_rsp_16_aligned(&mut self) { self.bbbb(0x48, 0x83, 0xE4, 0xF0); }
+    fn push_callee_saved(&mut self) { self.bb(0x41, 0x54); self.bb(0x41, 0x55); } // r12, r13
+    fn pop_callee_saved(&mut self) { self.bb(0x41, 0x5D); self.bb(0x41, 0x5C); }
+    fn emit_ret(&mut self) { self.pop_callee_saved(); self.mov_rsp_rbp(); self.pop_rbp(); self.b(0xC3); }
+    fn mov_rsp_rbp(&mut self) { self.bb(0x48, 0x89, 0xEC); }
+    fn pop_rbp(&mut self) { self.b(0x5D); }
+
+    fn load_slot_to_reg(&mut self, slot: u16, reg: Reg) {
+        let reg_code = reg as u8;
+        // mov reg64, [rdi + slot*8] -> REX.W + 8B + ModR/M + disp32
+        self.bb(0x48, 0x8B);
+        self.modrm(2, reg_code, 7); // mod=2, reg, rm=7(rdi)
+        self.i32((slot as i32) * 8);
+    }
+
+    fn store_rax_to_slot(&mut self, slot: u16) {
+        // mov [rdi + slot*8], rax -> REX.W + 89 + ModR/M + disp32
+        self.bb(0x48, 0x89);
+        self.modrm(2, 0, 7);
+        self.i32((slot as i32) * 8);
+    }
+
+    fn movzx_al_rsi_off(&mut self, off: u16) {
+        // movzx eax, byte [rsi + off] -> 0F B6 46 xx
+        self.b(0x0F); self.b(0xB6);
+        self.modrm(0, 0, 6); // rm=6(rsi)
+        self.b(off as u8);
+    }
+
+    fn cmp_al_imm8(&mut self, imm: u8) { self.bb(0x3C, imm); }
+    fn test_rax_rax(&mut self) { self.bbb(0x48, 0x85, 0xC0); }
+    fn add_rax_rcx(&mut self) { self.bbb(0x48, 0x01, 0xC8); }
+    fn sub_rax_rcx(&mut self) { self.bbb(0x48, 0x29, 0xC8); }
+    fn imul_rax_rcx(&mut self) { self.bbbb(0x48, 0x0F, 0xAF, 0xC1); }
+    fn mov_eax_imm32(&mut self, val: i32) { self.b(0xB8); self.i32(val); }
+    fn mov_rax_imm64(&mut self, val: i64) { self.bb(0x48, 0xB8); self.i64(val); }
+
+    fn jne_label(&mut self, label: usize) { self.rel32_jump(0x0F, 0x85, label); }
+    fn jz_label(&mut self, label: usize) { self.rel32_jump(0x0F, 0x84, label); }
+
+    fn rel32_jump(&mut self, prefix: u8, opcode: u8, label: usize) {
+        self.b(prefix); self.b(opcode);
+        self.i32(0); // Placeholder
+        self.patch_sites.push(PatchSite { buffer_offset: self.code.len() - 4, target_label: label });
+    }
+
+    fn emit_deopt_stub(&mut self, deopt_trampoline: usize) -> Result<(), String> {
+        // Simple deopt: call trampoline with failure code, return -1
+        // mov eax, -1; ret
+        // In production: save registers, snapshot state, call deopt_handler
+        self.b(0xB8); self.i32(-1);
+        self.b(0xC3);
+        Ok(())
+    }
+
+    // --- Backpatching ---
+    fn backpatch_jumps(&mut self) -> Result<(), String> {
+        for patch in &self.patch_sites {
+            if let Some(&target) = self.labels.get(&patch.target_label) {
+                let current_ip = patch.buffer_offset + 4;
+                let rel = (target as isize - current_ip as isize) as i32;
+                let buf = &mut self.code;
+                buf[patch.buffer_offset..patch.buffer_offset + 4].copy_from_slice(&rel.to_le_bytes());
+            } else {
+                return Err(format!("Unresolved label: {}", patch.target_label));
+            }
+        }
+        Ok(())
+    }
+
+    // --- Helpers ---
+    fn b(&mut self, v: u8) { self.code.push(v); }
+    fn bb(&mut self, a: u8, b: u8) { self.code.extend_from_slice(&[a, b]); }
+    fn bbb(&mut self, a: u8, b: u8, c: u8) { self.code.extend_from_slice(&[a, b, c]); }
+    fn bbbb(&mut self, a: u8, b: u8, c: u8, d: u8) { self.code.extend_from_slice(&[a, b, c, d]); }
+    fn i32(&mut self, v: i32) { self.code.extend_from_slice(&v.to_le_bytes()); }
+    fn i64(&mut self, v: i64) { self.code.extend_from_slice(&v.to_le_bytes()); }
+    fn modrm(&mut self, mode: u8, reg: u8, rm: u8) { self.b((mode << 6) | ((reg & 7) << 3) | (rm & 7)); }
+    fn next_label(&mut self) -> usize { let l = self.code.len(); self.labels.insert(self.labels.len() + 1, l); self.labels.len() }
+    // Note: trace_context is temporarily unused in this isolated file, kept for architectural completeness
+    trace_context: Option<Trace>,
+}
+
+// =============================================================================
+// §6  COMPILED TRACE & DEOPT
+// =============================================================================
 #[derive(Clone)]
 pub struct CompiledTrace {
     pub trace_id: u32,
@@ -448,30 +433,26 @@ pub struct CompiledTrace {
     pub memory: ExecutableMemory,
     pub guard_count: usize,
     pub instruction_count: usize,
+    pub side_exit_table: Vec<(usize, usize)>,
 }
 
 impl CompiledTrace {
-    /// Execute the compiled trace
-    pub unsafe fn execute(&self, slots: *mut i64) -> i64 {
-        let func: unsafe extern "C" fn(*mut i64) -> i64 = mem::transmute(self.entry_point);
-        func(slots)
+    /// fn(slots: *mut i64, types: *const u8) -> i64
+    pub unsafe fn execute(&self, slots: *mut i64, types: *const u8) -> i64 {
+        let func: unsafe extern "C" fn(*mut i64, *const u8) -> i64 = mem::transmute(self.entry_point);
+        func(slots, types)
     }
 }
 
-// =============================================================================
-// §6  TRACING JIT INTEGRATION
-// =============================================================================
+#[no_mangle]
+pub unsafe extern "C" fn jit_deopt_trampoline() -> i64 { -1 }
 
-/// The complete tracing JIT engine
+// §7  TRACING JIT INTEGRATION
 pub struct TracingJIT {
     pub recorder: TraceRecorder,
     pub codegen: NativeCodeGenerator,
-    
-    /// Execution thresholds
-    pub trace_trigger: u64,        // Start tracing after N executions
-    pub compile_trigger: u64,      // Compile after N traced executions
-    
-    /// Statistics
+    pub trace_trigger: u64,
+    pub compile_trigger: u64,
     pub traces_recorded: u64,
     pub traces_compiled: u64,
     pub deoptimizations: u64,
@@ -482,65 +463,49 @@ impl TracingJIT {
         Self {
             recorder: TraceRecorder::new(),
             codegen: NativeCodeGenerator::new(),
-            trace_trigger: 100,       // Start tracing after 100 executions
-            compile_trigger: 10,      // Compile after 10 traced runs
+            trace_trigger: 100,
+            compile_trigger: 10,
             traces_recorded: 0,
             traces_compiled: 0,
             deoptimizations: 0,
         }
     }
-    
-    /// Check if we should start tracing
-    pub fn should_start_tracing(&self, execution_count: u64) -> bool {
-        execution_count == self.trace_trigger
-    }
-    
-    /// Check if we should compile the trace
-    pub fn should_compile(&self, trace: &Trace) -> bool {
-        trace.execution_count >= self.compile_trigger
-    }
-    
-    /// Execute with JIT compilation
+
+    pub fn should_start_tracing(&self, count: u64) -> bool { count == self.trace_trigger }
+    pub fn should_compile(&self, trace: &Trace) -> bool { trace.execution_count >= self.compile_trigger }
+
     pub fn execute_with_jit(
         &mut self,
         entry_pc: usize,
-        slots: &mut [Value],
+        slots: &mut [i64],
+        types: &mut [u8],
         instructions: &[Instr],
     ) -> Result<Value, RuntimeError> {
-        // Check if we have a compiled trace
         if let Some(trace_id) = self.recorder.find_trace(entry_pc) {
             if let Some(trace) = self.recorder.get_trace(trace_id) {
-                // If trace is hot enough, compile it
-                if self.should_compile(trace) && trace.instructions.len() > 0 {
-                    // Compile trace to native code
-                    match self.codegen.compile_trace(trace) {
+                if self.should_compile(trace) && !trace.instructions.is_empty() {
+                    match self.codegen.compile_trace(trace, jit_deopt_trampoline as usize) {
                         Ok(compiled) => {
                             self.traces_compiled += 1;
-                            
-                            // Execute native code
-                            unsafe {
-                                // This is simplified - real impl needs proper slot management
-                                let slot_ptr = slots.as_mut_ptr() as *mut i64;
-                                let result = compiled.execute(slot_ptr);
-                                return Ok(Value::I64(result));
+                            let res = unsafe { compiled.execute(slots.as_mut_ptr(), types.as_ptr()) };
+                            if res >= 0 {
+                                return Ok(Value::I64(res));
                             }
+                            self.deoptimizations += 1; // Guard failed or deopt triggered
                         }
-                        Err(_) => {
-                            // Compilation failed - fall back to interpreter
-                            self.deoptimizations += 1;
-                        }
+                        Err(_) => { self.deoptimizations += 1; }
                     }
                 }
-                
-                // Update trace execution count
-                if let Some(trace_mut) = self.recorder.get_trace_mut(trace_id) {
-                    trace_mut.execution_count += 1;
-                }
+                if let Some(t) = self.recorder.get_trace_mut(trace_id) { t.execution_count += 1; }
             }
         }
+
+        // Fallback to interpreter (or start recording)
+        if self.should_start_tracing(100) {
+            self.recorder.start_recording(entry_pc);
+            self.traces_recorded += 1;
+        }
         
-        // Interpret normally (would call the tree-walker or bytecode VM)
-        // This is handled by the main interpreter loop
-        Err(RuntimeError::new("JIT not implemented yet"))
+        Err(RuntimeError::new("Interpreter fallback: JIT trace hot but not yet compiled, or guard failed"))
     }
 }
