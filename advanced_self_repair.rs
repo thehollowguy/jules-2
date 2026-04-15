@@ -573,7 +573,10 @@ impl ShadowValidator {
         let mut patched_state = context.clone();
         let mut divergence_point = None;
 
+        // "Original" execution skips guard instructions — simulating the
+        // un-patched fast path that lacks type/bounds/overflow checks.
         let original_steps = self.simulate_execution(&mut original_state, patch, false);
+        // "Patched" execution runs everything including guards.
         let patched_steps = self.simulate_execution(&mut patched_state, patch, true);
 
         let diverged = self.compare_states(&original_state, &patched_state, &mut divergence_point);
@@ -595,13 +598,28 @@ impl ShadowValidator {
         &self,
         state: &mut FxHashMap<String, RuntimeValue>,
         patch: &IRPatch,
-        _use_patch: bool,
+        use_patch: bool,
     ) -> u64 {
         let mut steps = 0u64;
 
         for instr in &patch.instructions {
             if steps >= self.max_steps {
                 break;
+            }
+
+            // When simulating the *original* (un-patched) path, skip guard
+            // instructions that the patch adds.  This lets compare_states detect
+            // cases where a guard would have changed execution flow.
+            if !use_patch {
+                match instr {
+                    PatchInstr::CheckType { .. }
+                    | PatchInstr::CheckBounds { .. }
+                    | PatchInstr::CheckOverflow { .. } => {
+                        steps += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
             }
 
             match instr {
@@ -810,8 +828,8 @@ pub struct AdaptiveThresholds {
     thresholds: FxHashMap<String, FunctionThreshold>,
     default_threshold: u32,
     learning_rate: f64,
-    min_threshold: u32,
-    max_threshold: u32,
+    pub min_threshold: u32,
+    pub max_threshold: u32,
 }
 
 /// Per-function threshold metadata.
@@ -976,6 +994,8 @@ pub struct ABTestResult {
     pub runner_up_avg_cycles: f64,
     pub improvement_ratio: f64,
     pub total_steps: u64,
+    /// The winning patch, stored so `get_best_patch` can return it after the test closes.
+    pub winning_patch: Option<IRPatch>,
 }
 
 impl ABTestEngine {
@@ -1018,43 +1038,37 @@ impl ABTestEngine {
         fingerprint
     }
 
-    /// Select the next variant to try using UCB1 policy.
+    /// Select the next variant to try using UCB1 policy (Lower-Confidence-Bound for minimisation).
     pub fn select_variant(&self, test_fingerprint: &u64) -> Option<usize> {
         let test = self.active_tests.get(test_fingerprint)?;
 
         let total_execs: u64 = test.variants.values().map(|v| v.executions).sum();
 
-        if total_execs == 0 {
-            // First round: try each variant once
-            return test.variants.keys().next().copied();
+        // First pass: try each variant at least once before applying UCB.
+        if total_execs < test.variants.len() as u64 {
+            return test.variants
+                .iter()
+                .find(|(_, v)| v.executions == 0)
+                .map(|(id, _)| *id);
         }
 
-        // UCB1: argmax_i (mean_i + C * sqrt(ln(N) / n_i))
+        // UCB for minimisation (LCB): score_i = -mean_i + C * sqrt(ln(N) / n_i)
+        // We maximise the score, which prefers low-mean, under-explored variants.
         test.variants
             .iter()
-            .filter(|(_, v)| v.executions > 0 || total_execs < test.variants.len() as u64)
             .max_by(|(_, a), (_, b)| {
-                let mean_a = a.avg_cycles_per_exec;
-                let mean_b = b.avg_cycles_per_exec;
-
-                let ucb_a = if a.executions == 0 {
-                    f64::INFINITY // Untried variant
-                } else {
-                    mean_a
-                        - self.exploration_parameter
-                            * ((total_execs as f64).ln() / a.executions as f64).sqrt()
+                let score = |v: &ABVariant| -> f64 {
+                    if v.executions == 0 {
+                        f64::INFINITY // Always try untried variants first
+                    } else {
+                        -v.avg_cycles_per_exec
+                            + self.exploration_parameter
+                                * ((total_execs as f64).ln() / v.executions as f64).sqrt()
+                    }
                 };
-
-                let ucb_b = if b.executions == 0 {
-                    f64::INFINITY
-                } else {
-                    mean_b
-                        - self.exploration_parameter
-                            * ((total_execs as f64).ln() / b.executions as f64).sqrt()
-                };
-
-                // Lower is better (fewer cycles)
-                ucb_b.partial_cmp(&ucb_a).unwrap_or(std::cmp::Ordering::Equal)
+                score(a)
+                    .partial_cmp(&score(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(id, _)| *id)
     }
@@ -1113,23 +1127,33 @@ impl ABTestEngine {
             None => return,
         };
 
+        // Sort by (failure-free first, then fewest avg cycles).
         let mut sorted: Vec<_> = test
             .variants
             .iter()
-            .filter(|(_, v)| v.executions > 0 && v.failures == 0)
+            .filter(|(_, v)| v.executions > 0)
             .collect();
         sorted.sort_by(|a, b| {
-            a.1.avg_cycles_per_exec
-                .partial_cmp(&b.1.avg_cycles_per_exec)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let a_clean = a.1.failures == 0;
+            let b_clean = b.1.failures == 0;
+            match (a_clean, b_clean) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.1.avg_cycles_per_exec
+                    .partial_cmp(&b.1.avg_cycles_per_exec)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            }
         });
 
-        if sorted.len() >= 2 {
+        if !sorted.is_empty() {
             let winner = sorted[0];
-            let runner_up = sorted[1];
-            let improvement = if runner_up.1.avg_cycles_per_exec > 0.0 {
-                (runner_up.1.avg_cycles_per_exec - winner.1.avg_cycles_per_exec)
-                    / runner_up.1.avg_cycles_per_exec
+            let runner_up_cycles = sorted
+                .get(1)
+                .map(|r| r.1.avg_cycles_per_exec)
+                .unwrap_or(winner.1.avg_cycles_per_exec);
+
+            let improvement = if runner_up_cycles > 0.0 {
+                (runner_up_cycles - winner.1.avg_cycles_per_exec) / runner_up_cycles
             } else {
                 0.0
             };
@@ -1139,21 +1163,10 @@ impl ABTestEngine {
                 func_name: test.func_name,
                 winner_variant: *winner.0,
                 winner_avg_cycles: winner.1.avg_cycles_per_exec,
-                runner_up_avg_cycles: runner_up.1.avg_cycles_per_exec,
+                runner_up_avg_cycles: runner_up_cycles,
                 improvement_ratio: improvement,
                 total_steps: test.total_steps,
-            });
-        } else if sorted.len() == 1 {
-            // Only one viable variant
-            let winner = sorted[0];
-            self.completed_tests.push(ABTestResult {
-                fingerprint,
-                func_name: test.func_name,
-                winner_variant: *winner.0,
-                winner_avg_cycles: winner.1.avg_cycles_per_exec,
-                runner_up_avg_cycles: winner.1.avg_cycles_per_exec,
-                improvement_ratio: 0.0,
-                total_steps: test.total_steps,
+                winning_patch: Some(winner.1.patch.clone()),
             });
         }
     }
@@ -1172,19 +1185,11 @@ impl ABTestEngine {
     }
 
     pub fn get_best_patch(&self, fingerprint: &u64) -> Option<IRPatch> {
-        for result in &self.completed_tests {
-            if &result.fingerprint == fingerprint {
-                // Find the test result in completed tests and return winner
-                for completed in &self.completed_tests {
-                    if &completed.fingerprint == fingerprint {
-                        // Need to find the patch from a stored copy. In production,
-                        // we'd store patches in completed_tests too.
-                        return None;
-                    }
-                }
-            }
+        // Check completed tests first — the winner's patch is stored there.
+        if let Some(result) = self.completed_tests.iter().find(|r| &r.fingerprint == fingerprint) {
+            return result.winning_patch.clone();
         }
-        // Check active tests
+        // Fall back to leading variant in an active test.
         if let Some(test) = self.active_tests.get(fingerprint) {
             if let Some(leading) = test.leading_variant {
                 return test.variants.get(&leading).map(|v| v.patch.clone());
@@ -1300,9 +1305,9 @@ impl MetaLearningEngine {
 
         let best_key = stats_map
             .iter()
-            .max_by(|(_, a), (_, b)| {
-                let score_a = self.strategy_score(a);
-                let score_b = self.strategy_score(b);
+            .max_by(|(key_a, a), (key_b, b)| {
+                let score_a = self.strategy_score(a, key_a);
+                let score_b = self.strategy_score(b, key_b);
                 score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(k, _)| k.clone());
@@ -1312,13 +1317,34 @@ impl MetaLearningEngine {
     }
 
     fn update_ucb(&mut self, failure_type: &str, _strategy: &str) {
-        if let Some(stats_map) = self.strategy_matrix.get(failure_type) {
-            let total: u32 = stats_map.values().map(|s| s.attempts).sum();
-            let _ = total;
+        // Increment global selection counter used by the UCB exploration term.
+        self.total_selections += 1;
+
+        let total: u64 = self
+            .strategy_matrix
+            .get(failure_type)
+            .map(|m| m.values().map(|s| s.attempts as u64).sum())
+            .unwrap_or(0);
+
+        if let Some(stats_map) = self.strategy_matrix.get_mut(failure_type) {
+            for stats in stats_map.values_mut() {
+                let success_rate = if stats.attempts > 0 {
+                    stats.successes as f64 / stats.attempts as f64
+                } else {
+                    0.5
+                };
+                // UCB1 exploration bonus
+                let exploration = if stats.attempts > 0 && total > 0 {
+                    (2.0 * (total as f64).ln() / stats.attempts as f64).sqrt()
+                } else {
+                    f64::INFINITY
+                };
+                stats.ucb_value = success_rate + exploration;
+            }
         }
     }
 
-    fn strategy_score(&self, stats: &StrategyStats) -> f64 {
+    fn strategy_score(&self, stats: &StrategyStats, strategy_key: &str) -> f64 {
         let success_rate = if stats.attempts > 0 {
             stats.successes as f64 / stats.attempts as f64
         } else {
@@ -1331,9 +1357,10 @@ impl MetaLearningEngine {
             f64::INFINITY
         };
 
+        // Use the weight for *this* strategy, not a hard-coded one.
         let default_weight = self
             .default_weights
-            .get("PolymorphicGuard")
+            .get(strategy_key)
             .copied()
             .unwrap_or(0.5);
 
@@ -1677,8 +1704,6 @@ impl ProfilePersistence {
     }
 
     fn deserialize_profile(json: &str) -> Result<PGOProfile, String> {
-        // Simplified deserialization
-        // In production, use serde_json
         let mut profile = PGOProfile {
             hot_paths: Vec::new(),
             fragile_paths: Vec::new(),
@@ -1687,31 +1712,68 @@ impl ProfilePersistence {
             performance_data: FxHashMap::default(),
         };
 
-        // Parse fragile paths (simple parser for our format)
-        // This is a simplified parser — full implementation would use a JSON library
-        if json.contains("fragile_paths") {
-            // Extract paths array content
-            if let Some(start) = json.find(r#""fragile_paths": ["#) {
-                let rest = &json[start + r#""fragile_paths": ["#.len()..];
-                if let Some(end) = rest.find(']') {
-                    let content = &rest[..end];
-                    // Parse each object
-                    for obj in content.split("}, {") {
-                        let obj = obj.trim_matches(|c| c == '{' || c == '}' || c == ' ');
-                        if obj.is_empty() {
-                            continue;
-                        }
-                        // Extract fields
-                        let fingerprint = Self::extract_field_u64(obj, "fingerprint").unwrap_or(0);
-                        let failure_count = Self::extract_field_u32(obj, "failures").unwrap_or(0);
-
-                        profile.fragile_paths.push(FragilePath {
-                            fingerprint,
-                            failure_count,
-                            patch_strategy: RepairStrategy::Deoptimize, // Default
-                            root_cause: "Deserialized".into(),
-                        });
+        // --- fragile_paths ---
+        if let Some(start) = json.find("\"fragile_paths\": [") {
+            let rest = &json[start + "\"fragile_paths\": [".len()..];
+            if let Some(end) = rest.find(']') {
+                let content = &rest[..end];
+                for obj in content.split("}, {") {
+                    let obj = obj.trim_matches(|c: char| c == '{' || c == '}' || c == ' ');
+                    if obj.is_empty() {
+                        continue;
                     }
+                    let fingerprint = Self::extract_field_u64(obj, "fingerprint").unwrap_or(0);
+                    let failure_count = Self::extract_field_u32(obj, "failures").unwrap_or(0);
+                    let root_cause = Self::extract_field_str(obj, "cause")
+                        .unwrap_or_else(|| "Deserialized".into());
+
+                    profile.fragile_paths.push(FragilePath {
+                        fingerprint,
+                        failure_count,
+                        patch_strategy: RepairStrategy::Deoptimize,
+                        root_cause,
+                    });
+                }
+            }
+        }
+
+        // --- performance_data ---
+        // Format: "func": {"avg_cycles": N, "p99_cycles": N, "calls": N}
+        if let Some(start) = json.find("\"performance_data\": {") {
+            let rest = &json[start + "\"performance_data\": {".len()..];
+            // Walk through key-value pairs
+            let mut remaining = rest;
+            while let Some(key_start) = remaining.find('"') {
+                remaining = &remaining[key_start + 1..];
+                let key_end = match remaining.find('"') {
+                    Some(e) => e,
+                    None => break,
+                };
+                let key = &remaining[..key_end];
+                remaining = &remaining[key_end + 1..];
+                // Expect ": {..."
+                if let Some(obj_start) = remaining.find('{') {
+                    remaining = &remaining[obj_start + 1..];
+                    if let Some(obj_end) = remaining.find('}') {
+                        let obj = &remaining[..obj_end];
+                        let avg_cycles = Self::extract_field_u64(obj, "avg_cycles").unwrap_or(0);
+                        let p99_cycles = Self::extract_field_u64(obj, "p99_cycles").unwrap_or(0);
+                        let call_count = Self::extract_field_u64(obj, "calls").unwrap_or(0);
+                        profile.performance_data.insert(
+                            key.to_string(),
+                            crate::self_repair::FunctionPerf {
+                                name: key.to_string(),
+                                avg_cycles,
+                                p99_cycles,
+                                call_count,
+                            },
+                        );
+                        remaining = &remaining[obj_end + 1..];
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
                 }
             }
         }
@@ -1732,6 +1794,36 @@ impl ProfilePersistence {
 
     fn extract_field_u32(obj: &str, field: &str) -> Option<u32> {
         Self::extract_field_u64(obj, field).map(|v| v as u32)
+    }
+
+    /// Extract a quoted string value: `"field": "value"`.
+    fn extract_field_str(obj: &str, field: &str) -> Option<String> {
+        let key = format!("\"{}\": \"", field);
+        if let Some(pos) = obj.find(&key) {
+            let rest = &obj[pos + key.len()..];
+            // Find the closing quote (handle simple escaped quotes).
+            let mut result = String::new();
+            let mut chars = rest.chars().peekable();
+            loop {
+                match chars.next() {
+                    Some('\\') => {
+                        match chars.next() {
+                            Some('"') => result.push('"'),
+                            Some('n') => result.push('\n'),
+                            Some('t') => result.push('\t'),
+                            Some('\\') => result.push('\\'),
+                            Some(c) => { result.push('\\'); result.push(c); }
+                            None => break,
+                        }
+                    }
+                    Some('"') => break,
+                    Some(c) => result.push(c),
+                    None => break,
+                }
+            }
+            return Some(result);
+        }
+        None
     }
 
     fn escape_json(s: &str) -> String {
@@ -1842,10 +1934,16 @@ impl IRDiffViewer {
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    // Collect chars so we never split a multi-byte UTF-8 codepoint.
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_len {
+        // Left-align and pad to exactly max_len columns.
         format!("{:<width$}", s, width = max_len)
     } else {
-        format!("{:.width$}...", &s[..max_len.saturating_sub(3)], width = max_len)
+        // Reserve three columns for the ellipsis.
+        let keep = max_len.saturating_sub(3);
+        let truncated: String = chars[..keep].iter().collect();
+        format!("{:<width$}...", truncated, width = keep)
     }
 }
 
@@ -1956,16 +2054,45 @@ impl CliffPredictor {
     fn pattern_matches(
         &self,
         pattern_key: &str,
-        _func_name: &str,
-        _context: &FxHashMap<String, RuntimeValue>,
+        func_name: &str,
+        context: &FxHashMap<String, RuntimeValue>,
     ) -> bool {
-        // Simplified pattern matching.
-        // Full implementation would analyze IR structure, loop nesting depth,
-        // data structure sizes, and call graph depth.
-        matches!(
-            pattern_key,
-            "nested_loop_large_arrays" | "hashmap_with_collisions"
-        )
+        match pattern_key {
+            "nested_loop_large_arrays" => {
+                // Heuristic: context contains an array-length variable > 10_000,
+                // or the function name suggests nested iteration.
+                let large_array = context.values().any(|v| {
+                    matches!(v, RuntimeValue::Int(n) if *n > 10_000)
+                });
+                let nested_name = func_name.contains("matrix")
+                    || func_name.contains("nested")
+                    || func_name.contains("grid");
+                large_array || nested_name
+            }
+            "hashmap_with_collisions" => {
+                // Heuristic: high collision rates would surface as large Int
+                // values for a key named "collision_count" or "bucket_size".
+                context.iter().any(|(k, v)| {
+                    (k.contains("collision") || k.contains("bucket"))
+                        && matches!(v, RuntimeValue::Int(n) if *n > 100)
+                })
+            }
+            "recursive_deep_call" => {
+                // Heuristic: function name suggests recursion AND a depth
+                // counter in context is already large.
+                let recursive_name = func_name.contains("recurse")
+                    || func_name.contains("fib")
+                    || func_name.contains("factorial")
+                    || func_name.contains("dfs")
+                    || func_name.contains("bfs");
+                let deep = context.iter().any(|(k, v)| {
+                    (k.contains("depth") || k.contains("level"))
+                        && matches!(v, RuntimeValue::Int(n) if *n > 500)
+                });
+                recursive_name && deep
+            }
+            _ => false,
+        }
     }
 
     /// Record actual slowdown to improve predictions.

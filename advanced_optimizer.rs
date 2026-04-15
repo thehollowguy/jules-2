@@ -1,34 +1,7 @@
-// =============================================================================
 // jules/src/advanced_optimizer.rs
 //
-// SUPEROPTIMIZER — Multi-Pass Expression & Program Optimizer
-//
-// Architecture inspired by:
-//   - LLVM InstCombine / ScalarReplAggregates
-//   - Souper peephole superoptimizer
-//   - egg e-graph equality saturation (Willsey et al. 2021)
-//   - GCC tree-ssa optimization pipeline
-//
-// Optimization Passes:
-//   §1  Configuration & Statistics
-//   §2  Constant Folding (int, float, bool, compile-time eval)
-//   §3  Constant Propagation (SCCP — Wegman & Zadeck)
-//   §4  Algebraic Simplification (50+ rewrite rules)
-//   §5  Strength Reduction (expensive → cheap ops)
-//   §6  Bitwise Optimization
-//   §7  Comparison Canonicalization
-//   §8  Expression Reassociation
-//   §9  Common Subexpression Elimination (CSE)
-//   §10 Dead Code Elimination (liveness-based)
-//   §11 Dead Store Elimination
-//   §12 Peephole Optimization
-//   §13 Loop Optimizations (LICM, induction var)
-//   §14 Function Inlining (with cost model)
-//   §15 Conditional Branch Optimization
-//   §16 Pipeline Orchestrator (multi-pass fixpoint)
-//   §17 Cost Model — x86-64 Cycle Estimation
-//   §18 Backwards Compatibility API
-// =============================================================================
+// SUPEROPTIMIZER 
+
 
 #![allow(dead_code)]
 
