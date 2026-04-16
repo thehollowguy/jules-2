@@ -23,6 +23,7 @@ use rustc_hash::FxHashMap;
 
 use crate::ast::{BinOpKind, Program};
 use crate::interp::{RuntimeError, Value};
+use crate::memory_management::PrefetchController;
 
 // =============================================================================
 // §1  BYTECODE INSTRUCTION SET
@@ -576,6 +577,7 @@ pub struct BytecodeVM {
     /// Execution statistics
     total_instructions: u64,
     total_time_ns: u64,
+    prefetch: PrefetchController,
 }
 
 impl BytecodeVM {
@@ -588,6 +590,7 @@ impl BytecodeVM {
             profiler: None,
             total_instructions: 0,
             total_time_ns: 0,
+            prefetch: PrefetchController::default(),
         }
     }
     
@@ -643,10 +646,10 @@ impl BytecodeVM {
         let constants = &func.constants;
         let slots = &mut self.memory_pool.slots;
         let mut pc: usize = 0;
+        let mut branch_density: u8 = 0;
         
         // Pre-compute instruction slice pointer to avoid bounds checks
         let instr_ptr = instructions.as_ptr();
-        let const_ptr = constants.as_ptr();
         let slot_ptr = slots.as_mut_ptr();
 
         // Main dispatch loop - direct threaded for maximum speed
@@ -658,6 +661,8 @@ impl BytecodeVM {
 
             // Direct instruction fetch with zero bounds checking
             let instr = unsafe { &*instr_ptr.add(pc) };
+            self.prefetch.update_distance(branch_density);
+            self.prefetch.prefetch_instruction(instr_ptr, pc, func_len);
             
             match instr {
                 // ── HOT PATH: Constant loads (most frequent) ──
@@ -692,6 +697,8 @@ impl BytecodeVM {
                 
                 // ── HOT PATH: Arithmetic operations ──
                 Instr::Add { dst, lhs, rhs } => {
+                    self.prefetch.prefetch_slot(slot_ptr, *lhs as usize, slots.len());
+                    self.prefetch.prefetch_slot(slot_ptr, *rhs as usize, slots.len());
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
                     
@@ -713,6 +720,8 @@ impl BytecodeVM {
                 }
                 
                 Instr::Sub { dst, lhs, rhs } => {
+                    self.prefetch.prefetch_slot(slot_ptr, *lhs as usize, slots.len());
+                    self.prefetch.prefetch_slot(slot_ptr, *rhs as usize, slots.len());
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
                     
@@ -734,6 +743,8 @@ impl BytecodeVM {
                 }
                 
                 Instr::Mul { dst, lhs, rhs } => {
+                    self.prefetch.prefetch_slot(slot_ptr, *lhs as usize, slots.len());
+                    self.prefetch.prefetch_slot(slot_ptr, *rhs as usize, slots.len());
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
                     
@@ -755,6 +766,8 @@ impl BytecodeVM {
                 }
                 
                 Instr::Div { dst, lhs, rhs } => {
+                    self.prefetch.prefetch_slot(slot_ptr, *lhs as usize, slots.len());
+                    self.prefetch.prefetch_slot(slot_ptr, *rhs as usize, slots.len());
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
                     
@@ -780,9 +793,28 @@ impl BytecodeVM {
                     slots[*dst as usize] = Self::div_values_static(&lhs_val, &rhs_val)?;
                     pc += 1;
                 }
+
+                // ── HOT PATH: SIMD-friendly vector ops ──
+                Instr::VecAdd { dst, lhs, rhs } => {
+                    self.prefetch.prefetch_slot(slot_ptr, *lhs as usize, slots.len());
+                    self.prefetch.prefetch_slot(slot_ptr, *rhs as usize, slots.len());
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+                    slots[*dst as usize] = Self::vec_add_values_static(l_val, r_val)?;
+                    pc += 1;
+                }
+                Instr::VecMul { dst, lhs, rhs } => {
+                    self.prefetch.prefetch_slot(slot_ptr, *lhs as usize, slots.len());
+                    self.prefetch.prefetch_slot(slot_ptr, *rhs as usize, slots.len());
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+                    slots[*dst as usize] = Self::vec_mul_values_static(l_val, r_val)?;
+                    pc += 1;
+                }
                 
                 // ── HOT PATH: Control flow ──
                 Instr::Jump { offset } => {
+                    branch_density = branch_density.saturating_add(1);
                     pc = if *offset >= 0 {
                         pc + *offset as usize
                     } else {
@@ -791,6 +823,7 @@ impl BytecodeVM {
                 }
                 
                 Instr::JumpFalse { cond, offset } => {
+                    branch_density = branch_density.saturating_add(1);
                     let cond_val = &slots[*cond as usize];
                     if !cond_val.is_truthy() {
                         pc = if *offset >= 0 {
@@ -804,6 +837,7 @@ impl BytecodeVM {
                 }
                 
                 Instr::JumpTrue { cond, offset } => {
+                    branch_density = branch_density.saturating_add(1);
                     let cond_val = &slots[*cond as usize];
                     if cond_val.is_truthy() {
                         pc = if *offset >= 0 {
@@ -845,6 +879,26 @@ impl BytecodeVM {
 
     fn div_values(&self, l: &Value, r: &Value) -> Result<Value, RuntimeError> {
         Self::div_values_static(l, r)
+    }
+
+    #[inline(always)]
+    fn vec_add_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
+        match (l, r) {
+            (Value::Vec2(a), Value::Vec2(b)) => Ok(Value::Vec2([a[0] + b[0], a[1] + b[1]])),
+            (Value::Vec3(a), Value::Vec3(b)) => Ok(Value::Vec3([a[0] + b[0], a[1] + b[1], a[2] + b[2]])),
+            (Value::Vec4(a), Value::Vec4(b)) => Ok(Value::Vec4(simd_add_vec4(*a, *b))),
+            _ => Err(RuntimeError::new("VecAdd expects matching vector types")),
+        }
+    }
+
+    #[inline(always)]
+    fn vec_mul_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
+        match (l, r) {
+            (Value::Vec2(a), Value::Vec2(b)) => Ok(Value::Vec2([a[0] * b[0], a[1] * b[1]])),
+            (Value::Vec3(a), Value::Vec3(b)) => Ok(Value::Vec3([a[0] * b[0], a[1] * b[1], a[2] * b[2]])),
+            (Value::Vec4(a), Value::Vec4(b)) => Ok(Value::Vec4(simd_mul_vec4(*a, *b))),
+            _ => Err(RuntimeError::new("VecMul expects matching vector types")),
+        }
     }
 
     // Static helper functions for use in the hot loop
@@ -914,6 +968,42 @@ impl BytecodeVM {
                 0.0
             },
         }
+    }
+}
+
+#[inline(always)]
+fn simd_add_vec4(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::{_mm_add_ps, _mm_loadu_ps, _mm_storeu_ps};
+        let va = _mm_loadu_ps(a.as_ptr());
+        let vb = _mm_loadu_ps(b.as_ptr());
+        let sum = _mm_add_ps(va, vb);
+        let mut out = [0.0f32; 4];
+        _mm_storeu_ps(out.as_mut_ptr(), sum);
+        return out;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
+    }
+}
+
+#[inline(always)]
+fn simd_mul_vec4(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::{_mm_loadu_ps, _mm_mul_ps, _mm_storeu_ps};
+        let va = _mm_loadu_ps(a.as_ptr());
+        let vb = _mm_loadu_ps(b.as_ptr());
+        let prod = _mm_mul_ps(va, vb);
+        let mut out = [0.0f32; 4];
+        _mm_storeu_ps(out.as_mut_ptr(), prod);
+        return out;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        [a[0] * b[0], a[1] * b[1], a[2] * b[2], a[3] * b[3]]
     }
 }
 

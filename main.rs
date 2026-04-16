@@ -16,6 +16,7 @@ mod gpu_backend;
 pub mod interp;
 mod lexer;
 mod ml_engine;
+mod memory_management;
 mod optimizer;
 mod parser;
 mod self_repair;
