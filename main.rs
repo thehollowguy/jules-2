@@ -21,7 +21,9 @@ mod parser;
 mod self_repair;
 mod sema;
 mod string_intern;
+#[cfg(feature = "phase3-jit")]
 pub mod tiered_compilation;
+#[cfg(feature = "phase3-jit")]
 pub mod tracing_jit;
 mod typeck;
 // Optional, phase-gated modules (added per performance phase protocol)
@@ -1879,33 +1881,56 @@ fn cmd_run(args: &CliArgs) -> i32 {
     // Run the interpreter.
     if let PipelineResult::Ok(program) = result {
         if args.tiered {
-            // Use tiered compilation for progressive optimization
-            let policy = match args.tier_policy.as_str() {
-                "fast-startup" => crate::tiered_compilation::PromotionPolicy::fast_startup(),
-                "balanced" => crate::tiered_compilation::PromotionPolicy::balanced(),
-                "max-performance" => crate::tiered_compilation::PromotionPolicy::max_performance(),
-                _ => crate::tiered_compilation::PromotionPolicy::balanced(),
-            };
-            
-            let mut tiered_mgr = crate::tiered_compilation::TieredExecutionManager::new(policy);
-            tiered_mgr.load_program(&program);
-            tiered_mgr.enabled = true;
-            
-            match tiered_mgr.call_function(&args.entry, vec![]) {
-                Ok(val) => {
-                    if !matches!(val, crate::interp::Value::Unit) {
-                        println!("{val}");
+            #[cfg(feature = "phase3-jit")]
+            {
+                // Use tiered compilation for progressive optimization
+                let policy = match args.tier_policy.as_str() {
+                    "fast-startup" => crate::tiered_compilation::PromotionPolicy::fast_startup(),
+                    "balanced" => crate::tiered_compilation::PromotionPolicy::balanced(),
+                    "max-performance" => crate::tiered_compilation::PromotionPolicy::max_performance(),
+                    _ => crate::tiered_compilation::PromotionPolicy::balanced(),
+                };
+
+                let mut tiered_mgr = crate::tiered_compilation::TieredExecutionManager::new(policy);
+                tiered_mgr.load_program(&program);
+                tiered_mgr.enabled = true;
+
+                match tiered_mgr.call_function(&args.entry, vec![]) {
+                    Ok(val) => {
+                        if !matches!(val, crate::interp::Value::Unit) {
+                            println!("{val}");
+                        }
+                    }
+                    Err(e) => {
+                        let diag = adapt_runtime_error(e);
+                        emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
+                        return 1;
                     }
                 }
-                Err(e) => {
-                    let diag = adapt_runtime_error(e);
-                    emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
-                    return 1;
+
+                if args.print_tier_stats {
+                    eprintln!("{}", tiered_mgr.tier_stats_summary());
                 }
             }
-            
-            if args.print_tier_stats {
-                eprintln!("{}", tiered_mgr.tier_stats_summary());
+            #[cfg(not(feature = "phase3-jit"))]
+            {
+                eprintln!(
+                    "warning: --tiered requested but binary was built without `phase3-jit`; running interpreter"
+                );
+                let mut interp = crate::interp::Interpreter::new();
+                interp.load_program(&program);
+                match interp.call_fn(&args.entry, vec![]) {
+                    Ok(val) => {
+                        if !matches!(val, crate::interp::Value::Unit) {
+                            println!("{val}");
+                        }
+                    }
+                    Err(e) => {
+                        let diag = adapt_runtime_error(e);
+                        emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
+                        return 1;
+                    }
+                }
             }
         } else {
             // Use plain interpreter (existing behavior)
