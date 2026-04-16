@@ -468,10 +468,14 @@ impl TieredExecutionManager {
                     slots[i] = arg;
                 }
             }
+            let mut types = vec![255u8; slots.len()];
+            for (i, v) in slots.iter().enumerate() {
+                types[i] = v.value_type() as u8;
+            }
 
             match self
                 .tracing_jit
-                .execute_with_jit(entry_pc, &mut slots, &compiled_fn.instrs)
+                .execute_with_jit(entry_pc, &mut slots, &mut types, &compiled_fn.instrs)
             {
                 Ok(v) => return Ok(v),
                 Err(_) => {}

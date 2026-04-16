@@ -204,30 +204,44 @@ pub struct NativeCodeGenerator {
 }
 
 impl NativeCodeGenerator {
+    fn init_reg_map(&mut self) {
+        self.reg_map.insert(Reg::RAX, RegState::Empty);
+        self.reg_map.insert(Reg::RCX, RegState::Empty);
+        self.reg_map.insert(Reg::RDX, RegState::Empty);
+        self.reg_map.insert(Reg::R8, RegState::Empty);
+        self.reg_map.insert(Reg::R9, RegState::Empty);
+        self.reg_map.insert(Reg::R10, RegState::Empty);
+        self.reg_map.insert(Reg::R11, RegState::Empty);
+    }
+
     pub fn new() -> Self {
-        Self {
+        let mut this = Self {
             code: Vec::with_capacity(4096), labels: HashMap::new(), patch_sites: Vec::new(),
             reg_map: HashMap::new(), slot_reg: HashMap::new(), spill_offset: 16,
             next_label_id: 0,
-        }
+        };
+        this.init_reg_map();
+        this
     }
 
-    pub fn compile_trace(&mut self, trace: &Trace, deopt_addr: usize) -> Result<CompiledTrace, String> {
+    pub fn compile_trace(&mut self, trace: &Trace, _deopt_addr: usize) -> Result<CompiledTrace, String> {
         self.code.clear(); self.labels.clear(); self.patch_sites.clear();
         self.reg_map.clear(); self.slot_reg.clear(); self.spill_offset = 16;
+        self.init_reg_map();
+        let deopt_label = self.next_label();
 
         // 1. ABI Prologue
         self.emit_prologue();
 
         // 2. Hoist invariant guards to entry & emit
-        self.emit_hoisted_guards(&trace.guards, deopt_addr)?;
+        self.emit_hoisted_guards(&trace.guards, deopt_label)?;
 
         // 3. Optimization Pass: Constant Folding & Dead Store Elimination
         let optimized = self.optimize_trace(&trace.instructions);
 
         // 4. Emit Instructions
         for instr in &optimized {
-            self.emit_instruction(instr)?;
+            self.emit_instruction(instr, deopt_label)?;
         }
 
         // 5. Write back dirty registers & emit epilogue
@@ -235,7 +249,7 @@ impl NativeCodeGenerator {
         self.emit_ret();
 
         // 6. Emit Deopt Stub
-        self.labels.insert(trace.next_label_id, self.code.len());
+        self.labels.insert(deopt_label, self.code.len());
         self.emit_deopt_stub();
 
         // 7. Backpatch Jumps
@@ -260,12 +274,16 @@ impl NativeCodeGenerator {
         
         for ti in instrs {
             match &ti.instruction {
-                Instr::LoadI32(dst, v) | Instr::LoadI64(dst, v) => {
+                Instr::LoadI32(dst, v) => {
                     last_load.insert(*dst, *v as i64);
                     out.push(ti.clone());
                 }
-                Instr::Add(dst, lhs, rhs) => {
-                    if let (Some(a), Some(b)) = (last_load.get(lhs), last_load.get(rhs)) {
+                Instr::LoadI64(dst, v) => {
+                    last_load.insert(*dst, *v);
+                    out.push(ti.clone());
+                }
+                Instr::BinOp(dst, BinOpKind::Add, lhs, rhs) => {
+                    if let (Some(a), Some(b)) = (last_load.get(lhs).copied(), last_load.get(rhs).copied()) {
                         // Constant fold
                         last_load.insert(*dst, a + b);
                         out.push(TraceInstruction {
@@ -278,8 +296,8 @@ impl NativeCodeGenerator {
                     last_load.remove(dst);
                     out.push(ti.clone());
                 }
-                Instr::Sub(dst, lhs, rhs) => {
-                    if let (Some(a), Some(b)) = (last_load.get(lhs), last_load.get(rhs)) {
+                Instr::BinOp(dst, BinOpKind::Sub, lhs, rhs) => {
+                    if let (Some(a), Some(b)) = (last_load.get(lhs).copied(), last_load.get(rhs).copied()) {
                         last_load.insert(*dst, a - b);
                         out.push(TraceInstruction {
                             original_pc: ti.original_pc,
@@ -291,8 +309,8 @@ impl NativeCodeGenerator {
                     last_load.remove(dst);
                     out.push(ti.clone());
                 }
-                Instr::Mul(dst, lhs, rhs) => {
-                    if let (Some(a), Some(b)) = (last_load.get(lhs), last_load.get(rhs)) {
+                Instr::BinOp(dst, BinOpKind::Mul, lhs, rhs) => {
+                    if let (Some(a), Some(b)) = (last_load.get(lhs).copied(), last_load.get(rhs).copied()) {
                         last_load.insert(*dst, a * b);
                         out.push(TraceInstruction {
                             original_pc: ti.original_pc,
@@ -311,20 +329,18 @@ impl NativeCodeGenerator {
     }
 
     // --- Guard Hoisting & Emission ---
-    fn emit_hoisted_guards(&mut self, guards: &[Guard], deopt_addr: usize) -> Result<(), String> {
+    fn emit_hoisted_guards(&mut self, guards: &[Guard], deopt_label: usize) -> Result<(), String> {
         for g in guards {
             self.b(0x0F); self.b(0xB6);          // movzx eax, byte [rsi + slot]
             self.modrm(0, 0, 6); self.b(g.slot as u8);
             self.bb(0x3C, g.expected_type as u8); // cmp al, type
-            let lbl = self.next_label();
-            self.jne_label(lbl);
-            self.labels.insert(lbl, deopt_addr);
+            self.jne_label(deopt_label);
         }
         Ok(())
     }
 
     // --- Instruction Emission (Optimized) ---
-    fn emit_instruction(&mut self, ti: &TraceInstruction) -> Result<(), String> {
+    fn emit_instruction(&mut self, ti: &TraceInstruction, deopt_label: usize) -> Result<(), String> {
         match &ti.instruction {
             Instr::LoadI32(dst, val) => {
                 self.ensure_reg(*dst, Reg::RAX)?;
@@ -336,36 +352,36 @@ impl NativeCodeGenerator {
                 self.mov_rax_imm64(*val);
                 self.mark_dirty(*dst);
             }
-            Instr::Add(dst, lhs, rhs) => {
+            Instr::Move(dst, src) => {
+                self.ensure_reg(*src, Reg::RAX)?;
+                self.bind_slot_reg(*dst, Reg::RAX);
+                self.mark_dirty(*dst);
+            }
+            Instr::BinOp(dst, BinOpKind::Add, lhs, rhs) => {
                 self.ensure_reg(*lhs, Reg::RAX)?;
                 self.ensure_reg(*rhs, Reg::RCX)?;
                 self.add_rax_rcx();
                 self.bind_slot_reg(*dst, Reg::RAX);
                 self.mark_dirty(*dst);
             }
-            Instr::Sub(dst, lhs, rhs) => {
+            Instr::BinOp(dst, BinOpKind::Sub, lhs, rhs) => {
                 self.ensure_reg(*lhs, Reg::RAX)?;
                 self.ensure_reg(*rhs, Reg::RCX)?;
                 self.sub_rax_rcx();
                 self.bind_slot_reg(*dst, Reg::RAX);
                 self.mark_dirty(*dst);
             }
-            Instr::Mul(dst, lhs, rhs) => {
+            Instr::BinOp(dst, BinOpKind::Mul, lhs, rhs) => {
                 self.ensure_reg(*lhs, Reg::RAX)?;
                 self.ensure_reg(*rhs, Reg::RCX)?;
                 self.imul_rax_rcx();
                 self.bind_slot_reg(*dst, Reg::RAX);
                 self.mark_dirty(*dst);
             }
-            Instr::JumpFalse(cond, target_pc) => {
+            Instr::JumpFalse(cond, _target_pc) => {
                 self.ensure_reg(*cond, Reg::RAX)?;
                 self.test_rax_rax();
-                let lbl = self.next_label();
-                // Use short jump if possible
-                let is_short = self.code.len() + 2 + 1 < 127; // Rough estimate
-                if is_short { self.jz_short(lbl); } else { self.jz_label(lbl); }
-                self.patch_sites.push(PatchSite { buffer_offset: self.code.len() - if is_short {1} else {4}, target_label: lbl, is_short_jump: is_short });
-                self.labels.insert(lbl, target_pc);
+                self.jz_label(deopt_label);
             }
             Instr::Return(slot) => {
                 self.ensure_reg(*slot, Reg::RAX)?;
@@ -380,7 +396,12 @@ impl NativeCodeGenerator {
     // --- Register Allocation & Spilling ---
     fn ensure_reg(&mut self, slot: u16, preferred: Reg) -> Result<(), String> {
         if let Some(&reg) = self.slot_reg.get(&slot) {
-            if reg != preferred { self.mov_reg_reg(reg, preferred); }
+            if reg != preferred {
+                self.mov_reg_reg(reg, preferred);
+                self.reg_map.insert(reg, RegState::Empty);
+                self.reg_map.insert(preferred, RegState::Occupied(slot));
+                self.slot_reg.insert(slot, preferred);
+            }
             return Ok(());
         }
         if let Some(RegState::Empty) = self.reg_map.get(&preferred) {
@@ -424,11 +445,10 @@ impl NativeCodeGenerator {
 
     fn spill_slot(&mut self, slot: u16, reg: Reg) -> Result<(), String> {
         let reg_code = reg as u8;
-        self.bb(0x48, 0x89); self.modrm(2, reg_code & 7, 5); // [rbp - disp32]
-        self.i32(-(self.spill_offset as i32));
+        self.bb(0x48, 0x89); self.modrm(2, reg_code & 7, 7); // [rdi + disp32]
+        self.i32((slot as i32) * 8);
         self.reg_map.insert(reg, RegState::Empty);
         self.slot_reg.remove(&slot);
-        self.spill_offset += 8;
         Ok(())
     }
 
@@ -457,7 +477,11 @@ impl NativeCodeGenerator {
         self.bb(0x41, 0x5F); self.bb(0x41, 0x5E); self.bb(0x41, 0x5D); self.bb(0x41, 0x5C);
         self.bbb(0x48, 0x89, 0xEC); self.b(0x5D); self.b(0xC3);
     }
-    fn emit_deopt_stub(&mut self) { self.b(0xB8); self.i32(-1); self.b(0xC3); }
+    fn emit_deopt_stub(&mut self) {
+        self.b(0xB8);
+        self.i32(-1);
+        self.emit_ret();
+    }
 
     fn mov_reg_reg(&mut self, src: Reg, dst: Reg) { self.bb(0x48, 0x89); self.modrm(3, src as u8, dst as u8); }
     fn mov_eax_imm32(&mut self, v: i32) { self.b(0xB8); self.i32(v); }
@@ -469,8 +493,6 @@ impl NativeCodeGenerator {
 
     fn jne_label(&mut self, l: usize) { self.rel32_jump(0x0F, 0x85, l); }
     fn jz_label(&mut self, l: usize) { self.rel32_jump(0x0F, 0x84, l); }
-    fn jz_short(&mut self, l: usize) { self.b(0x74); self.b(0); self.patch_sites.push(PatchSite { buffer_offset: self.code.len()-1, target_label: l, is_short_jump: true }); }
-
     fn rel32_jump(&mut self, p: u8, o: u8, l: usize) { self.b(p); self.b(o); self.i32(0); self.patch_sites.push(PatchSite { buffer_offset: self.code.len()-4, target_label: l, is_short_jump: false }); }
 
     fn backpatch_jumps(&mut self) -> Result<(), String> {
@@ -498,7 +520,6 @@ impl NativeCodeGenerator {
 // =============================================================================
 // §5  COMPILED TRACE
 // =============================================================================
-#[derive(Clone)]
 pub struct CompiledTrace {
     pub trace_id: u32,
     pub entry_point: *mut u8,
@@ -558,7 +579,14 @@ impl TracingJIT {
                 if let Some(t) = self.recorder.get_trace_mut(tid) { t.execution_count += 1; }
             }
         }
-        if self.should_start_tracing(100) { self.recorder.start_recording(entry_pc); self.traces_recorded += 1; }
+        if self.should_start_tracing(self.traces_recorded + 1) {
+            self.recorder.start_recording(entry_pc);
+            for (pc, instr) in instructions.iter().enumerate() {
+                self.recorder.record_instruction(instr, pc);
+            }
+            let _ = self.recorder.finish_recording();
+            self.traces_recorded += 1;
+        }
         Err(RuntimeError::new("Interpreter fallback: JIT trace hot but not compiled, or guard failed"))
     }
 }
