@@ -3,7 +3,8 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::time::Instant;
+use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 use jules::interp::{EcsWorld, Value};
 
@@ -173,35 +174,52 @@ fn main() {
         for _ in 0..3 {
             run_step_rust(&mut rw, dt);
         }
+        let min_measure_window = Duration::from_millis(200);
+        let mut measured_steps = 0usize;
         let tr = Instant::now();
-        for _ in 0..steps {
-            run_step_rust(&mut rw, dt);
+        while measured_steps < steps || tr.elapsed() < min_measure_window {
+            for _ in 0..steps {
+                run_step_rust(&mut rw, dt);
+            }
+            measured_steps += steps;
         }
+        // Keep final state observable so the optimizer cannot delete updates.
+        let checksum = rust_checksum(&rw);
+        black_box(checksum);
+        black_box(&rw);
         let elapsed = tr.elapsed().as_secs_f64();
-        let sps = steps as f64 / elapsed.max(1e-12);
-        println!("rust elapsed: {:.3}s ({:.1} steps/s)", elapsed, sps);
+        let sps = measured_steps as f64 / elapsed.max(1e-12);
+        println!(
+            "rust elapsed: {:.3}s ({:.1} steps/s, measured_steps={})",
+            elapsed, sps, measured_steps
+        );
+        let rust_sec_per_step = elapsed / (measured_steps as f64).max(1.0);
         if let Some(aot_s) = aot_elapsed_s {
+            let aot_sec_per_step = aot_s / (steps as f64).max(1.0);
             println!(
-                "aot-vs-rust ratio (aot/rust): {:.2}x",
-                aot_s / elapsed.max(1e-12)
+                "aot-vs-rust ratio (sec/step): {:.2}x",
+                aot_sec_per_step / rust_sec_per_step.max(1e-12)
             );
         }
         if let Some(fused_s) = fused_elapsed_s {
+            let fused_sec_per_step = fused_s / (steps as f64).max(1.0);
             println!(
-                "fused-vs-rust ratio (fused/rust): {:.2}x",
-                fused_s / elapsed.max(1e-12)
+                "fused-vs-rust ratio (sec/step): {:.2}x",
+                fused_sec_per_step / rust_sec_per_step.max(1e-12)
             );
         }
         if let Some(chunked_s) = chunked_elapsed_s {
+            let chunked_sec_per_step = chunked_s / (steps as f64).max(1.0);
             println!(
-                "chunked-vs-rust ratio (chunked/rust): {:.2}x",
-                chunked_s / elapsed.max(1e-12)
+                "chunked-vs-rust ratio (sec/step): {:.2}x",
+                chunked_sec_per_step / rust_sec_per_step.max(1e-12)
             );
         }
         if let Some(superopt_s) = superopt_elapsed_s {
+            let superopt_sec_per_step = superopt_s / (steps as f64).max(1.0);
             println!(
-                "superoptimizer-vs-rust ratio (superoptimizer/rust): {:.2}x",
-                superopt_s / elapsed.max(1e-12)
+                "superoptimizer-vs-rust ratio (sec/step): {:.2}x",
+                superopt_sec_per_step / rust_sec_per_step.max(1e-12)
             );
         }
     }
@@ -306,21 +324,22 @@ fn run_step_aot_hash(
 
     for id in &cache.ids {
         let t_fetch = Instant::now();
-        let pos_val = world.get_component(*id, "pos").unwrap().clone();
-        let vel_val = world.get_component(*id, "vel").unwrap().clone();
+        let vel = match world.get_component(*id, "vel") {
+            Some(Value::Vec3(v)) => *v,
+            _ => continue,
+        };
         hotspot.fetch_ns += t_fetch.elapsed().as_nanos();
 
         let t_math = Instant::now();
-        let new_pos = match (pos_val, vel_val) {
-            (Value::Vec3(p), Value::Vec3(v)) => {
-                Value::Vec3([p[0] + v[0] * dt, p[1] + v[1] * dt, p[2] + v[2] * dt])
-            }
-            _ => continue,
-        };
+        let dv = [vel[0] * dt, vel[1] * dt, vel[2] * dt];
         hotspot.math_ns += t_math.elapsed().as_nanos();
 
         let t_write = Instant::now();
-        world.insert_component(*id, "pos", new_pos);
+        if let Some(Value::Vec3(p)) = world.get_component_mut(*id, "pos") {
+            p[0] += dv[0];
+            p[1] += dv[1];
+            p[2] += dv[2];
+        }
         hotspot.write_ns += t_write.elapsed().as_nanos();
     }
 }
@@ -337,6 +356,16 @@ fn run_step_rust(world: &mut RustWorld, dt: f32) {
         p[2] += v[2] * dt;
         *h -= *d * dt;
     }
+}
+
+fn rust_checksum(world: &RustWorld) -> f64 {
+    let pos_sum: f64 = world
+        .pos
+        .iter()
+        .map(|p| (p[0] + p[1] + p[2]) as f64)
+        .sum();
+    let health_sum: f64 = world.health.iter().map(|h| *h as f64).sum();
+    pos_sum + health_sum
 }
 
 fn run_step(world: &mut EcsWorld, dt: f32) {
