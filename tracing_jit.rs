@@ -260,49 +260,42 @@ impl NativeCodeGenerator {
         
         for ti in instrs {
             match &ti.instruction {
-                Instr::LoadI32(dst, v) | Instr::LoadI64(dst, v) => {
+                Instr::LoadI32(dst, v) => {
                     last_load.insert(*dst, *v as i64);
                     out.push(ti.clone());
                 }
-                Instr::Add(dst, lhs, rhs) => {
-                    if let (Some(a), Some(b)) = (last_load.get(lhs), last_load.get(rhs)) {
-                        // Constant fold
-                        last_load.insert(*dst, a + b);
-                        out.push(TraceInstruction {
-                            original_pc: ti.original_pc,
-                            instruction: Instr::LoadI64(*dst, a + b),
-                            guard: None,
-                        });
-                        continue;
-                    }
-                    last_load.remove(dst);
+                Instr::LoadI64(dst, v) => {
+                    last_load.insert(*dst, *v as i64);
                     out.push(ti.clone());
                 }
-                Instr::Sub(dst, lhs, rhs) => {
-                    if let (Some(a), Some(b)) = (last_load.get(lhs), last_load.get(rhs)) {
-                        last_load.insert(*dst, a - b);
+                Instr::BinOp(dst, op, lhs, rhs) => {
+                    let folded = match op {
+                        BinOpKind::Add => last_load
+                            .get(lhs)
+                            .zip(last_load.get(rhs))
+                            .map(|(a, b)| a + b),
+                        BinOpKind::Sub => last_load
+                            .get(lhs)
+                            .zip(last_load.get(rhs))
+                            .map(|(a, b)| a - b),
+                        BinOpKind::Mul => last_load
+                            .get(lhs)
+                            .zip(last_load.get(rhs))
+                            .map(|(a, b)| a * b),
+                        _ => None,
+                    };
+
+                    if let Some(v) = folded {
+                        last_load.insert(*dst, v);
                         out.push(TraceInstruction {
                             original_pc: ti.original_pc,
-                            instruction: Instr::LoadI64(*dst, a - b),
+                            instruction: Instr::LoadI64(*dst, v),
                             guard: None,
                         });
-                        continue;
+                    } else {
+                        last_load.remove(dst);
+                        out.push(ti.clone());
                     }
-                    last_load.remove(dst);
-                    out.push(ti.clone());
-                }
-                Instr::Mul(dst, lhs, rhs) => {
-                    if let (Some(a), Some(b)) = (last_load.get(lhs), last_load.get(rhs)) {
-                        last_load.insert(*dst, a * b);
-                        out.push(TraceInstruction {
-                            original_pc: ti.original_pc,
-                            instruction: Instr::LoadI64(*dst, a * b),
-                            guard: None,
-                        });
-                        continue;
-                    }
-                    last_load.remove(dst);
-                    out.push(ti.clone());
                 }
                 _ => out.push(ti.clone()),
             }
@@ -336,36 +329,17 @@ impl NativeCodeGenerator {
                 self.mov_rax_imm64(*val);
                 self.mark_dirty(*dst);
             }
-            Instr::Add(dst, lhs, rhs) => {
+            Instr::BinOp(dst, op, lhs, rhs) => {
                 self.ensure_reg(*lhs, Reg::RAX)?;
                 self.ensure_reg(*rhs, Reg::RCX)?;
-                self.add_rax_rcx();
+                match op {
+                    BinOpKind::Add => self.add_rax_rcx(),
+                    BinOpKind::Sub => self.sub_rax_rcx(),
+                    BinOpKind::Mul => self.imul_rax_rcx(),
+                    _ => return Err(format!("Unsupported BinOp in trace backend: {:?}", op)),
+                }
                 self.bind_slot_reg(*dst, Reg::RAX);
                 self.mark_dirty(*dst);
-            }
-            Instr::Sub(dst, lhs, rhs) => {
-                self.ensure_reg(*lhs, Reg::RAX)?;
-                self.ensure_reg(*rhs, Reg::RCX)?;
-                self.sub_rax_rcx();
-                self.bind_slot_reg(*dst, Reg::RAX);
-                self.mark_dirty(*dst);
-            }
-            Instr::Mul(dst, lhs, rhs) => {
-                self.ensure_reg(*lhs, Reg::RAX)?;
-                self.ensure_reg(*rhs, Reg::RCX)?;
-                self.imul_rax_rcx();
-                self.bind_slot_reg(*dst, Reg::RAX);
-                self.mark_dirty(*dst);
-            }
-            Instr::JumpFalse(cond, target_pc) => {
-                self.ensure_reg(*cond, Reg::RAX)?;
-                self.test_rax_rax();
-                let lbl = self.next_label();
-                // Use short jump if possible
-                let is_short = self.code.len() + 2 + 1 < 127; // Rough estimate
-                if is_short { self.jz_short(lbl); } else { self.jz_label(lbl); }
-                self.patch_sites.push(PatchSite { buffer_offset: self.code.len() - if is_short {1} else {4}, target_label: lbl, is_short_jump: is_short });
-                self.labels.insert(lbl, target_pc);
             }
             Instr::Return(slot) => {
                 self.ensure_reg(*slot, Reg::RAX)?;
@@ -498,7 +472,6 @@ impl NativeCodeGenerator {
 // =============================================================================
 // §5  COMPILED TRACE
 // =============================================================================
-#[derive(Clone)]
 pub struct CompiledTrace {
     pub trace_id: u32,
     pub entry_point: *mut u8,
